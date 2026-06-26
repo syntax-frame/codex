@@ -432,6 +432,70 @@ async fn send_input_errors_when_thread_missing() {
 }
 
 #[tokio::test]
+async fn failed_communication_send_emits_created_without_enqueued() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::filter::Targets;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_test::internal::MockWriter;
+
+    let output: &'static std::sync::Mutex<Vec<u8>> =
+        Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            Targets::new()
+                .with_default(LevelFilter::OFF)
+                .with_target("codex_agent_communication", LevelFilter::INFO),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_current_span(false)
+                .with_span_list(false)
+                .with_writer(MockWriter::new(output)),
+        );
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let harness = AgentControlHarness::new().await;
+    let sender_thread_id = ThreadId::new();
+    let receiver_thread_id = ThreadId::new();
+    let metadata = codex_protocol::protocol::AgentCommunicationMetadata {
+        id: uuid::Uuid::new_v4().to_string(),
+        kind: codex_protocol::protocol::AgentCommunicationKind::Message,
+        sender_thread_id,
+        source_call_id: Some("call-1".to_string()),
+    };
+    let id = metadata.id.clone();
+    let mut communication = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/missing").expect("agent path"),
+        Vec::new(),
+        "mail".to_string(),
+        /*trigger_turn*/ false,
+    );
+    communication.agent_communication_metadata = Some(metadata);
+    crate::agent_communication::emit_agent_communication_created(
+        &communication,
+        receiver_thread_id,
+    );
+
+    let err = harness
+        .control
+        .send_inter_agent_communication(receiver_thread_id, communication)
+        .await
+        .expect_err("send should fail for missing receiver");
+    assert_matches!(err, CodexErr::ThreadNotFound(id) if id == receiver_thread_id);
+
+    let events = String::from_utf8(output.lock().expect("buffer lock").clone())
+        .expect("JSON logs should be UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON log event"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["fields"]["communication_id"], id);
+    assert_eq!(events[0]["fields"]["state"], "created");
+}
+
+#[tokio::test]
 async fn get_status_returns_not_found_for_missing_thread() {
     let harness = AgentControlHarness::new().await;
     let status = harness.control.get_status(ThreadId::new()).await;

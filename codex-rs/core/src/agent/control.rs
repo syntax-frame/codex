@@ -24,6 +24,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AgentCommunicationKind;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -199,6 +200,25 @@ impl AgentControl {
             }
         }
         result
+    }
+
+    fn create_and_emit_agent_communication(
+        kind: AgentCommunicationKind,
+        sender_thread_id: ThreadId,
+        receiver_thread_id: ThreadId,
+        communication: &mut InterAgentCommunication,
+        source_call_id: Option<&str>,
+    ) {
+        communication.agent_communication_metadata =
+            crate::agent_communication::new_agent_communication_metadata(
+                kind,
+                sender_thread_id,
+                source_call_id,
+            );
+        crate::agent_communication::emit_agent_communication_created(
+            communication,
+            receiver_thread_id,
+        );
     }
 
     /// Interrupt the current task for an existing agent thread.
@@ -473,12 +493,19 @@ impl AgentControl {
                 ) else {
                     return;
                 };
-                let communication = InterAgentCommunication::new(
+                let mut communication = InterAgentCommunication::new(
                     child_agent_path,
                     parent_agent_path,
                     Vec::new(),
                     message,
                     /*trigger_turn*/ false,
+                );
+                Self::create_and_emit_agent_communication(
+                    AgentCommunicationKind::Result,
+                    child_thread_id,
+                    parent_thread_id,
+                    &mut communication,
+                    /*source_call_id*/ None,
                 );
                 let _ = control
                     .send_inter_agent_communication(parent_thread_id, communication)
