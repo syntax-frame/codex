@@ -49,6 +49,9 @@ const KIND_DONE: c_int = 2;
 const KIND_HISTORY: c_int = 4;
 /// A tool call the model made, as JSON `{"tool": <name>, "args": <value>}`.
 const KIND_TOOL_CALL: c_int = 5;
+/// Boundary between two reasoning summary sections — the consumer should start a
+/// new "thinking" bubble for subsequent reasoning deltas.
+const KIND_REASONING_BREAK: c_int = 6;
 const KIND_ERROR: c_int = 3;
 
 /// Callback invoked for each streamed event. `text` is a NUL-terminated UTF-8
@@ -220,6 +223,10 @@ async fn run_turn_async(
         .map_err(|e| format!("failed to submit user input: {e}"))?;
 
     // Drain events until the turn completes (or errors).
+    // Track the reasoning summary section so we can signal bubble boundaries:
+    // Codex streams reasoning as multiple summary sections (each its own thought),
+    // distinguished by `summary_index`.
+    let mut last_summary_index: Option<i64> = None;
     loop {
         let event = thread
             .next_event()
@@ -227,7 +234,15 @@ async fn run_turn_async(
             .map_err(|e| format!("event stream error: {e}"))?;
         match event.msg {
             EventMsg::ReasoningContentDelta(ev) => {
+                if last_summary_index.is_some_and(|prev| prev != ev.summary_index) {
+                    emit(callback, ctx, KIND_REASONING_BREAK, "");
+                }
+                last_summary_index = Some(ev.summary_index);
                 emit(callback, ctx, KIND_REASONING_DELTA, &ev.delta);
+            }
+            EventMsg::AgentReasoningSectionBreak(_) => {
+                emit(callback, ctx, KIND_REASONING_BREAK, "");
+                last_summary_index = None;
             }
             EventMsg::ReasoningRawContentDelta(ev) => {
                 emit(callback, ctx, KIND_REASONING_DELTA, &ev.delta);
