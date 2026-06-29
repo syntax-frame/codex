@@ -29,7 +29,9 @@ use codex_login::TokenData;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
@@ -144,7 +146,7 @@ async fn run_turn_async(
     let thread_manager = thread_manager_with_models_provider(auth, provider);
 
     // Minimal Config rooted at the temp home (no on-disk config => defaults).
-    let config = ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.clone())
         .harness_overrides(ConfigOverrides {
             model: Some(model.clone()),
@@ -153,6 +155,12 @@ async fn run_turn_async(
         .build()
         .await
         .map_err(|e| format!("failed to build config: {e}"))?;
+
+    // Enable reasoning so the model emits reasoning-summary deltas (rendered as
+    // "thinking" bubbles in the app). Without these the turn streams only the
+    // final answer.
+    config.model_reasoning_effort = Some(ReasoningEffort::High);
+    config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
 
     let new_thread = thread_manager
         .start_thread(config)
@@ -176,7 +184,7 @@ async fn run_turn_async(
                     mode: ModeKind::Default,
                     settings: Settings {
                         model: if model.is_empty() { session_model } else { model },
-                        reasoning_effort: None,
+                        reasoning_effort: Some(ReasoningEffort::High),
                         developer_instructions: None,
                     },
                 }),
