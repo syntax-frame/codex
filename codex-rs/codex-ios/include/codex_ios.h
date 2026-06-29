@@ -32,6 +32,37 @@ char *codex_run_prompt(const char *access_token,
  */
 void codex_free_string(char *s);
 
+/*
+ * Streaming event callback for codex_run_turn_streaming().
+ *   ctx         opaque pointer passed through verbatim from the call site.
+ *   event_kind  0 = reasoning delta, 1 = text delta, 2 = done, 3 = error.
+ *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
+ *               copy it if it must outlive the callback.
+ */
+typedef void (*codex_event_callback)(void *ctx, int event_kind, const char *text);
+
+/*
+ * Drive ONE user turn through the REAL Codex turn loop (run_turn) and stream
+ * events to `callback`. Blocks until the turn completes. Talks to the ChatGPT
+ * OAuth backend.
+ *
+ * All string args are NUL-terminated UTF-8 C strings:
+ *   access_token  OAuth bearer access token.
+ *   id_token      OAuth id token (JWT) — required to load ChatGPT auth.
+ *   account_id    ChatGPT account id.
+ *   model         Model slug, e.g. "gpt-5.4".
+ *   prompt        The user prompt.
+ *   ctx           opaque pointer forwarded to every callback invocation.
+ *   callback      invoked for each streamed event (see codex_event_callback).
+ */
+void codex_run_turn_streaming(const char *access_token,
+                              const char *id_token,
+                              const char *account_id,
+                              const char *model,
+                              const char *prompt,
+                              void *ctx,
+                              codex_event_callback callback);
+
 #ifdef __cplusplus
 }
 #endif

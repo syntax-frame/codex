@@ -240,22 +240,37 @@ pub extern "C" fn codex_run_turn_streaming(
 ) {
     let ctx_addr = ctx as usize;
     let result = std::panic::catch_unwind(move || {
-        let ctx = ctx_addr as *mut c_void;
+        // Parse the C strings on the calling thread (the pointers are only valid
+        // for the duration of this call), then move the owned data into a worker.
         let token = c_str_to_string(access_token, "access_token")?;
         let id_tok = c_str_to_string(id_token, "id_token")?;
         let account = c_str_to_string(account_id, "account_id")?;
         let model = c_str_to_string(model, "model")?;
         let prompt = c_str_to_string(prompt, "prompt")?;
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            // Codex's turn loop has deep async state machines; the default 2 MiB
-            // worker stack overflows. Match Codex's production worker stack (16 MiB).
-            .thread_stack_size(16 * 1024 * 1024)
-            .build()
-            .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
-
-        runtime.block_on(run_turn_async(token, id_tok, account, model, prompt, callback, ctx))
+        // `block_on` drives the main future on the CALLING thread. On iOS the
+        // caller is a GCD worker (~512 KiB stack), which Codex's deep async
+        // `Session::new` state machine overflows (SIGBUS at the stack guard
+        // page). Run the runtime + block_on on a dedicated thread with a large
+        // stack instead. (`thread_stack_size` below only covers tokio's own
+        // worker threads, not the block_on driver thread.)
+        std::thread::Builder::new()
+            .name("codex-turn".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || -> Result<(), String> {
+                let ctx = ctx_addr as *mut c_void;
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_stack_size(16 * 1024 * 1024)
+                    .build()
+                    .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+                runtime.block_on(run_turn_async(
+                    token, id_tok, account, model, prompt, callback, ctx,
+                ))
+            })
+            .map_err(|e| format!("failed to spawn worker thread: {e}"))?
+            .join()
+            .map_err(|_| "worker thread panicked".to_string())?
     });
 
     match result {
