@@ -37,7 +37,8 @@ void codex_free_string(char *s);
  *   ctx         opaque pointer passed through verbatim from the call site.
  *   event_kind  0 = reasoning delta, 1 = text delta, 2 = done, 3 = error,
  *               4 = history (full updated rollout as a JSON array of ResponseItems,
- *                   emitted once just before done; persist it per node).
+ *                   emitted once just before done; persist it per node),
+ *               5 = tool call, as JSON {"tool": <name>, "args": <value>}.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */

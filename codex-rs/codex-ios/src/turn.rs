@@ -47,6 +47,8 @@ const KIND_DONE: c_int = 2;
 /// a JSON array of Codex `ResponseItem`s (messages + tool calls/outputs +
 /// reasoning). The app persists this per node and passes it back next turn.
 const KIND_HISTORY: c_int = 4;
+/// A tool call the model made, as JSON `{"tool": <name>, "args": <value>}`.
+const KIND_TOOL_CALL: c_int = 5;
 const KIND_ERROR: c_int = 3;
 
 /// Callback invoked for each streamed event. `text` is a NUL-terminated UTF-8
@@ -229,6 +231,27 @@ async fn run_turn_async(
             }
             EventMsg::ReasoningRawContentDelta(ev) => {
                 emit(callback, ctx, KIND_REASONING_DELTA, &ev.delta);
+            }
+            // The model called the built-in `update_plan` tool.
+            EventMsg::PlanUpdate(args) => {
+                let payload = serde_json::json!({ "tool": "update_plan", "args": args });
+                if let Ok(json) = serde_json::to_string(&payload) {
+                    emit(callback, ctx, KIND_TOOL_CALL, &json);
+                }
+            }
+            // Shell/exec tool call (only fires once exec tools are wired).
+            EventMsg::ExecCommandBegin(ev) => {
+                let payload = serde_json::json!({ "tool": "shell", "args": ev });
+                if let Ok(json) = serde_json::to_string(&payload) {
+                    emit(callback, ctx, KIND_TOOL_CALL, &json);
+                }
+            }
+            // MCP tool call (only fires once MCP servers are wired).
+            EventMsg::McpToolCallBegin(ev) => {
+                let payload = serde_json::json!({ "tool": "mcp", "args": ev });
+                if let Ok(json) = serde_json::to_string(&payload) {
+                    emit(callback, ctx, KIND_TOOL_CALL, &json);
+                }
             }
             EventMsg::AgentMessageContentDelta(ev) => {
                 emit(callback, ctx, KIND_TEXT_DELTA, &ev.delta);
