@@ -1,0 +1,23 @@
+[package]
+name = "codex-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+codex-api = { workspace = true }
+codex-client = { workspace = true }
+codex-protocol = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["staticlib", "lib"]
+doctest = false

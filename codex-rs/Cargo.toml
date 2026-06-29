@@ -114,6 +114,7 @@ members = [
     "utils/template",
     "codex-client",
     "codex-api",
+    "codex-ios",
     "state",
     "terminal-detection",
     "test-binary-support",

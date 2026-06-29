@@ -2652,6 +2652,7 @@ dependencies = [
  "codex-apply-patch",
  "codex-async-utils",
  "codex-code-mode",
+ "codex-code-mode-protocol",
  "codex-config",
  "codex-connectors",
  "codex-context-fragments",
@@ -3249,6 +3250,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-ios"
+version = "0.0.0"
+dependencies = [
+ "codex-api",
+ "codex-client",
+ "codex-protocol",
+ "futures",
+ "http 1.4.0",
+ "libc",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "codex-keyring-store"
 version = "0.0.0"
 dependencies = [
@@ -3838,7 +3854,7 @@ name = "codex-rollout-trace"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "codex-code-mode",
+ "codex-code-mode-protocol",
  "codex-protocol",
  "http 1.4.0",
  "pretty_assertions",
@@ -4054,7 +4070,7 @@ dependencies = [
 name = "codex-tools"
 version = "0.0.0"
 dependencies = [
- "codex-code-mode",
+ "codex-code-mode-protocol",
  "codex-connectors",
  "codex-features",
  "codex-file-system",

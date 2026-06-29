@@ -417,6 +417,7 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) skills_service: Arc<SkillsService>,
     pub(crate) plugins_manager: Arc<PluginsManager>,
     pub(crate) mcp_manager: Arc<McpManager>,
+    #[cfg(feature = "code-mode")]
     pub(crate) code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
     pub(crate) extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
     pub(crate) conversation_history: InitialHistory,
@@ -509,6 +510,7 @@ impl Codex {
             skills_service,
             plugins_manager,
             mcp_manager,
+            #[cfg(feature = "code-mode")]
             code_mode_session_provider,
             extensions,
             conversation_history,
@@ -689,6 +691,7 @@ impl Codex {
             skills_service,
             plugins_manager,
             mcp_manager.clone(),
+            #[cfg(feature = "code-mode")]
             code_mode_session_provider,
             extensions,
             thread_extension_init,

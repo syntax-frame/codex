@@ -8,7 +8,7 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-codex-code-mode = { workspace = true }
+codex-code-mode-protocol = { workspace = true }
 codex-connectors = { workspace = true }
 codex-features = { workspace = true }
 codex-file-system = { workspace = true }

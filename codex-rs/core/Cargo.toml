@@ -15,6 +15,14 @@ path = "src/bin/config_schema.rs"
 [lints]
 workspace = true
 
+[features]
+default = ["code-mode"]
+# Enables the V8-backed code-mode runtime (pulls in `codex-code-mode` -> `v8`).
+# Disable (e.g. `--no-default-features`) on platforms without a prebuilt V8,
+# such as iOS, to drop the V8 dependency. The turn loop and non-exec tools
+# remain available; only the code-mode tool surface is removed.
+code-mode = ["dep:codex-code-mode"]
+
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
@@ -29,7 +37,8 @@ codex-api = { workspace = true }
 codex-app-server-protocol = { workspace = true }
 codex-apply-patch = { workspace = true }
 codex-async-utils = { workspace = true }
-codex-code-mode = { workspace = true }
+codex-code-mode = { workspace = true, optional = true }
+codex-code-mode-protocol = { workspace = true }
 codex-connectors = { workspace = true }
 codex-context-fragments = { workspace = true }
 codex-config = { workspace = true }
