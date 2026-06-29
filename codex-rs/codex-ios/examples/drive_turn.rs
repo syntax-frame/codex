@@ -30,6 +30,7 @@ extern "C" fn on_event(ctx: *mut c_void, kind: c_int, text: *const c_char) {
             cap.answer.push_str(&s);
         }
         4 => cap.history = s,                       // KIND_HISTORY (full rollout)
+        5 => println!("\n  [TOOL] {s}"),            // KIND_TOOL_CALL
         2 => println!("  «done»"),                 // done
         3 => println!("  «ERROR: {s}»"),           // error
         _ => {}
@@ -61,14 +62,18 @@ fn main() {
 
     let mut cap = Capture { history: String::new(), answer: String::new() };
 
-    println!("=== turn 1 (no history) ===");
+    println!("=== FILE TOOLS TEST ===");
     print!("answer: ");
-    run(&token, &id, &account, "My name is Zephyr. Just acknowledge in 3 words.", "", &mut cap);
-    println!("(history rollout captured: {} bytes)", cap.history.len());
-
-    let h1 = cap.history.clone();
-    println!("\n=== turn 2 (with history) — asking it back ===");
-    print!("answer: ");
-    run(&token, &id, &account, "What is my name? Reply with one word.", &h1, &mut cap);
-    println!("\n>>> MEMORY TEST: turn-2 answer was \"{}\"", cap.answer.trim());
+    run(&token, &id, &account,
+        "Use your file tools to do this on disk: write a file named notes.txt containing exactly 'hello world', then list the directory, then read notes.txt back. Then tell me the directory listing and the file contents.",
+        "", &mut cap);
+    println!("\n--- workspace contents on disk ---");
+    let ws = std::env::temp_dir().join("codex_drive_turn_ws");
+    if let Ok(entries) = std::fs::read_dir(&ws) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let body = std::fs::read_to_string(&p).unwrap_or_default();
+            println!("  {} => {:?}", p.file_name().unwrap().to_string_lossy(), body);
+        }
+    }
 }

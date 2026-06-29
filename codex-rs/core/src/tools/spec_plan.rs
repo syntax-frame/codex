@@ -7,6 +7,9 @@ use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
 use crate::tools::handlers::ApplyPatchHandler;
+use crate::tools::handlers::ListDirHandler;
+use crate::tools::handlers::ReadFileHandler;
+use crate::tools::handlers::WriteFileHandler;
 #[cfg(feature = "code-mode")]
 use crate::tools::handlers::CodeModeExecuteHandler;
 #[cfg(feature = "code-mode")]
@@ -717,6 +720,12 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let environment_mode = tool_environment_mode(context.step_context);
 
     planned_tools.add(PlanHandler);
+
+    // On-device file tools: read/write/list within the turn's workspace (cwd).
+    // No shell, no environment — plain filesystem, jailed to the working dir.
+    planned_tools.add(ReadFileHandler);
+    planned_tools.add(WriteFileHandler);
+    planned_tools.add(ListDirHandler);
 
     if features.enabled(Feature::DeferredExecutor) {
         planned_tools.add(WaitForEnvironmentHandler);

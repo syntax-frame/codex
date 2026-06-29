@@ -255,29 +255,24 @@ async fn run_turn_async(
             EventMsg::ReasoningRawContentDelta(ev) => {
                 emit(callback, ctx, KIND_REASONING_DELTA, &ev.delta);
             }
-            // The model called the built-in `update_plan` tool.
-            EventMsg::PlanUpdate(args) => {
-                let payload = serde_json::json!({ "tool": "update_plan", "args": args });
-                if let Ok(json) = serde_json::to_string(&payload) {
-                    emit(callback, ctx, KIND_TOOL_CALL, &json);
+            // Any function tool call the model makes (read_file/write_file/
+            // list_dir/update_plan/shell/…) surfaces generically here — the raw
+            // response item carries the function name + arguments live.
+            EventMsg::RawResponseItem(ev) => {
+                if let ResponseItem::FunctionCall {
+                    name, arguments, ..
+                } = &ev.item
+                {
+                    let args: serde_json::Value =
+                        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+                    let payload = serde_json::json!({ "tool": name, "args": args });
+                    if let Ok(json) = serde_json::to_string(&payload) {
+                        emit(callback, ctx, KIND_TOOL_CALL, &json);
+                    }
                 }
             }
-            // Shell/exec tool call (only fires once exec tools are wired).
-            EventMsg::ExecCommandBegin(ev) => {
-                let payload = serde_json::json!({ "tool": "shell", "args": ev });
-                if let Ok(json) = serde_json::to_string(&payload) {
-                    emit(callback, ctx, KIND_TOOL_CALL, &json);
-                }
-            }
-            // MCP tool call (only fires once MCP servers are wired).
-            EventMsg::McpToolCallBegin(ev) => {
-                let payload = serde_json::json!({ "tool": "mcp", "args": ev });
-                if let Ok(json) = serde_json::to_string(&payload) {
-                    emit(callback, ctx, KIND_TOOL_CALL, &json);
-                }
-            }
-            // Web search (provider-hosted) — surfaced on completion (carries the
-            // query + the action/result).
+            // Web search (provider-hosted, not a function call) — surfaced on
+            // completion (carries the query + the action/result).
             EventMsg::WebSearchEnd(ev) => {
                 let payload = serde_json::json!({ "tool": "web_search", "args": ev });
                 if let Ok(json) = serde_json::to_string(&payload) {
