@@ -27,6 +27,8 @@ use codex_login::AuthKeyringBackendKind;
 use codex_login::CodexAuth;
 use codex_login::TokenData;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
@@ -41,6 +43,10 @@ use codex_protocol::user_input::UserInput;
 const KIND_REASONING_DELTA: c_int = 0;
 const KIND_TEXT_DELTA: c_int = 1;
 const KIND_DONE: c_int = 2;
+/// Emitted once just before KIND_DONE: the full updated conversation rollout as
+/// a JSON array of Codex `ResponseItem`s (messages + tool calls/outputs +
+/// reasoning). The app persists this per node and passes it back next turn.
+const KIND_HISTORY: c_int = 4;
 const KIND_ERROR: c_int = 3;
 
 /// Callback invoked for each streamed event. `text` is a NUL-terminated UTF-8
@@ -124,6 +130,7 @@ async fn run_turn_async(
     account_id: String,
     model: String,
     prompt: String,
+    history_json: String,
     callback: EventCallback,
     ctx: *mut c_void,
 ) -> Result<(), String> {
@@ -168,6 +175,22 @@ async fn run_turn_async(
         .map_err(|e| format!("failed to start thread: {e}"))?;
     let thread = new_thread.thread;
     let session_model = new_thread.session_configured.model.clone();
+
+    // Seed the node's prior conversation (the full rollout persisted by the app)
+    // so the model has memory. This mirrors exactly what Codex keeps across
+    // turns: messages, tool calls/outputs, and reasoning items.
+    let prior: Vec<ResponseItem> = if history_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&history_json)
+            .map_err(|e| format!("failed to parse history json: {e}"))?
+    };
+    if !prior.is_empty() {
+        thread
+            .inject_response_items(prior)
+            .await
+            .map_err(|e| format!("failed to seed history: {e}"))?;
+    }
 
     // Submit a single user turn through the real loop, pinning the model.
     thread
@@ -215,6 +238,29 @@ async fn run_turn_async(
                 return Ok(());
             }
             EventMsg::TurnComplete(_) => {
+                // Emit the updated rollout (ResponseItems only) so the app can
+                // persist it per node and replay it on the next turn.
+                match thread.load_history(false).await {
+                    Ok(stored) => {
+                        let items: Vec<ResponseItem> = stored
+                            .items
+                            .into_iter()
+                            .filter_map(|ri| match ri {
+                                RolloutItem::ResponseItem(item) => Some(item),
+                                _ => None,
+                            })
+                            .collect();
+                        if let Ok(json) = serde_json::to_string(&items) {
+                            emit(callback, ctx, KIND_HISTORY, &json);
+                        }
+                    }
+                    Err(e) => emit(
+                        callback,
+                        ctx,
+                        KIND_ERROR,
+                        &format!("load_history failed: {e}"),
+                    ),
+                }
                 emit(callback, ctx, KIND_DONE, "");
                 return Ok(());
             }
@@ -243,6 +289,7 @@ pub extern "C" fn codex_run_turn_streaming(
     account_id: *const c_char,
     model: *const c_char,
     prompt: *const c_char,
+    history_json: *const c_char,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
@@ -255,6 +302,12 @@ pub extern "C" fn codex_run_turn_streaming(
         let account = c_str_to_string(account_id, "account_id")?;
         let model = c_str_to_string(model, "model")?;
         let prompt = c_str_to_string(prompt, "prompt")?;
+        // History is optional: NULL or empty means a fresh conversation.
+        let history = if history_json.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(history_json, "history_json")?
+        };
 
         // `block_on` drives the main future on the CALLING thread. On iOS the
         // caller is a GCD worker (~512 KiB stack), which Codex's deep async
@@ -273,7 +326,7 @@ pub extern "C" fn codex_run_turn_streaming(
                     .build()
                     .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
                 runtime.block_on(run_turn_async(
-                    token, id_tok, account, model, prompt, callback, ctx,
+                    token, id_tok, account, model, prompt, history, callback, ctx,
                 ))
             })
             .map_err(|e| format!("failed to spawn worker thread: {e}"))?

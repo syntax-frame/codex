@@ -1,15 +1,20 @@
-//! Host harness: drive the REAL Codex turn loop FFI with a live OAuth token read
-//! from ~/.codex/auth.json (token never printed) and stream events to stdout.
-//! Run: `cargo run -p codex-ios --example drive_turn -- "your prompt"`
+//! Host harness: drive the REAL Codex turn loop FFI with a live OAuth token from
+//! ~/.codex/auth.json (token never printed). Runs TWO turns to verify per-node
+//! history: turn 1 states a fact, turn 2 asks it back using the rollout returned
+//! by turn 1. Run: `cargo run -p codex-ios --example drive_turn`
 
+use codex_ios::codex_run_turn_streaming;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
 
-use codex_ios::codex_run_turn_streaming;
+struct Capture {
+    history: String,
+    answer: String,
+}
 
-extern "C" fn on_event(_ctx: *mut c_void, kind: c_int, text: *const c_char) {
+extern "C" fn on_event(ctx: *mut c_void, kind: c_int, text: *const c_char) {
     let s = if text.is_null() {
         String::new()
     } else {
@@ -17,44 +22,50 @@ extern "C" fn on_event(_ctx: *mut c_void, kind: c_int, text: *const c_char) {
             .to_string_lossy()
             .into_owned()
     };
-    let label = match kind {
-        0 => "REASONING",
-        1 => "TEXT",
-        2 => "DONE",
-        3 => "ERROR",
-        _ => "?",
-    };
-    println!("[{label}] {s}");
+    let cap = unsafe { &mut *(ctx as *mut Capture) };
+    match kind {
+        0 => {}                                   // reasoning delta (ignore here)
+        1 => {                                     // text delta
+            print!("{s}");
+            cap.answer.push_str(&s);
+        }
+        4 => cap.history = s,                       // KIND_HISTORY (full rollout)
+        2 => println!("  «done»"),                 // done
+        3 => println!("  «ERROR: {s}»"),           // error
+        _ => {}
+    }
+}
+
+fn run(token: &str, id: &str, account: &str, prompt: &str, history: &str, cap: &mut Capture) {
+    cap.answer.clear();
+    let c = |s: &str| CString::new(s).unwrap();
+    let (ct, ci, ca, cm, cp, ch) = (
+        c(token), c(id), c(account), c("gpt-5.4"), c(prompt), c(history),
+    );
+    codex_run_turn_streaming(
+        ct.as_ptr(), ci.as_ptr(), ca.as_ptr(), cm.as_ptr(), cp.as_ptr(), ch.as_ptr(),
+        cap as *mut Capture as *mut c_void, on_event,
+    );
 }
 
 fn main() {
-    let prompt = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "Say hello from the real Codex loop in exactly five words.".to_string());
-
     let home = std::env::var("HOME").expect("HOME");
-    let auth_path = format!("{home}/.codex/auth.json");
-    let raw = std::fs::read_to_string(&auth_path).expect("read auth.json");
-    let v: serde_json::Value = serde_json::from_str(&raw).expect("parse auth.json");
-    let token = v["tokens"]["access_token"].as_str().expect("access_token").to_string();
-    let id_token = v["tokens"]["id_token"].as_str().expect("id_token").to_string();
-    let account = v["tokens"]["account_id"].as_str().expect("account_id").to_string();
+    let raw = std::fs::read_to_string(format!("{home}/.codex/auth.json")).expect("auth.json");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("parse");
+    let token = v["tokens"]["access_token"].as_str().unwrap().to_string();
+    let id = v["tokens"]["id_token"].as_str().unwrap().to_string();
+    let account = v["tokens"]["account_id"].as_str().unwrap().to_string();
 
-    println!("(driving real turn loop; model=gpt-5.4; token len {} hidden)", token.len());
+    let mut cap = Capture { history: String::new(), answer: String::new() };
 
-    let c_token = CString::new(token).unwrap();
-    let c_id = CString::new(id_token).unwrap();
-    let c_account = CString::new(account).unwrap();
-    let c_model = CString::new("gpt-5.4").unwrap();
-    let c_prompt = CString::new(prompt).unwrap();
+    println!("=== turn 1 (no history) ===");
+    print!("answer: ");
+    run(&token, &id, &account, "My name is Zephyr. Just acknowledge in 3 words.", "", &mut cap);
+    println!("(history rollout captured: {} bytes)", cap.history.len());
 
-    codex_run_turn_streaming(
-        c_token.as_ptr(),
-        c_id.as_ptr(),
-        c_account.as_ptr(),
-        c_model.as_ptr(),
-        c_prompt.as_ptr(),
-        std::ptr::null_mut(),
-        on_event,
-    );
+    let h1 = cap.history.clone();
+    println!("\n=== turn 2 (with history) — asking it back ===");
+    print!("answer: ");
+    run(&token, &id, &account, "What is my name? Reply with one word.", &h1, &mut cap);
+    println!("\n>>> MEMORY TEST: turn-2 answer was \"{}\"", cap.answer.trim());
 }
