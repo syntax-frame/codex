@@ -276,6 +276,14 @@ async fn run_turn_async(
                     emit(callback, ctx, KIND_TOOL_CALL, &json);
                 }
             }
+            // Web search (provider-hosted) — surfaced on completion (carries the
+            // query + the action/result).
+            EventMsg::WebSearchEnd(ev) => {
+                let payload = serde_json::json!({ "tool": "web_search", "args": ev });
+                if let Ok(json) = serde_json::to_string(&payload) {
+                    emit(callback, ctx, KIND_TOOL_CALL, &json);
+                }
+            }
             EventMsg::AgentMessageContentDelta(ev) => {
                 emit(callback, ctx, KIND_TEXT_DELTA, &ev.delta);
             }
