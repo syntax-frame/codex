@@ -7,8 +7,13 @@ license.workspace = true
 [dependencies]
 codex-api = { workspace = true }
 codex-client = { workspace = true }
+codex-core = { path = "../core", default-features = false }
+codex-login = { workspace = true }
+codex-model-provider-info = { workspace = true }
 codex-protocol = { workspace = true }
+chrono = { workspace = true }
 futures = { workspace = true }
+tempfile = { workspace = true }
 http = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true }
@@ -21,3 +26,6 @@ workspace = true
 [lib]
 crate-type = ["staticlib", "lib"]
 doctest = false
+
+[dev-dependencies]
+serde_json = { workspace = true }

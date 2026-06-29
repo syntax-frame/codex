@@ -3253,14 +3253,19 @@ dependencies = [
 name = "codex-ios"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "codex-api",
  "codex-client",
+ "codex-core",
+ "codex-login",
+ "codex-model-provider-info",
  "codex-protocol",
  "futures",
  "http 1.4.0",
  "libc",
  "reqwest 0.12.28",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

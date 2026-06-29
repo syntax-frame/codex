@@ -248,7 +248,7 @@ Probed `cargo build -p codex-core --target aarch64-apple-ios-sim`. Findings:
 - **Desktop build stays green** (code-mode default-on).
 - **Refined estimate: ~1 day** to a compiling iOS `core`. Next blocker to probe past core: `codex-network-proxy`/`rama-unix`.
 - **Feature structure:** `codex-core` `default = ["code-mode"]`; mobile builds `--no-default-features`. Permanently move `codex-tools`/`codex-rollout-trace` to `codex-code-mode-protocol` (strict win for desktop too).
-- Status: finishing the last 10 errors to get `core` compiling for both iOS targets, committing to `ios-mobile-feature`.
+- Status: **DONE.** ✅ `codex-core` compiles clean for **both** `aarch64-apple-ios-sim` and `aarch64-apple-ios` (0 errors), and the **desktop default build (code-mode on) is unchanged** (0 errors). Committed to `ios-mobile-feature` (`d3933cfd9f`), `main` untouched. The real turn loop is now iOS-buildable. Next: a thin iOS wrapper that drives `run_turn` + a streaming-event FFI (reasoning/tool-call/tool-result/text deltas) for the UI.
 
 ## 9. Open questions
 
