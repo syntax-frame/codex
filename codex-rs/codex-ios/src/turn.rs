@@ -136,6 +136,7 @@ async fn run_turn_async(
     model: String,
     prompt: String,
     history_json: String,
+    workspace: String,
     callback: EventCallback,
     ctx: *mut c_void,
 ) -> Result<(), String> {
@@ -162,6 +163,13 @@ async fn run_turn_async(
         .codex_home(codex_home.clone())
         .harness_overrides(ConfigOverrides {
             model: Some(model.clone()),
+            // Root the turn in the node's workspace dir ("zone") so file tools
+            // operate inside it.
+            cwd: if workspace.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(&workspace))
+            },
             ..Default::default()
         })
         .build()
@@ -328,6 +336,7 @@ pub extern "C" fn codex_run_turn_streaming(
     model: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
+    workspace_path: *const c_char,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
@@ -345,6 +354,12 @@ pub extern "C" fn codex_run_turn_streaming(
             String::new()
         } else {
             c_str_to_string(history_json, "history_json")?
+        };
+        // Workspace dir to root the turn at (where file tools operate). Optional.
+        let workspace = if workspace_path.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(workspace_path, "workspace_path")?
         };
 
         // `block_on` drives the main future on the CALLING thread. On iOS the
@@ -364,7 +379,7 @@ pub extern "C" fn codex_run_turn_streaming(
                     .build()
                     .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
                 runtime.block_on(run_turn_async(
-                    token, id_tok, account, model, prompt, history, callback, ctx,
+                    token, id_tok, account, model, prompt, history, workspace, callback, ctx,
                 ))
             })
             .map_err(|e| format!("failed to spawn worker thread: {e}"))?

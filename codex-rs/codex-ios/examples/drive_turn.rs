@@ -39,11 +39,14 @@ extern "C" fn on_event(ctx: *mut c_void, kind: c_int, text: *const c_char) {
 fn run(token: &str, id: &str, account: &str, prompt: &str, history: &str, cap: &mut Capture) {
     cap.answer.clear();
     let c = |s: &str| CString::new(s).unwrap();
-    let (ct, ci, ca, cm, cp, ch) = (
+    let ws = std::env::temp_dir().join("codex_drive_turn_ws");
+    let _ = std::fs::create_dir_all(&ws);
+    let (ct, ci, ca, cm, cp, ch, cw) = (
         c(token), c(id), c(account), c("gpt-5.4"), c(prompt), c(history),
+        c(ws.to_str().unwrap()),
     );
     codex_run_turn_streaming(
-        ct.as_ptr(), ci.as_ptr(), ca.as_ptr(), cm.as_ptr(), cp.as_ptr(), ch.as_ptr(),
+        ct.as_ptr(), ci.as_ptr(), ca.as_ptr(), cm.as_ptr(), cp.as_ptr(), ch.as_ptr(), cw.as_ptr(),
         cap as *mut Capture as *mut c_void, on_event,
     );
 }

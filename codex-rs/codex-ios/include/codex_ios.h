@@ -59,6 +59,8 @@ typedef void (*codex_event_callback)(void *ctx, int event_kind, const char *text
  *   history_json  Prior conversation rollout as a JSON array of ResponseItems
  *                 (from a previous turn's history event), or NULL/empty for a
  *                 fresh conversation. Gives the model memory across turns.
+ *   workspace_path  Absolute path to the node's working directory; the turn is
+ *                 rooted here so file tools operate inside it. NULL/empty = none.
  *   ctx           opaque pointer forwarded to every callback invocation.
  *   callback      invoked for each streamed event (see codex_event_callback).
  */
@@ -68,6 +70,7 @@ void codex_run_turn_streaming(const char *access_token,
                               const char *model,
                               const char *prompt,
                               const char *history_json,
+                              const char *workspace_path,
                               void *ctx,
                               codex_event_callback callback);
 
