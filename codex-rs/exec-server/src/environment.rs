@@ -572,16 +572,30 @@ impl Environment {
         key_path: impl Into<String>,
         host_fingerprint: Option<String>,
     ) -> Self {
+        let host = host.into();
+        let user = user.into();
+        let key_path = key_path.into();
         Self {
             exec_server_url: None,
             remote_client: None,
             startup_task: Arc::new(Mutex::new(None)),
             exec_backend: Arc::new(crate::ssh_process::SshProcessBackend::with_fingerprint(
-                host, port, user, key_path, host_fingerprint,
+                host.clone(),
+                port,
+                user.clone(),
+                key_path.clone(),
+                host_fingerprint.clone(),
             )),
-            // Filesystem stays local for this pass; apply_patch/remote files are
-            // a later pass. Only the exec backend is redirected over SSH.
-            filesystem: Arc::new(LocalFileSystem::unsandboxed()),
+            // Server mode: file ops (apply_patch + read/write) must act on the
+            // REMOTE host's disk, so back the filesystem with an SFTP session
+            // over SSH to the same host instead of the phone's local disk.
+            filesystem: Arc::new(crate::ssh_file_system::SshFileSystem::with_fingerprint(
+                host,
+                port,
+                user,
+                key_path,
+                host_fingerprint,
+            )),
             http_client: Arc::new(ReqwestHttpClient),
             local_runtime_paths: None,
             // Server mode: exec must go over SSH via `exec_backend`, even though

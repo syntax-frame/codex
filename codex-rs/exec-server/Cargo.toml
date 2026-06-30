@@ -36,6 +36,12 @@ prost = "0.14.3"
 # Pin russh to 0.45 EXACTLY: 0.61 pulls ml-kem 0.3.x which conflicts with the
 # ml-kem 0.2.x that `clatter` already depends on in this crate (build failure).
 russh = "=0.45"
+# Transport-agnostic SFTP protocol implementation used by `SshFileSystem` for
+# server-mode (remote) file ops. IMPORTANT: russh-sftp depends on NEITHER russh
+# NOR ml-kem, so it cannot bump our pinned `russh = "=0.45"` and cannot pull
+# `ml-kem 0.3.x` (verified via `cargo tree`). It attaches to an existing russh
+# 0.45 channel via `request_subsystem("sftp")` + `into_stream()`.
+russh-sftp = "2.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

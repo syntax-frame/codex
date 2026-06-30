@@ -59,8 +59,11 @@ contents with `write_file`.";
 /// Server-mode counterpart: the shell/exec tools run on a remote SSH host, so
 /// the model SHOULD use them for shell commands. (No anti-shell nudge here.)
 const SERVER_MODE_DEVELOPER_INSTRUCTIONS: &str = "You are connected to a remote server. \
-Shell/exec tools execute commands ON THAT SERVER over SSH. When the user asks you to run a \
-shell command, use the shell/exec tool and report the command's actual output.";
+Shell/exec tools execute commands ON THAT SERVER over SSH, and file operations act on that \
+server's filesystem. When the user asks you to run a shell command, use the shell/exec tool \
+and report the command's actual output. To create or edit files on the server, prefer \
+`apply_patch` (it edits files directly on the remote host); the shell/exec tools and \
+`apply_patch` all operate on the same remote server.";
 
 /// SSH connection parameters for "server mode": when supplied to
 /// [`run_turn_async`], the turn's shell/exec tools run on the SSH host instead
