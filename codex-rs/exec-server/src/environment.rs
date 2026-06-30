@@ -552,22 +552,23 @@ impl Environment {
     /// so [`Environment::is_remote`] stays `false` and the local shell is used
     /// for snapshotting; only process execution is redirected over SSH.
     ///
-    /// `host_fingerprint` is accepted for forward-compatibility (host-key
-    /// pinning). It is currently unused: `SshProcessBackend` does not pin the
-    /// server key yet, so it is recorded here but not enforced.
+    /// `host_fingerprint`, when `Some`, pins the server host key: the SSH
+    /// connection is accepted only if the server's key fingerprint matches (in
+    /// OpenSSH `SHA256:<base64nopad>` form). When `None`, any host key is
+    /// accepted. See [`crate::ssh_process::SshProcessBackend`].
     pub fn ssh(
         host: impl Into<String>,
         port: u16,
         user: impl Into<String>,
         key_path: impl Into<String>,
-        _host_fingerprint: Option<String>,
+        host_fingerprint: Option<String>,
     ) -> Self {
         Self {
             exec_server_url: None,
             remote_client: None,
             startup_task: Arc::new(Mutex::new(None)),
-            exec_backend: Arc::new(crate::ssh_process::SshProcessBackend::new(
-                host, port, user, key_path,
+            exec_backend: Arc::new(crate::ssh_process::SshProcessBackend::with_fingerprint(
+                host, port, user, key_path, host_fingerprint,
             )),
             // Filesystem stays local for this pass; apply_patch/remote files are
             // a later pass. Only the exec backend is redirected over SSH.

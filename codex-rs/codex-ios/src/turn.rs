@@ -76,8 +76,10 @@ pub struct ServerMode {
     pub user: String,
     /// Path to an OpenSSH private key authorized on the host.
     pub key_path: String,
-    /// Expected host-key fingerprint. Accepted for forward-compat; host-key
-    /// pinning is not yet enforced in `SshProcessBackend`.
+    /// Expected host-key fingerprint in OpenSSH `SHA256:<base64nopad>` form.
+    /// When `Some`, host-key pinning is enforced in `SshProcessBackend`: the
+    /// SSH connection is rejected unless the server key fingerprint matches.
+    /// When `None`, any host key is accepted (permissive).
     pub host_fingerprint: Option<String>,
 }
 
@@ -510,6 +512,136 @@ pub extern "C" fn codex_run_turn_streaming(
                 runtime.block_on(run_turn_async(
                     token, id_tok, account, model, prompt, history, workspace,
                     /*server_mode*/ None, callback, ctx,
+                ))
+            })
+            .map_err(|e| format!("failed to spawn worker thread: {e}"))?
+            .join()
+            .map_err(|_| "worker thread panicked".to_string())?
+    });
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => emit(callback, ctx, KIND_ERROR, &message),
+        Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
+    }
+}
+
+/// Server-mode counterpart of [`codex_run_turn_streaming`]: drives ONE user
+/// turn whose shell/exec tools run on a remote SSH host instead of being
+/// disabled. Takes the same params as [`codex_run_turn_streaming`] PLUS the SSH
+/// connection settings.
+///
+/// `workspace_path` here is the cwd ON THE SERVER (it must exist on the remote
+/// host); the turn is rooted there.
+///
+/// `ssh_key_pem` is the OpenSSH PRIVATE KEY CONTENTS (PEM text), NOT a path. It
+/// is written to a chmod-600 file inside an ephemeral temp dir for the duration
+/// of the call (and deleted afterward); nothing is persisted.
+///
+/// `ssh_fingerprint` is the expected server host-key fingerprint in OpenSSH
+/// `SHA256:...` form. When null or empty, host-key pinning is disabled
+/// (permissive). When set, the SSH connection is rejected unless the server's
+/// host key matches.
+///
+/// # Safety
+/// All string pointers must be either null or valid NUL-terminated C strings.
+/// `callback` must be a valid function pointer; `ctx` is passed through opaquely.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn codex_run_turn_streaming_server(
+    access_token: *const c_char,
+    id_token: *const c_char,
+    account_id: *const c_char,
+    model: *const c_char,
+    prompt: *const c_char,
+    history_json: *const c_char,
+    workspace_path: *const c_char,
+    ssh_host: *const c_char,
+    ssh_port: u16,
+    ssh_user: *const c_char,
+    ssh_key_pem: *const c_char,
+    ssh_fingerprint: *const c_char,
+    ctx: *mut c_void,
+    callback: EventCallback,
+) {
+    let ctx_addr = ctx as usize;
+    let result = std::panic::catch_unwind(move || {
+        // Parse the C strings on the calling thread (the pointers are only valid
+        // for the duration of this call), then move the owned data into a worker.
+        let token = c_str_to_string(access_token, "access_token")?;
+        let id_tok = c_str_to_string(id_token, "id_token")?;
+        let account = c_str_to_string(account_id, "account_id")?;
+        let model = c_str_to_string(model, "model")?;
+        let prompt = c_str_to_string(prompt, "prompt")?;
+        // History is optional: NULL or empty means a fresh conversation.
+        let history = if history_json.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(history_json, "history_json")?
+        };
+        // Workspace dir to root the turn at (on the SERVER). Optional.
+        let workspace = if workspace_path.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(workspace_path, "workspace_path")?
+        };
+
+        // SSH connection settings.
+        let host = c_str_to_string(ssh_host, "ssh_host")?;
+        let user = c_str_to_string(ssh_user, "ssh_user")?;
+        let key_pem = c_str_to_string(ssh_key_pem, "ssh_key_pem")?;
+        // Fingerprint is optional: null/empty => no host-key pinning.
+        let fingerprint = if ssh_fingerprint.is_null() {
+            None
+        } else {
+            let s = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        };
+
+        // Persist the private key PEM to a chmod-600 file in an ephemeral temp
+        // dir. The dir (and key) live for the duration of the worker thread and
+        // are removed when `key_dir` drops after the turn completes.
+        let key_dir = tempfile::tempdir()
+            .map_err(|e| format!("failed to create ssh key tempdir: {e}"))?;
+        let key_path = key_dir.path().join("id_ssh");
+        std::fs::write(&key_path, key_pem.as_bytes())
+            .map_err(|e| format!("failed to write ssh key file: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("failed to chmod ssh key file: {e}"))?;
+        }
+        let key_path_str = key_path.to_string_lossy().into_owned();
+
+        let server_mode = ServerMode {
+            host,
+            port: ssh_port,
+            user,
+            key_path: key_path_str,
+            host_fingerprint: fingerprint,
+        };
+
+        // Same big-stack worker + multi-thread runtime dance as the local FFI.
+        std::thread::Builder::new()
+            .name("codex-turn".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || -> Result<(), String> {
+                // Hold the key dir alive until the turn finishes.
+                let _key_dir = key_dir;
+                let ctx = ctx_addr as *mut c_void;
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_stack_size(16 * 1024 * 1024)
+                    .build()
+                    .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+                runtime.block_on(run_turn_async(
+                    token, id_tok, account, model, prompt, history, workspace,
+                    /*server_mode*/ Some(server_mode), callback, ctx,
                 ))
             })
             .map_err(|e| format!("failed to spawn worker thread: {e}"))?

@@ -74,6 +74,53 @@ void codex_run_turn_streaming(const char *access_token,
                               void *ctx,
                               codex_event_callback callback);
 
+/*
+ * Server-mode counterpart of codex_run_turn_streaming(): drive ONE user turn
+ * whose shell/exec tools run on a remote host over SSH instead of being
+ * disabled. Same streaming/callback contract and event kinds as
+ * codex_run_turn_streaming(); same leading parameters, PLUS the SSH connection
+ * settings.
+ *
+ * All string args are NUL-terminated UTF-8 C strings (null/empty handled as
+ * noted):
+ *   access_token    OAuth bearer access token.
+ *   id_token        OAuth id token (JWT) — required to load ChatGPT auth.
+ *   account_id      ChatGPT account id.
+ *   model           Model slug, e.g. "gpt-5.4".
+ *   prompt          The user prompt.
+ *   history_json    Prior conversation rollout as a JSON array of ResponseItems,
+ *                   or NULL/empty for a fresh conversation.
+ *   workspace_path  Absolute path to the working directory ON THE SERVER; the
+ *                   turn is rooted here (must exist on the remote host).
+ *                   NULL/empty = none.
+ *   ssh_host        Remote SSH host (hostname or IP).
+ *   ssh_port        Remote SSH port (e.g. 22).
+ *   ssh_user        Remote SSH username.
+ *   ssh_key_pem     OpenSSH PRIVATE KEY CONTENTS (PEM text), NOT a path. Written
+ *                   to a chmod-600 temp file for the duration of the call and
+ *                   deleted afterward; never persisted.
+ *   ssh_fingerprint Expected server host-key fingerprint in OpenSSH "SHA256:..."
+ *                   form. When NULL or empty, host-key pinning is disabled
+ *                   (any host key accepted). When set, the connection is
+ *                   rejected unless the server's host key matches.
+ *   ctx             opaque pointer forwarded to every callback invocation.
+ *   callback        invoked for each streamed event (see codex_event_callback).
+ */
+void codex_run_turn_streaming_server(const char *access_token,
+                                     const char *id_token,
+                                     const char *account_id,
+                                     const char *model,
+                                     const char *prompt,
+                                     const char *history_json,
+                                     const char *workspace_path,
+                                     const char *ssh_host,
+                                     uint16_t ssh_port,
+                                     const char *ssh_user,
+                                     const char *ssh_key_pem,
+                                     const char *ssh_fingerprint,
+                                     void *ctx,
+                                     codex_event_callback callback);
+
 #ifdef __cplusplus
 }
 #endif

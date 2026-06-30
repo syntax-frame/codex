@@ -68,11 +68,16 @@ pub struct SshProcessBackend {
     port: u16,
     user: String,
     key_path: String,
+    /// Expected server host-key fingerprint in OpenSSH `SHA256:<base64nopad>`
+    /// form (as printed by `ssh-keygen -lf`). When `Some`, the connection is
+    /// accepted only if the server's host key fingerprint matches; when `None`,
+    /// any host key is accepted (permissive).
+    host_fingerprint: Option<String>,
 }
 
 impl SshProcessBackend {
     /// Construct a backend that authenticates with the OpenSSH private key at
-    /// `key_path`.
+    /// `key_path`. No host-key pinning (any server key is accepted).
     pub fn new(
         host: impl Into<String>,
         port: u16,
@@ -84,6 +89,27 @@ impl SshProcessBackend {
             port,
             user: user.into(),
             key_path: key_path.into(),
+            host_fingerprint: None,
+        }
+    }
+
+    /// Like [`SshProcessBackend::new`], but pins the server host key to
+    /// `host_fingerprint` when it is `Some`. The fingerprint must be in OpenSSH
+    /// `SHA256:<base64nopad>` form (the `SHA256:` prefix is optional). When
+    /// `None`, any host key is accepted.
+    pub fn with_fingerprint(
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        key_path: impl Into<String>,
+        host_fingerprint: Option<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            user: user.into(),
+            key_path: key_path.into(),
+            host_fingerprint,
         }
     }
 
@@ -96,8 +122,11 @@ impl SshProcessBackend {
             ..Default::default()
         });
 
+        let handler = SshClientHandler {
+            expected_fingerprint: self.host_fingerprint.clone(),
+        };
         let mut session =
-            client::connect(config, (self.host.as_str(), self.port), SshClientHandler)
+            client::connect(config, (self.host.as_str(), self.port), handler)
                 .await
                 .map_err(|e| ExecServerError::Protocol(format!("ssh connect: {e}")))?;
 
@@ -459,7 +488,11 @@ impl ExecProcess for SshProcess {
     }
 }
 
-struct SshClientHandler;
+struct SshClientHandler {
+    /// Expected host-key fingerprint in OpenSSH `SHA256:<base64nopad>` form. The
+    /// `SHA256:` prefix is optional. When `None`, any host key is accepted.
+    expected_fingerprint: Option<String>,
+}
 
 #[async_trait]
 impl client::Handler for SshClientHandler {
@@ -467,11 +500,24 @@ impl client::Handler for SshClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &key::PublicKey,
+        server_public_key: &key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        // TODO(integration/env-wiring): pin the server host key. Accepted here
-        // for the standalone host spike, matching codex-ios/src/ssh.rs.
-        Ok(true)
+        match &self.expected_fingerprint {
+            // No pin configured: permissive (matches the host spike behavior).
+            None => Ok(true),
+            Some(expected) => {
+                // russh's `PublicKey::fingerprint()` returns the base64 (no
+                // padding) SHA256 of the serialized public key — i.e. exactly
+                // what OpenSSH's `ssh-keygen -lf` prints after the `SHA256:`
+                // prefix. Compare against the expected fingerprint, tolerating
+                // an optional leading `SHA256:`.
+                let actual = server_public_key.fingerprint();
+                let expected = expected
+                    .strip_prefix("SHA256:")
+                    .unwrap_or(expected.as_str());
+                Ok(actual == expected)
+            }
+        }
     }
 }
 
