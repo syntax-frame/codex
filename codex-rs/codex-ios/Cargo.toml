@@ -9,6 +9,8 @@ codex-api = { workspace = true }
 codex-client = { workspace = true }
 codex-core = { path = "../core", default-features = false }
 codex-features = { workspace = true }
+russh = "0.45"
+async-trait = "0.1"
 codex-login = { workspace = true }
 codex-model-provider-info = { workspace = true }
 codex-protocol = { workspace = true }
