@@ -21,6 +21,8 @@ use std::os::raw::c_void;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::test_support::thread_manager_with_models_provider;
+use codex_core::test_support::thread_manager_with_models_provider_and_home;
+use codex_exec_server::EnvironmentManager;
 use codex_features::Feature;
 use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
@@ -53,6 +55,35 @@ environment. For ALL file operations use only the `read_file`, `write_file`, and
 `list_dir` tools. Never use `apply_patch`, `shell`, or `exec_command` — they are \
 unavailable here and will fail. To create or modify a file, write its full \
 contents with `write_file`.";
+
+/// Server-mode counterpart: the shell/exec tools run on a remote SSH host, so
+/// the model SHOULD use them for shell commands. (No anti-shell nudge here.)
+const SERVER_MODE_DEVELOPER_INSTRUCTIONS: &str = "You are connected to a remote server. \
+Shell/exec tools execute commands ON THAT SERVER over SSH. When the user asks you to run a \
+shell command, use the shell/exec tool and report the command's actual output.";
+
+/// SSH connection parameters for "server mode": when supplied to
+/// [`run_turn_async`], the turn's shell/exec tools run on the SSH host instead
+/// of being disabled. The C FFI / Swift layer constructs this from caller-
+/// provided connection settings (host/port/user/key path/fingerprint).
+///
+/// The filesystem stays local for this pass (apply_patch / remote files are a
+/// later pass); only process execution is redirected over SSH.
+#[derive(Clone, Debug)]
+pub struct ServerMode {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    /// Path to an OpenSSH private key authorized on the host.
+    pub key_path: String,
+    /// Expected host-key fingerprint. Accepted for forward-compat; host-key
+    /// pinning is not yet enforced in `SshProcessBackend`.
+    pub host_fingerprint: Option<String>,
+}
+
+/// Environment id under which the SSH server-mode environment is registered and
+/// selected for the turn.
+const SERVER_MODE_ENVIRONMENT_ID: &str = "ssh-server";
 
 /// Event-kind discriminants passed to the callback.
 const KIND_REASONING_DELTA: c_int = 0;
@@ -144,7 +175,7 @@ async fn build_auth(
     .ok_or_else(|| "ephemeral auth.json produced no auth".to_string())
 }
 
-async fn run_turn_async(
+pub(crate) async fn run_turn_async(
     access_token: String,
     id_token: String,
     account_id: String,
@@ -152,6 +183,7 @@ async fn run_turn_async(
     prompt: String,
     history_json: String,
     workspace: String,
+    server_mode: Option<ServerMode>,
     callback: EventCallback,
     ctx: *mut c_void,
 ) -> Result<(), String> {
@@ -171,7 +203,30 @@ async fn run_turn_async(
     // codex provider. This is the smallest public construction path; it manages
     // its own ephemeral codex_home (separate from the Config's) for its thread
     // store, which is fine for a one-shot turn.
-    let thread_manager = thread_manager_with_models_provider(auth, provider);
+    //
+    // In server mode, build a ThreadManager whose EnvironmentManager has the
+    // SSH environment registered AND selected as the default, so the turn's
+    // shell/exec tools route through the SSH backend (and `has_environment()`
+    // is true). Otherwise keep the default (local, shell-disabled) path intact.
+    let thread_manager = match &server_mode {
+        Some(server) => {
+            let environment_manager = std::sync::Arc::new(EnvironmentManager::ssh(
+                SERVER_MODE_ENVIRONMENT_ID,
+                server.host.clone(),
+                server.port,
+                server.user.clone(),
+                server.key_path.clone(),
+                server.host_fingerprint.clone(),
+            ));
+            thread_manager_with_models_provider_and_home(
+                auth,
+                provider,
+                codex_home.clone(),
+                environment_manager,
+            )
+        }
+        None => thread_manager_with_models_provider(auth, provider),
+    };
 
     // Minimal Config rooted at the temp home (no on-disk config => defaults).
     let mut config = ConfigBuilder::default()
@@ -203,13 +258,28 @@ async fn run_turn_async(
     config.model_reasoning_effort = Some(ReasoningEffort::High);
     config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
 
-    // iOS has no shell: there is no `/bin/zsh` to spawn, so the unified-exec /
-    // shell tools can never run here. Worse, when offered them the model prefers
-    // shell (`printf … | tee file`) over our native `write_file`, which then
-    // trips the approval machinery and hangs the turn. Disable the shell tool so
-    // the only file-mutating tools are our on-device read_file/write_file/
-    // list_dir handlers.
-    let _ = config.features.disable(Feature::ShellTool);
+    // Shell tool gating:
+    // - Local (no server mode): iOS has no shell — there is no `/bin/zsh` to
+    //   spawn, so the unified-exec / shell tools can never run here. Worse, when
+    //   offered them the model prefers shell (`printf … | tee file`) over our
+    //   native `write_file`, which then trips the approval machinery and hangs
+    //   the turn. Disable the shell tool so the only file-mutating tools are our
+    //   on-device read_file/write_file/list_dir handlers.
+    // - Server mode: shell/exec tools run on the SSH host, so re-enable the
+    //   shell tool. The SSH environment is registered+selected above, which
+    //   makes `has_environment()` true and routes the tools through the SSH
+    //   backend.
+    if server_mode.is_some() {
+        let _ = config.features.enable(Feature::ShellTool);
+    } else {
+        let _ = config.features.disable(Feature::ShellTool);
+    }
+
+    // SPIKE: enable the multi-agent v2 collaboration suite (spawn_agent,
+    // send_message, followup_task, wait_agent, interrupt_agent, list_agents).
+    // The version is derived from features: MultiAgentV2 => V2. spawn_agent
+    // creates another in-process thread via agent_control (no subprocess).
+    let _ = config.features.enable(Feature::MultiAgentV2);
 
     let new_thread = thread_manager
         .start_thread(config)
@@ -250,7 +320,14 @@ async fn run_turn_async(
                     settings: Settings {
                         model: if model.is_empty() { session_model } else { model },
                         reasoning_effort: Some(ReasoningEffort::High),
-                        developer_instructions: Some(MOBILE_DEVELOPER_INSTRUCTIONS.to_string()),
+                        developer_instructions: Some(
+                            if server_mode.is_some() {
+                                SERVER_MODE_DEVELOPER_INSTRUCTIONS
+                            } else {
+                                MOBILE_DEVELOPER_INSTRUCTIONS
+                            }
+                            .to_string(),
+                        ),
                     },
                 }),
                 ..Default::default()
@@ -431,7 +508,70 @@ pub extern "C" fn codex_run_turn_streaming(
                     .build()
                     .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
                 runtime.block_on(run_turn_async(
-                    token, id_tok, account, model, prompt, history, workspace, callback, ctx,
+                    token, id_tok, account, model, prompt, history, workspace,
+                    /*server_mode*/ None, callback, ctx,
+                ))
+            })
+            .map_err(|e| format!("failed to spawn worker thread: {e}"))?
+            .join()
+            .map_err(|_| "worker thread panicked".to_string())?
+    });
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => emit(callback, ctx, KIND_ERROR, &message),
+        Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
+    }
+}
+
+/// Rust-friendly entry point that drives ONE turn (optionally in server mode)
+/// on a dedicated big-stack thread + multi-thread tokio runtime, mirroring the
+/// safety dance in [`codex_run_turn_streaming`]. Owned `String`s in, so callers
+/// (the host test today; the C FFI + Swift wiring next) need not juggle C
+/// pointer lifetimes here.
+///
+/// Pass `server_mode = Some(..)` to run the turn's shell/exec tools on the SSH
+/// host; `None` keeps the local, shell-disabled behavior.
+///
+/// # Safety
+/// `callback` must be a valid function pointer; `ctx` is passed through
+/// opaquely and must outlive the call.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn run_turn_streaming(
+    access_token: String,
+    id_token: String,
+    account_id: String,
+    model: String,
+    prompt: String,
+    history_json: String,
+    workspace: String,
+    server_mode: Option<ServerMode>,
+    ctx: *mut c_void,
+    callback: EventCallback,
+) {
+    let ctx_addr = ctx as usize;
+    let result = std::panic::catch_unwind(move || {
+        std::thread::Builder::new()
+            .name("codex-turn".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || -> Result<(), String> {
+                let ctx = ctx_addr as *mut c_void;
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_stack_size(16 * 1024 * 1024)
+                    .build()
+                    .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+                runtime.block_on(run_turn_async(
+                    access_token,
+                    id_token,
+                    account_id,
+                    model,
+                    prompt,
+                    history_json,
+                    workspace,
+                    server_mode,
+                    callback,
+                    ctx,
                 ))
             })
             .map_err(|e| format!("failed to spawn worker thread: {e}"))?

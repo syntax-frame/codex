@@ -33,8 +33,8 @@ extern "C" fn on_event(ctx: *mut c_void, kind: c_int, text: *const c_char) {
         }
         4 => cap.history = s,                       // KIND_HISTORY (full rollout)
         5 => println!("\n  [TOOL] {s}"),            // KIND_TOOL_CALL
-        2 => println!("  «done»"),                 // done
-        3 => println!("  «ERROR: {s}»"),           // error
+        2 => println!("\n  «done»"),                // done
+        3 => println!("\n  «ERROR: {s}»"),          // error
         _ => {}
     }
 }
@@ -64,10 +64,10 @@ fn main() {
 
     let mut cap = Capture { history: String::new(), answer: String::new() };
 
-    println!("=== FILE TOOLS TEST (generic phrasing, mimics device) ===");
+    println!("=== SPAWN AGENT SPIKE ===");
     print!("answer: ");
     run(&token, &id, &account,
-        "I have three tasks: buy milk, call mom, finish the report. Can u write that down in a file?",
+        "Use your spawn_agent tool to spawn a sub-agent that computes 2+2 and reports the result. Wait for it (wait_agent) and then tell me what it returned. If you don't have a spawn_agent tool, say so explicitly.",
         "", &mut cap);
     println!("\n--- workspace contents on disk ---");
     let ws = std::env::temp_dir().join("codex_drive_turn_ws");

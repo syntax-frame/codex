@@ -326,6 +326,52 @@ impl EnvironmentManager {
         Ok(())
     }
 
+    /// Builds a manager whose sole environment is an SSH "server mode"
+    /// environment, registered under `environment_id` and selected as the
+    /// default. Shell/exec tools for any turn using this manager run on the SSH
+    /// host (see [`Environment::ssh`]); there is no local environment.
+    pub fn ssh(
+        environment_id: impl Into<String>,
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        key_path: impl Into<String>,
+        host_fingerprint: Option<String>,
+    ) -> Self {
+        let environment_id = environment_id.into();
+        let environment = Arc::new(Environment::ssh(host, port, user, key_path, host_fingerprint));
+        Self {
+            default_environment: Some(environment_id.clone()),
+            environments: RwLock::new(HashMap::from([(environment_id, environment)])),
+            local_environment: None,
+            local_runtime_paths: None,
+        }
+    }
+
+    /// Adds or replaces a named SSH "server mode" environment without changing
+    /// the manager's default environment selection.
+    pub fn upsert_ssh_environment(
+        &self,
+        environment_id: String,
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        key_path: impl Into<String>,
+        host_fingerprint: Option<String>,
+    ) -> Result<(), ExecServerError> {
+        if environment_id.is_empty() {
+            return Err(ExecServerError::Protocol(
+                "environment id cannot be empty".to_string(),
+            ));
+        }
+        let environment = Arc::new(Environment::ssh(host, port, user, key_path, host_fingerprint));
+        self.environments
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(environment_id, environment);
+        Ok(())
+    }
+
     /// Adds or replaces a named remote environment that connects through an
     /// authenticated, end-to-end encrypted rendezvous stream.
     ///
@@ -494,6 +540,40 @@ impl Environment {
             )),
             http_client: Arc::new(ReqwestHttpClient),
             local_runtime_paths: Some(local_runtime_paths),
+        }
+    }
+
+    /// Builds an environment whose exec backend runs shell tools on a remote
+    /// host over SSH (see [`crate::ssh_process::SshProcessBackend`]).
+    ///
+    /// This is the "server mode" execution path: shell/exec tools run on the
+    /// SSH host, while the filesystem stays local for this pass (apply_patch /
+    /// remote files are a later pass). It is NOT a `remote_client` environment,
+    /// so [`Environment::is_remote`] stays `false` and the local shell is used
+    /// for snapshotting; only process execution is redirected over SSH.
+    ///
+    /// `host_fingerprint` is accepted for forward-compatibility (host-key
+    /// pinning). It is currently unused: `SshProcessBackend` does not pin the
+    /// server key yet, so it is recorded here but not enforced.
+    pub fn ssh(
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        key_path: impl Into<String>,
+        _host_fingerprint: Option<String>,
+    ) -> Self {
+        Self {
+            exec_server_url: None,
+            remote_client: None,
+            startup_task: Arc::new(Mutex::new(None)),
+            exec_backend: Arc::new(crate::ssh_process::SshProcessBackend::new(
+                host, port, user, key_path,
+            )),
+            // Filesystem stays local for this pass; apply_patch/remote files are
+            // a later pass. Only the exec backend is redirected over SSH.
+            filesystem: Arc::new(LocalFileSystem::unsandboxed()),
+            http_client: Arc::new(ReqwestHttpClient),
+            local_runtime_paths: None,
         }
     }
 
