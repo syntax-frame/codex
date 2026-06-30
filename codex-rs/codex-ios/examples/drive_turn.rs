@@ -64,10 +64,10 @@ fn main() {
 
     let mut cap = Capture { history: String::new(), answer: String::new() };
 
-    println!("=== SPAWN AGENT SPIKE ===");
+    println!("=== HTTP TOOL TEST (local node) ===");
     print!("answer: ");
     run(&token, &id, &account,
-        "Use your spawn_agent tool to spawn a sub-agent that computes 2+2 and reports the result. Wait for it (wait_agent) and then tell me what it returned. If you don't have a spawn_agent tool, say so explicitly.",
+        "Use your http_request tool to GET https://api.github.com/zen (send a User-Agent header like 'agentapp'), then tell me exactly what the response body says. If you don't have an http_request tool, say so explicitly.",
         "", &mut cap);
     println!("\n--- workspace contents on disk ---");
     let ws = std::env::temp_dir().join("codex_drive_turn_ws");

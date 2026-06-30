@@ -7,6 +7,7 @@ use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
 use crate::tools::handlers::ApplyPatchHandler;
+use crate::tools::handlers::HttpRequestHandler;
 use crate::tools::handlers::ListDirHandler;
 use crate::tools::handlers::ReadFileHandler;
 use crate::tools::handlers::WriteFileHandler;
@@ -721,11 +722,16 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
     planned_tools.add(PlanHandler);
 
-    // On-device file tools: read/write/list within the turn's workspace (cwd).
-    // No shell, no environment — plain filesystem, jailed to the working dir.
-    planned_tools.add(ReadFileHandler);
-    planned_tools.add(WriteFileHandler);
-    planned_tools.add(ListDirHandler);
+    // On-device tools for LOCAL (Type-A) nodes only: read/write/list within the
+    // turn's workspace + http_request for API access. Gated on the shell tool
+    // being disabled — server (Type-B) nodes enable the shell and use it instead
+    // (they don't need the local file tools, and HTTP belongs to local agents).
+    if !features.enabled(Feature::ShellTool) {
+        planned_tools.add(ReadFileHandler);
+        planned_tools.add(WriteFileHandler);
+        planned_tools.add(ListDirHandler);
+        planned_tools.add(HttpRequestHandler);
+    }
 
     if features.enabled(Feature::DeferredExecutor) {
         planned_tools.add(WaitForEnvironmentHandler);
