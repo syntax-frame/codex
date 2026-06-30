@@ -247,7 +247,18 @@ pub(crate) async fn run_turn_async(
             // hang the turn forever — there is no UI to approve), and treat the
             // node's workspace as writable so any write-capable tool proceeds.
             approval_policy: Some(AskForApproval::Never),
-            sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+            // In server mode the command runs on a REMOTE machine over SSH, so a
+            // *local* OS sandbox is meaningless — and iOS has no seatbelt to set
+            // one up, so trying to sandbox would force an escalation that
+            // approval=Never auto-denies ("blocked by the execution environment").
+            // Use DangerFullAccess so exec dispatches straight to the SSH backend;
+            // the real security boundary is the remote host (key-only SSH).
+            // Local mode keeps WorkspaceWrite.
+            sandbox_mode: Some(if server_mode.is_some() {
+                SandboxMode::DangerFullAccess
+            } else {
+                SandboxMode::WorkspaceWrite
+            }),
             ..Default::default()
         })
         .build()
