@@ -21,6 +21,7 @@ use std::os::raw::c_void;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::test_support::thread_manager_with_models_provider;
+use codex_features::Feature;
 use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
 use codex_login::AuthKeyringBackendKind;
@@ -28,8 +29,11 @@ use codex_login::CodexAuth;
 use codex_login::TokenData;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
@@ -38,6 +42,17 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+
+/// Steers the model toward the on-device tools. This build runs on a phone with
+/// no shell and no patch environment, so `apply_patch` and any shell/exec tool
+/// cannot work here; without this nudge the model reaches for `apply_patch`
+/// first, fails, and only then falls back to `write_file` (a wasted round-trip
+/// and a confusing "the patch tool failed" line in the user's chat).
+const MOBILE_DEVELOPER_INSTRUCTIONS: &str = "You are running natively on a mobile device. There is no shell and no patch \
+environment. For ALL file operations use only the `read_file`, `write_file`, and \
+`list_dir` tools. Never use `apply_patch`, `shell`, or `exec_command` — they are \
+unavailable here and will fail. To create or modify a file, write its full \
+contents with `write_file`.";
 
 /// Event-kind discriminants passed to the callback.
 const KIND_REASONING_DELTA: c_int = 0;
@@ -170,6 +185,12 @@ async fn run_turn_async(
             } else {
                 Some(std::path::PathBuf::from(&workspace))
             },
+            // The mobile build has no human in the loop to answer approval
+            // prompts and no OS sandbox: never block on an approval (that would
+            // hang the turn forever — there is no UI to approve), and treat the
+            // node's workspace as writable so any write-capable tool proceeds.
+            approval_policy: Some(AskForApproval::Never),
+            sandbox_mode: Some(SandboxMode::WorkspaceWrite),
             ..Default::default()
         })
         .build()
@@ -181,6 +202,14 @@ async fn run_turn_async(
     // final answer.
     config.model_reasoning_effort = Some(ReasoningEffort::High);
     config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
+
+    // iOS has no shell: there is no `/bin/zsh` to spawn, so the unified-exec /
+    // shell tools can never run here. Worse, when offered them the model prefers
+    // shell (`printf … | tee file`) over our native `write_file`, which then
+    // trips the approval machinery and hangs the turn. Disable the shell tool so
+    // the only file-mutating tools are our on-device read_file/write_file/
+    // list_dir handlers.
+    let _ = config.features.disable(Feature::ShellTool);
 
     let new_thread = thread_manager
         .start_thread(config)
@@ -221,7 +250,7 @@ async fn run_turn_async(
                     settings: Settings {
                         model: if model.is_empty() { session_model } else { model },
                         reasoning_effort: Some(ReasoningEffort::High),
-                        developer_instructions: None,
+                        developer_instructions: Some(MOBILE_DEVELOPER_INSTRUCTIONS.to_string()),
                     },
                 }),
                 ..Default::default()
@@ -241,6 +270,26 @@ async fn run_turn_async(
             .await
             .map_err(|e| format!("event stream error: {e}"))?;
         match event.msg {
+            // Safety net: with approval_policy=Never these should not fire, but
+            // if any approval-gated tool ever requests a decision there is no UI
+            // to answer it — auto-approve so the turn can never deadlock.
+            EventMsg::ExecApprovalRequest(ev) => {
+                let _ = thread
+                    .submit(Op::ExecApproval {
+                        id: ev.effective_approval_id(),
+                        turn_id: Some(ev.turn_id.clone()),
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await;
+            }
+            EventMsg::ApplyPatchApprovalRequest(ev) => {
+                let _ = thread
+                    .submit(Op::PatchApproval {
+                        id: ev.call_id.clone(),
+                        decision: ReviewDecision::Approved,
+                    })
+                    .await;
+            }
             EventMsg::ReasoningContentDelta(ev) => {
                 if last_summary_index.is_some_and(|prev| prev != ev.summary_index) {
                     emit(callback, ctx, KIND_REASONING_BREAK, "");

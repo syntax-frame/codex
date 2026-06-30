@@ -27,6 +27,8 @@ extern "C" fn on_event(ctx: *mut c_void, kind: c_int, text: *const c_char) {
         0 => {}                                   // reasoning delta (ignore here)
         1 => {                                     // text delta
             print!("{s}");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
             cap.answer.push_str(&s);
         }
         4 => cap.history = s,                       // KIND_HISTORY (full rollout)
@@ -62,10 +64,10 @@ fn main() {
 
     let mut cap = Capture { history: String::new(), answer: String::new() };
 
-    println!("=== FILE TOOLS TEST ===");
+    println!("=== FILE TOOLS TEST (generic phrasing, mimics device) ===");
     print!("answer: ");
     run(&token, &id, &account,
-        "Use your file tools to do this on disk: write a file named notes.txt containing exactly 'hello world', then list the directory, then read notes.txt back. Then tell me the directory listing and the file contents.",
+        "I have three tasks: buy milk, call mom, finish the report. Can u write that down in a file?",
         "", &mut cap);
     println!("\n--- workspace contents on disk ---");
     let ws = std::env::temp_dir().join("codex_drive_turn_ws");
