@@ -466,6 +466,13 @@ pub struct Environment {
     filesystem: Arc<dyn ExecutorFileSystem>,
     http_client: Arc<dyn HttpClient>,
     local_runtime_paths: Option<ExecServerRuntimePaths>,
+    /// When `true`, exec dispatch must route shell/exec tools through
+    /// [`Environment::get_exec_backend`] even though this is not a
+    /// `remote_client` environment (`is_remote()` stays `false`). This is set
+    /// for "server mode" (SSH) environments, whose `exec_backend` is a
+    /// `SshProcessBackend`: without this flag, exec would fall through to a
+    /// local native process spawn (forbidden on iOS) instead of going over SSH.
+    force_backend_exec: bool,
 }
 
 impl Environment {
@@ -479,6 +486,7 @@ impl Environment {
             filesystem: Arc::new(LocalFileSystem::unsandboxed()),
             http_client: Arc::new(ReqwestHttpClient),
             local_runtime_paths: None,
+            force_backend_exec: false,
         }
     }
 }
@@ -540,6 +548,7 @@ impl Environment {
             )),
             http_client: Arc::new(ReqwestHttpClient),
             local_runtime_paths: Some(local_runtime_paths),
+            force_backend_exec: false,
         }
     }
 
@@ -575,6 +584,10 @@ impl Environment {
             filesystem: Arc::new(LocalFileSystem::unsandboxed()),
             http_client: Arc::new(ReqwestHttpClient),
             local_runtime_paths: None,
+            // Server mode: exec must go over SSH via `exec_backend`, even though
+            // this is not a `remote_client` environment (`is_remote()` stays
+            // false so shell-info snapshotting uses the safe local path).
+            force_backend_exec: true,
         }
     }
 
@@ -616,11 +629,23 @@ impl Environment {
             filesystem,
             http_client: Arc::new(client),
             local_runtime_paths,
+            // `is_remote()` already routes exec through the backend for remote
+            // environments; the explicit flag is only needed for SSH server mode.
+            force_backend_exec: false,
         }
     }
 
     pub fn is_remote(&self) -> bool {
         self.remote_client.is_some()
+    }
+
+    /// Returns `true` when exec dispatch must route shell/exec tools through
+    /// [`Environment::get_exec_backend`] rather than spawning a local native
+    /// process. This is `true` for remote (`remote_client`) environments and
+    /// for "server mode" SSH environments, whose backend is a
+    /// `SshProcessBackend`. Local environments return `false`.
+    pub fn uses_backend_exec(&self) -> bool {
+        self.is_remote() || self.force_backend_exec
     }
 
     /// Returns the remote exec-server URL when this environment is remote.

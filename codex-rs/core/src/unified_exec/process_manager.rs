@@ -1048,7 +1048,7 @@ impl UnifiedExecProcessManager {
             )
             .await;
         }
-        if environment.is_remote() {
+        if environment.uses_backend_exec() {
             if !inherited_fds.is_empty() {
                 return Err(UnifiedExecError::create_process(
                     "remote exec-server does not support inherited file descriptors".to_string(),
