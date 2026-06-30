@@ -134,6 +134,22 @@ fn emit(callback: EventCallback, ctx: *mut c_void, kind: c_int, text: &str) {
     }
 }
 
+/// Pull the first target file path out of an apply_patch grammar body — the
+/// `*** Add File: <path>` / `*** Update File: <path>` / `*** Delete File: <path>`
+/// line — so the tool bubble can show which file is being edited. Returns "" if
+/// none is found.
+fn patch_target_file(input: &str) -> String {
+    for line in input.lines() {
+        let line = line.trim();
+        for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                return rest.trim().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// Build a `CodexAuth` for the ChatGPT/codex backend from a raw OAuth token by
 /// writing an ephemeral `auth.json` and loading it through the normal storage
 /// path. `codex_home` must be a freshly created (temp) directory.
@@ -400,11 +416,10 @@ pub(crate) async fn run_turn_async(
             // Any function tool call the model makes (read_file/write_file/
             // list_dir/update_plan/shell/…) surfaces generically here — the raw
             // response item carries the function name + arguments live.
-            EventMsg::RawResponseItem(ev) => {
-                if let ResponseItem::FunctionCall {
+            EventMsg::RawResponseItem(ev) => match &ev.item {
+                ResponseItem::FunctionCall {
                     name, arguments, ..
-                } = &ev.item
-                {
+                } => {
                     let args: serde_json::Value =
                         serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
                     let payload = serde_json::json!({ "tool": name, "args": args });
@@ -412,7 +427,22 @@ pub(crate) async fn run_turn_async(
                         emit(callback, ctx, KIND_TOOL_CALL, &json);
                     }
                 }
-            }
+                // Freeform / "custom" tools (notably apply_patch) are NOT
+                // FunctionCalls — they carry their raw grammar text in `input`.
+                // Surface them too, and pull the target file out of the patch so
+                // the bubble shows what's being edited.
+                ResponseItem::CustomToolCall { name, input, .. } => {
+                    let file = patch_target_file(input);
+                    let payload = serde_json::json!({
+                        "tool": name,
+                        "args": { "path": file },
+                    });
+                    if let Ok(json) = serde_json::to_string(&payload) {
+                        emit(callback, ctx, KIND_TOOL_CALL, &json);
+                    }
+                }
+                _ => {}
+            },
             // Web search (provider-hosted, not a function call) — surfaced on
             // completion (carries the query + the action/result).
             EventMsg::WebSearchEnd(ev) => {
