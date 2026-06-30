@@ -27,6 +27,7 @@ mod rpc;
 mod runtime_paths;
 mod sandboxed_file_system;
 mod server;
+mod ssh_process;
 mod telemetry;
 mod trace_context;
 
@@ -91,6 +92,7 @@ pub use process::ExecProcessEvent;
 pub use process::ExecProcessEventReceiver;
 pub use process::ExecProcessFuture;
 pub use process::StartedExecProcess;
+pub use ssh_process::SshProcessBackend;
 pub use protocol::ByteChunk;
 pub use protocol::EnvironmentInfo;
 pub use protocol::ExecClosedNotification;

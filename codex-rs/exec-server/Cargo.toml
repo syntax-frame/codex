@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 arc-swap = { workspace = true }
+async-trait = "0.1"
 axum = { workspace = true, features = ["http1", "tokio", "ws"] }
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -32,6 +33,9 @@ futures = { workspace = true }
 http = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 prost = "0.14.3"
+# Pin russh to 0.45 EXACTLY: 0.61 pulls ml-kem 0.3.x which conflicts with the
+# ml-kem 0.2.x that `clatter` already depends on in this crate (build failure).
+russh = "=0.45"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

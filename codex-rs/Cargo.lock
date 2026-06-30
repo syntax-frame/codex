@@ -2932,6 +2932,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -2959,6 +2960,7 @@ dependencies = [
  "prost 0.14.3",
  "rcgen",
  "reqwest 0.12.28",
+ "russh",
  "rustls",
  "serde",
  "serde_json",
