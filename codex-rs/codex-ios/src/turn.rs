@@ -12,6 +12,7 @@
 //! freshly-created temp dir that is deleted when the call returns; nothing is
 //! logged or persisted beyond the lifetime of the call.
 
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::os::raw::c_char;
@@ -30,18 +31,20 @@ use codex_login::AuthKeyringBackendKind;
 use codex_login::CodexAuth;
 use codex_login::TokenData;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::ReviewDecision;
-use codex_protocol::protocol::RolloutItem;
+use codex_model_provider_info::WireApi;
+use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_protocol::config_types::CollaborationMode;
-use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::Settings;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 
@@ -109,8 +112,7 @@ const KIND_ERROR: c_int = 3;
 /// C string that is ONLY valid for the duration of the call; the callee must
 /// copy it if it needs to outlive the invocation. `ctx` is passed through
 /// verbatim so Swift can recover its closure/context.
-pub type EventCallback =
-    extern "C" fn(ctx: *mut c_void, event_kind: c_int, text: *const c_char);
+pub type EventCallback = extern "C" fn(ctx: *mut c_void, event_kind: c_int, text: *const c_char);
 
 fn c_str_to_string(ptr: *const c_char, field: &str) -> Result<String, String> {
     if ptr.is_null() {
@@ -148,6 +150,16 @@ fn patch_target_file(input: &str) -> String {
         }
     }
     String::new()
+}
+
+/// Stable key for tool calls that may be replayed when prior rollout history is
+/// injected into a fresh one-shot iOS thread.
+fn tool_call_replay_key(item: &ResponseItem) -> Option<String> {
+    match item {
+        ResponseItem::FunctionCall { call_id, .. } => Some(format!("function:{call_id}")),
+        ResponseItem::CustomToolCall { call_id, .. } => Some(format!("custom:{call_id}")),
+        _ => None,
+    }
 }
 
 /// Build a `CodexAuth` for the ChatGPT/codex backend from a raw OAuth token by
@@ -196,10 +208,27 @@ async fn build_auth(
     .ok_or_else(|| "ephemeral auth.json produced no auth".to_string())
 }
 
+/// How to authenticate + which backend to talk to for a turn.
+///
+/// This is the ONE place provider selection lives. The ChatGPT-OAuth variant is
+/// the original path (unchanged behavior); the ApiKey variant targets any
+/// OpenAI-Responses-compatible endpoint (OpenAI proper, a local Ollama/LM Studio
+/// server, or any paid compatible provider) with a plain bearer API key.
+pub(crate) enum ProviderAuthConfig {
+    /// Original path: ChatGPT OAuth tokens; base_url resolves to the codex
+    /// backend automatically.
+    ChatgptOAuth {
+        access_token: String,
+        id_token: String,
+        account_id: String,
+    },
+    /// Generic API-key path: `Authorization: Bearer <api_key>` against
+    /// `base_url` (must expose the OpenAI Responses API at `<base_url>/responses`).
+    ApiKey { base_url: String, api_key: String },
+}
+
 pub(crate) async fn run_turn_async(
-    access_token: String,
-    id_token: String,
-    account_id: String,
+    provider_config: ProviderAuthConfig,
     model: String,
     prompt: String,
     history_json: String,
@@ -213,12 +242,34 @@ pub(crate) async fn run_turn_async(
     let home_guard = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
     let codex_home = home_guard.path().to_path_buf();
 
-    let auth = build_auth(&codex_home, access_token, id_token, account_id).await?;
-
-    // The built-in OpenAI provider with ChatGPT auth resolves its base_url to
-    // `https://chatgpt.com/backend-api/codex` automatically (see
-    // ModelProviderInfo::to_api_provider).
-    let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    // Build (auth, provider) from the selected config. The OAuth branch is
+    // byte-for-byte the original behavior; the ApiKey branch resolves auth via
+    // the provider's bearer-token path (see codex-model-provider's
+    // `resolve_provider_auth`, which honors a bearer API key BEFORE any OAuth
+    // logic), so no ChatGPT machinery is touched.
+    let (auth, provider) = match provider_config {
+        ProviderAuthConfig::ChatgptOAuth {
+            access_token,
+            id_token,
+            account_id,
+        } => {
+            let auth = build_auth(&codex_home, access_token, id_token, account_id).await?;
+            // The built-in OpenAI provider with ChatGPT auth resolves its
+            // base_url to `https://chatgpt.com/backend-api/codex` automatically
+            // (see ModelProviderInfo::to_api_provider).
+            let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+            (auth, provider)
+        }
+        ProviderAuthConfig::ApiKey { base_url, api_key } => {
+            // `CodexAuth::from_api_key` produces a plain `Authorization: Bearer
+            // <key>` header. The provider (name != "OpenAI") targets the given
+            // base_url via the Responses wire API. requires_openai_auth is false
+            // for the oss provider, so none of the ChatGPT-specific auth applies.
+            let auth = CodexAuth::from_api_key(&api_key);
+            let provider = create_oss_provider_with_base_url(&base_url, WireApi::Responses);
+            (auth, provider)
+        }
+    };
 
     // Minimal ThreadManager: a dummy AuthManager wrapping our CodexAuth plus the
     // codex provider. This is the smallest public construction path; it manages
@@ -329,6 +380,8 @@ pub(crate) async fn run_turn_async(
         serde_json::from_str(&history_json)
             .map_err(|e| format!("failed to parse history json: {e}"))?
     };
+    let mut replayed_tool_calls: HashSet<String> =
+        prior.iter().filter_map(tool_call_replay_key).collect();
     if !prior.is_empty() {
         thread
             .inject_response_items(prior)
@@ -350,7 +403,11 @@ pub(crate) async fn run_turn_async(
                 collaboration_mode: Some(CollaborationMode {
                     mode: ModeKind::Default,
                     settings: Settings {
-                        model: if model.is_empty() { session_model } else { model },
+                        model: if model.is_empty() {
+                            session_model
+                        } else {
+                            model
+                        },
                         reasoning_effort: Some(ReasoningEffort::High),
                         developer_instructions: Some(
                             if server_mode.is_some() {
@@ -416,33 +473,41 @@ pub(crate) async fn run_turn_async(
             // Any function tool call the model makes (read_file/write_file/
             // list_dir/update_plan/shell/…) surfaces generically here — the raw
             // response item carries the function name + arguments live.
-            EventMsg::RawResponseItem(ev) => match &ev.item {
-                ResponseItem::FunctionCall {
-                    name, arguments, ..
-                } => {
-                    let args: serde_json::Value =
-                        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
-                    let payload = serde_json::json!({ "tool": name, "args": args });
-                    if let Ok(json) = serde_json::to_string(&payload) {
-                        emit(callback, ctx, KIND_TOOL_CALL, &json);
+            EventMsg::RawResponseItem(ev) => {
+                if let Some(key) = tool_call_replay_key(&ev.item) {
+                    if replayed_tool_calls.remove(&key) {
+                        continue;
                     }
                 }
-                // Freeform / "custom" tools (notably apply_patch) are NOT
-                // FunctionCalls — they carry their raw grammar text in `input`.
-                // Surface them too, and pull the target file out of the patch so
-                // the bubble shows what's being edited.
-                ResponseItem::CustomToolCall { name, input, .. } => {
-                    let file = patch_target_file(input);
-                    let payload = serde_json::json!({
-                        "tool": name,
-                        "args": { "path": file },
-                    });
-                    if let Ok(json) = serde_json::to_string(&payload) {
-                        emit(callback, ctx, KIND_TOOL_CALL, &json);
+
+                match &ev.item {
+                    ResponseItem::FunctionCall {
+                        name, arguments, ..
+                    } => {
+                        let args: serde_json::Value =
+                            serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+                        let payload = serde_json::json!({ "tool": name, "args": args });
+                        if let Ok(json) = serde_json::to_string(&payload) {
+                            emit(callback, ctx, KIND_TOOL_CALL, &json);
+                        }
                     }
+                    // Freeform / "custom" tools (notably apply_patch) are NOT
+                    // FunctionCalls — they carry their raw grammar text in `input`.
+                    // Surface them too, and pull the target file out of the patch so
+                    // the bubble shows what's being edited.
+                    ResponseItem::CustomToolCall { name, input, .. } => {
+                        let file = patch_target_file(input);
+                        let payload = serde_json::json!({
+                            "tool": name,
+                            "args": { "path": file },
+                        });
+                        if let Ok(json) = serde_json::to_string(&payload) {
+                            emit(callback, ctx, KIND_TOOL_CALL, &json);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             // Web search (provider-hosted, not a function call) — surfaced on
             // completion (carries the query + the action/result).
             EventMsg::WebSearchEnd(ev) => {
@@ -554,7 +619,90 @@ pub extern "C" fn codex_run_turn_streaming(
                     .build()
                     .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
                 runtime.block_on(run_turn_async(
-                    token, id_tok, account, model, prompt, history, workspace,
+                    ProviderAuthConfig::ChatgptOAuth {
+                        access_token: token,
+                        id_token: id_tok,
+                        account_id: account,
+                    },
+                    model, prompt, history, workspace,
+                    /*server_mode*/ None, callback, ctx,
+                ))
+            })
+            .map_err(|e| format!("failed to spawn worker thread: {e}"))?
+            .join()
+            .map_err(|_| "worker thread panicked".to_string())?
+    });
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => emit(callback, ctx, KIND_ERROR, &message),
+        Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
+    }
+}
+
+/// Generic API-key counterpart of [`codex_run_turn_streaming`]: drives ONE user
+/// turn against ANY OpenAI-Responses-compatible endpoint using a plain bearer
+/// API key instead of ChatGPT OAuth. This is the path for OpenAI proper (with an
+/// API key), a local Ollama / LM Studio server, or any paid compatible provider.
+///
+/// `base_url` is the provider's API root that exposes the Responses API at
+/// `<base_url>/responses` (e.g. `http://localhost:11434/v1` for a local Ollama,
+/// or `https://api.openai.com/v1`). `api_key` is sent as `Authorization: Bearer
+/// <api_key>`; for a local server that ignores auth it can be any non-empty
+/// placeholder.
+///
+/// Local mode only (shell/exec disabled, on-device file tools) — mirrors
+/// [`codex_run_turn_streaming`]. Event kinds and error handling are identical.
+///
+/// # Safety
+/// All string pointers must be either null or valid NUL-terminated C strings.
+/// `callback` must be a valid function pointer; `ctx` is passed through opaquely.
+#[unsafe(no_mangle)]
+pub extern "C" fn codex_run_turn_streaming_apikey(
+    base_url: *const c_char,
+    api_key: *const c_char,
+    model: *const c_char,
+    prompt: *const c_char,
+    history_json: *const c_char,
+    workspace_path: *const c_char,
+    ctx: *mut c_void,
+    callback: EventCallback,
+) {
+    let ctx_addr = ctx as usize;
+    let result = std::panic::catch_unwind(move || {
+        // Parse the C strings on the calling thread (the pointers are only valid
+        // for the duration of this call), then move the owned data into a worker.
+        let base_url = c_str_to_string(base_url, "base_url")?;
+        let api_key = c_str_to_string(api_key, "api_key")?;
+        let model = c_str_to_string(model, "model")?;
+        let prompt = c_str_to_string(prompt, "prompt")?;
+        // History is optional: NULL or empty means a fresh conversation.
+        let history = if history_json.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(history_json, "history_json")?
+        };
+        // Workspace dir to root the turn at (where file tools operate). Optional.
+        let workspace = if workspace_path.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(workspace_path, "workspace_path")?
+        };
+
+        // Same big-stack worker + multi-thread runtime dance as the OAuth FFI.
+        std::thread::Builder::new()
+            .name("codex-turn".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || -> Result<(), String> {
+                let ctx = ctx_addr as *mut c_void;
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_stack_size(16 * 1024 * 1024)
+                    .build()
+                    .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+                runtime.block_on(run_turn_async(
+                    ProviderAuthConfig::ApiKey { base_url, api_key },
+                    model, prompt, history, workspace,
                     /*server_mode*/ None, callback, ctx,
                 ))
             })
@@ -639,18 +787,14 @@ pub extern "C" fn codex_run_turn_streaming_server(
             None
         } else {
             let s = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
-            if s.trim().is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+            if s.trim().is_empty() { None } else { Some(s) }
         };
 
         // Persist the private key PEM to a chmod-600 file in an ephemeral temp
         // dir. The dir (and key) live for the duration of the worker thread and
         // are removed when `key_dir` drops after the turn completes.
-        let key_dir = tempfile::tempdir()
-            .map_err(|e| format!("failed to create ssh key tempdir: {e}"))?;
+        let key_dir =
+            tempfile::tempdir().map_err(|e| format!("failed to create ssh key tempdir: {e}"))?;
         let key_path = key_dir.path().join("id_ssh");
         std::fs::write(&key_path, key_pem.as_bytes())
             .map_err(|e| format!("failed to write ssh key file: {e}"))?;
@@ -684,8 +828,18 @@ pub extern "C" fn codex_run_turn_streaming_server(
                     .build()
                     .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
                 runtime.block_on(run_turn_async(
-                    token, id_tok, account, model, prompt, history, workspace,
-                    /*server_mode*/ Some(server_mode), callback, ctx,
+                    ProviderAuthConfig::ChatgptOAuth {
+                        access_token: token,
+                        id_token: id_tok,
+                        account_id: account,
+                    },
+                    model,
+                    prompt,
+                    history,
+                    workspace,
+                    /*server_mode*/ Some(server_mode),
+                    callback,
+                    ctx,
                 ))
             })
             .map_err(|e| format!("failed to spawn worker thread: {e}"))?
@@ -738,9 +892,11 @@ pub unsafe fn run_turn_streaming(
                     .build()
                     .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
                 runtime.block_on(run_turn_async(
-                    access_token,
-                    id_token,
-                    account_id,
+                    ProviderAuthConfig::ChatgptOAuth {
+                        access_token,
+                        id_token,
+                        account_id,
+                    },
                     model,
                     prompt,
                     history_json,

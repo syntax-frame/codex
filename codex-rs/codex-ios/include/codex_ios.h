@@ -75,6 +75,38 @@ void codex_run_turn_streaming(const char *access_token,
                               codex_event_callback callback);
 
 /*
+ * Generic API-key counterpart of codex_run_turn_streaming(): drive ONE user
+ * turn against ANY OpenAI-Responses-compatible endpoint using a plain bearer
+ * API key instead of ChatGPT OAuth. Use for OpenAI proper (with an API key), a
+ * local Ollama / LM Studio server, or any paid compatible provider. Same
+ * streaming/callback contract and event kinds as codex_run_turn_streaming().
+ * Local mode only (shell/exec disabled, on-device file tools).
+ *
+ * All string args are NUL-terminated UTF-8 C strings (null/empty as noted):
+ *   base_url        Provider API root exposing the Responses API at
+ *                   "<base_url>/responses" (e.g. "http://localhost:11434/v1"
+ *                   for a local Ollama, or "https://api.openai.com/v1").
+ *   api_key         Sent as "Authorization: Bearer <api_key>". For a local
+ *                   server that ignores auth, any non-empty placeholder works.
+ *   model           Model slug, e.g. "granite4.1:8b" or "gpt-5.4".
+ *   prompt          The user prompt.
+ *   history_json    Prior conversation rollout as a JSON array of ResponseItems,
+ *                   or NULL/empty for a fresh conversation.
+ *   workspace_path  Absolute path to the node's working directory; the turn is
+ *                   rooted here so file tools operate inside it. NULL/empty = none.
+ *   ctx             opaque pointer forwarded to every callback invocation.
+ *   callback        invoked for each streamed event (see codex_event_callback).
+ */
+void codex_run_turn_streaming_apikey(const char *base_url,
+                                     const char *api_key,
+                                     const char *model,
+                                     const char *prompt,
+                                     const char *history_json,
+                                     const char *workspace_path,
+                                     void *ctx,
+                                     codex_event_callback callback);
+
+/*
  * Server-mode counterpart of codex_run_turn_streaming(): drive ONE user turn
  * whose shell/exec tools run on a remote host over SSH instead of being
  * disabled. Same streaming/callback contract and event kinds as
