@@ -107,6 +107,7 @@ const KIND_TOOL_CALL: c_int = 5;
 /// new "thinking" bubble for subsequent reasoning deltas.
 const KIND_REASONING_BREAK: c_int = 6;
 const KIND_ERROR: c_int = 3;
+const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
 
 /// Callback invoked for each streamed event. `text` is a NUL-terminated UTF-8
 /// C string that is ONLY valid for the duration of the call; the callee must
@@ -208,6 +209,49 @@ async fn build_auth(
     .ok_or_else(|| "ephemeral auth.json produced no auth".to_string())
 }
 
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+async fn write_api_key_provider_config(
+    codex_home: &std::path::Path,
+    base_url: &str,
+) -> Result<(), String> {
+    let config = format!(
+        r#"model_provider = "{provider_id}"
+
+[model_providers.{provider_id}]
+name = "iOS API key"
+base_url = {base_url}
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+"#,
+        provider_id = IOS_APIKEY_PROVIDER_ID,
+        base_url = toml_basic_string(base_url),
+    );
+    tokio::fs::write(codex_home.join("config.toml"), config)
+        .await
+        .map_err(|e| format!("failed to write ephemeral config.toml: {e}"))
+}
+
 /// How to authenticate + which backend to talk to for a turn.
 ///
 /// This is the ONE place provider selection lives. The ChatGPT-OAuth variant is
@@ -247,7 +291,7 @@ pub(crate) async fn run_turn_async(
     // the provider's bearer-token path (see codex-model-provider's
     // `resolve_provider_auth`, which honors a bearer API key BEFORE any OAuth
     // logic), so no ChatGPT machinery is touched.
-    let (auth, provider) = match provider_config {
+    let (auth, provider, model_provider_override) = match provider_config {
         ProviderAuthConfig::ChatgptOAuth {
             access_token,
             id_token,
@@ -258,16 +302,21 @@ pub(crate) async fn run_turn_async(
             // base_url to `https://chatgpt.com/backend-api/codex` automatically
             // (see ModelProviderInfo::to_api_provider).
             let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-            (auth, provider)
+            (auth, provider, None)
         }
         ProviderAuthConfig::ApiKey { base_url, api_key } => {
             // `CodexAuth::from_api_key` produces a plain `Authorization: Bearer
             // <key>` header. The provider (name != "OpenAI") targets the given
             // base_url via the Responses wire API. requires_openai_auth is false
             // for the oss provider, so none of the ChatGPT-specific auth applies.
+            //
+            // The Config built below must also select a provider with this
+            // base_url. Otherwise the thread starts with the default `openai`
+            // provider and the request falls back to api.openai.com.
+            write_api_key_provider_config(&codex_home, &base_url).await?;
             let auth = CodexAuth::from_api_key(&api_key);
             let provider = create_oss_provider_with_base_url(&base_url, WireApi::Responses);
-            (auth, provider)
+            (auth, provider, Some(IOS_APIKEY_PROVIDER_ID.to_string()))
         }
     };
 
@@ -329,6 +378,7 @@ pub(crate) async fn run_turn_async(
             } else {
                 SandboxMode::WorkspaceWrite
             }),
+            model_provider: model_provider_override,
             ..Default::default()
         })
         .build()
@@ -624,8 +674,13 @@ pub extern "C" fn codex_run_turn_streaming(
                         id_token: id_tok,
                         account_id: account,
                     },
-                    model, prompt, history, workspace,
-                    /*server_mode*/ None, callback, ctx,
+                    model,
+                    prompt,
+                    history,
+                    workspace,
+                    /*server_mode*/ None,
+                    callback,
+                    ctx,
                 ))
             })
             .map_err(|e| format!("failed to spawn worker thread: {e}"))?
@@ -702,8 +757,13 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
                     .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
                 runtime.block_on(run_turn_async(
                     ProviderAuthConfig::ApiKey { base_url, api_key },
-                    model, prompt, history, workspace,
-                    /*server_mode*/ None, callback, ctx,
+                    model,
+                    prompt,
+                    history,
+                    workspace,
+                    /*server_mode*/ None,
+                    callback,
+                    ctx,
                 ))
             })
             .map_err(|e| format!("failed to spawn worker thread: {e}"))?
