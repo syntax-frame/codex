@@ -40,7 +40,6 @@ use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
-use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::config_types::ModeKind;
@@ -324,6 +323,7 @@ pub(crate) async fn run_turn_async(
     prompt: String,
     history_json: String,
     workspace: String,
+    dynamic_tools_json: String,
     server_mode: Option<ServerMode>,
     callback: EventCallback,
     ctx: *mut c_void,
@@ -455,37 +455,24 @@ pub(crate) async fn run_turn_async(
         let _ = config.features.disable(Feature::ShellTool);
     }
 
-    // SPIKE: enable the multi-agent v2 collaboration suite (spawn_agent,
-    // send_message, followup_task, wait_agent, interrupt_agent, list_agents).
-    // The version is derived from features: MultiAgentV2 => V2. spawn_agent
-    // creates another in-process thread via agent_control (no subprocess).
-    let _ = config.features.enable(Feature::MultiAgentV2);
+    // Disable Codex's built-in MultiAgentV2 spike (spawn_agent / send_message /
+    // followup_task / wait_agent / interrupt_agent / list_agents). Its tool names
+    // clash with OUR orchestration dynamic tools (executed in Swift as persistent
+    // graph nodes), so the built-in in-process suite must be off.
+    let _ = config.features.disable(Feature::MultiAgentV2);
 
-    // TODO(phase1): remove echo; replace with the real orchestration tool specs
-    // (spawn_agent / send_message / wait_agent / …) provided from Swift.
-    //
-    // Phase 0 round-trip proof: register a single trivial `echo` dynamic tool so
-    // the model can trigger the DynamicToolCallRequest -> client-response ->
-    // resume cycle end-to-end. `defer_loading:false` advertises it immediately
-    // (no tool_search step needed).
-    let echo_tool = DynamicToolSpec::Function(DynamicToolFunctionSpec {
-        name: "echo".to_string(),
-        description: "Echo back the text you provide. Returns exactly the string \
-passed in the `text` argument. Use this to verify the tool round-trip."
-            .to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "text": { "type": "string", "description": "The text to echo back." }
-            },
-            "required": ["text"],
-            "additionalProperties": false
-        }),
-        defer_loading: false,
-    });
+    // Orchestration tools are supplied by the client (Swift) as dynamic tool
+    // specs and executed on-device. Parse the JSON array into DynamicToolSpecs;
+    // empty/absent => a plain turn with no dynamic tools.
+    let dynamic_tools: Vec<DynamicToolSpec> = if dynamic_tools_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&dynamic_tools_json)
+            .map_err(|e| format!("failed to parse dynamic_tools_json: {e}"))?
+    };
 
     let new_thread = thread_manager
-        .start_thread_with_tools(config, vec![echo_tool])
+        .start_thread_with_tools(config, dynamic_tools)
         .await
         .map_err(|e| format!("failed to start thread: {e}"))?;
     let thread = new_thread.thread;
@@ -750,6 +737,7 @@ pub extern "C" fn codex_run_turn_streaming(
     prompt: *const c_char,
     history_json: *const c_char,
     workspace_path: *const c_char,
+    dynamic_tools_json: *const c_char,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
@@ -773,6 +761,12 @@ pub extern "C" fn codex_run_turn_streaming(
             String::new()
         } else {
             c_str_to_string(workspace_path, "workspace_path")?
+        };
+        // Client-supplied dynamic tool specs (JSON array). Optional.
+        let dynamic_tools = if dynamic_tools_json.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
         };
 
         // `block_on` drives the main future on the CALLING thread. On iOS the
@@ -801,6 +795,7 @@ pub extern "C" fn codex_run_turn_streaming(
                     prompt,
                     history,
                     workspace,
+                    dynamic_tools,
                     /*server_mode*/ None,
                     callback,
                     ctx,
@@ -843,6 +838,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
     prompt: *const c_char,
     history_json: *const c_char,
     workspace_path: *const c_char,
+    dynamic_tools_json: *const c_char,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
@@ -866,6 +862,12 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
         } else {
             c_str_to_string(workspace_path, "workspace_path")?
         };
+        // Client-supplied dynamic tool specs (JSON array). Optional.
+        let dynamic_tools = if dynamic_tools_json.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
+        };
 
         // Same big-stack worker + multi-thread runtime dance as the OAuth FFI.
         std::thread::Builder::new()
@@ -884,6 +886,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
                     prompt,
                     history,
                     workspace,
+                    dynamic_tools,
                     /*server_mode*/ None,
                     callback,
                     ctx,
@@ -931,6 +934,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
     prompt: *const c_char,
     history_json: *const c_char,
     workspace_path: *const c_char,
+    dynamic_tools_json: *const c_char,
     ssh_host: *const c_char,
     ssh_port: u16,
     ssh_user: *const c_char,
@@ -959,6 +963,12 @@ pub extern "C" fn codex_run_turn_streaming_server(
             String::new()
         } else {
             c_str_to_string(workspace_path, "workspace_path")?
+        };
+        // Client-supplied dynamic tool specs (JSON array). Optional.
+        let dynamic_tools = if dynamic_tools_json.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
         };
 
         // SSH connection settings.
@@ -1020,6 +1030,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
                     prompt,
                     history,
                     workspace,
+                    dynamic_tools,
                     /*server_mode*/ Some(server_mode),
                     callback,
                     ctx,
@@ -1058,6 +1069,7 @@ pub unsafe fn run_turn_streaming(
     prompt: String,
     history_json: String,
     workspace: String,
+    dynamic_tools_json: String,
     server_mode: Option<ServerMode>,
     ctx: *mut c_void,
     callback: EventCallback,
@@ -1084,6 +1096,7 @@ pub unsafe fn run_turn_streaming(
                     prompt,
                     history_json,
                     workspace,
+                    dynamic_tools_json,
                     server_mode,
                     callback,
                     ctx,

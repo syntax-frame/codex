@@ -66,6 +66,11 @@ typedef void (*codex_event_callback)(void *ctx, int event_kind, const char *text
  *                 fresh conversation. Gives the model memory across turns.
  *   workspace_path  Absolute path to the node's working directory; the turn is
  *                 rooted here so file tools operate inside it. NULL/empty = none.
+ *   dynamic_tools_json  JSON array of dynamic tool specs the client executes
+ *                 on-device (each {"type":"function","name":...,"description":...,
+ *                 "inputSchema":{...}}). When one is called the turn PAUSES and
+ *                 emits event kind 7; reply with codex_respond_dynamic_tool().
+ *                 NULL/empty = no dynamic tools. (Same param on all three turn fns.)
  *   ctx           opaque pointer forwarded to every callback invocation.
  *   callback      invoked for each streamed event (see codex_event_callback).
  */
@@ -76,6 +81,7 @@ void codex_run_turn_streaming(const char *access_token,
                               const char *prompt,
                               const char *history_json,
                               const char *workspace_path,
+                              const char *dynamic_tools_json,
                               void *ctx,
                               codex_event_callback callback);
 
@@ -108,6 +114,7 @@ void codex_run_turn_streaming_apikey(const char *base_url,
                                      const char *prompt,
                                      const char *history_json,
                                      const char *workspace_path,
+                                     const char *dynamic_tools_json,
                                      void *ctx,
                                      codex_event_callback callback);
 
@@ -150,6 +157,7 @@ void codex_run_turn_streaming_server(const char *access_token,
                                      const char *prompt,
                                      const char *history_json,
                                      const char *workspace_path,
+                                     const char *dynamic_tools_json,
                                      const char *ssh_host,
                                      uint16_t ssh_port,
                                      const char *ssh_user,
