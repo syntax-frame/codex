@@ -12,12 +12,17 @@
 //! freshly-created temp dir that is deleted when the call returns; nothing is
 //! logged or persisted beyond the lifetime of the call.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -34,6 +39,10 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolResponse;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
@@ -106,6 +115,12 @@ const KIND_TOOL_CALL: c_int = 5;
 /// Boundary between two reasoning summary sections — the consumer should start a
 /// new "thinking" bubble for subsequent reasoning deltas.
 const KIND_REASONING_BREAK: c_int = 6;
+/// A dynamic-tool call the model made that PAUSES the turn until the client
+/// replies via `codex_respond_dynamic_tool`. Payload is JSON
+/// `{"turn_handle": <u64>, "call_id": <str>, "tool": <str>,
+///   "namespace": <str|null>, "arguments": <value>}`. The turn resumes once the
+/// matching response is submitted.
+const KIND_DYNAMIC_TOOL_CALL: c_int = 7;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
 
@@ -134,6 +149,38 @@ fn emit(callback: EventCallback, ctx: *mut c_void, kind: c_int, text: &str) {
     let sanitized: String = text.chars().filter(|&c| c != '\0').collect();
     if let Ok(cstr) = CString::new(sanitized) {
         callback(ctx, kind, cstr.as_ptr());
+    }
+}
+
+/// Monotonic per-turn handle allocated for each turn that may pause on a dynamic
+/// tool call. Included in the KIND_DYNAMIC_TOOL_CALL payload and passed back by
+/// the client through `codex_respond_dynamic_tool` to route the response to the
+/// correct in-flight turn.
+static NEXT_TURN_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+/// Sender half used to deliver a client-provided dynamic tool response into the
+/// event loop of the turn identified by a turn handle.
+type ResponseSender =
+    tokio::sync::mpsc::UnboundedSender<(String, DynamicToolResponse)>;
+
+/// Global registry mapping a turn handle to the channel its event loop is
+/// awaiting a dynamic tool response on. Populated for the duration of each turn
+/// and removed when the turn ends (via a drop guard on every return path).
+fn dynamic_tool_registry() -> &'static Mutex<HashMap<u64, ResponseSender>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u64, ResponseSender>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Removes a turn's registry entry when the turn's async body returns, on ANY
+/// path (TurnComplete, Error, or a `?` early-return), so a handle can never
+/// outlive its turn.
+struct RegistryGuard(u64);
+
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = dynamic_tool_registry().lock() {
+            map.remove(&self.0);
+        }
     }
 }
 
@@ -414,12 +461,47 @@ pub(crate) async fn run_turn_async(
     // creates another in-process thread via agent_control (no subprocess).
     let _ = config.features.enable(Feature::MultiAgentV2);
 
+    // TODO(phase1): remove echo; replace with the real orchestration tool specs
+    // (spawn_agent / send_message / wait_agent / …) provided from Swift.
+    //
+    // Phase 0 round-trip proof: register a single trivial `echo` dynamic tool so
+    // the model can trigger the DynamicToolCallRequest -> client-response ->
+    // resume cycle end-to-end. `defer_loading:false` advertises it immediately
+    // (no tool_search step needed).
+    let echo_tool = DynamicToolSpec::Function(DynamicToolFunctionSpec {
+        name: "echo".to_string(),
+        description: "Echo back the text you provide. Returns exactly the string \
+passed in the `text` argument. Use this to verify the tool round-trip."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "The text to echo back." }
+            },
+            "required": ["text"],
+            "additionalProperties": false
+        }),
+        defer_loading: false,
+    });
+
     let new_thread = thread_manager
-        .start_thread(config)
+        .start_thread_with_tools(config, vec![echo_tool])
         .await
         .map_err(|e| format!("failed to start thread: {e}"))?;
     let thread = new_thread.thread;
     let session_model = new_thread.session_configured.model.clone();
+
+    // Allocate a turn handle and register the channel the event loop will await
+    // a dynamic tool response on. The drop guard removes the entry on every
+    // return path so the handle never outlives the turn.
+    let turn_handle = NEXT_TURN_HANDLE.fetch_add(1, Ordering::Relaxed);
+    let (resp_tx, mut resp_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, DynamicToolResponse)>();
+    dynamic_tool_registry()
+        .lock()
+        .map_err(|_| "dynamic tool registry poisoned".to_string())?
+        .insert(turn_handle, resp_tx);
+    let _registry_guard = RegistryGuard(turn_handle);
 
     // Seed the node's prior conversation (the full rollout persisted by the app)
     // so the model has memory. This mirrors exactly what Codex keeps across
@@ -568,6 +650,47 @@ pub(crate) async fn run_turn_async(
             }
             EventMsg::AgentMessageContentDelta(ev) => {
                 emit(callback, ctx, KIND_TEXT_DELTA, &ev.delta);
+            }
+            // A dynamic tool call: the turn is now PAUSED. Surface it to the
+            // client with the turn handle + call id, then block THIS loop
+            // awaiting the client's response (mirrors the codex-core test's
+            // request -> submit(DynamicToolResponse) flow — no other events fire
+            // while paused). The client executes the tool and calls
+            // `codex_respond_dynamic_tool`, which delivers `(call_id, response)`
+            // here; we submit it and resume draining events.
+            EventMsg::DynamicToolCallRequest(req) => {
+                let payload = serde_json::json!({
+                    "turn_handle": turn_handle,
+                    "call_id": req.call_id,
+                    "tool": req.tool,
+                    "namespace": req.namespace,
+                    "arguments": req.arguments,
+                });
+                if let Ok(json) = serde_json::to_string(&payload) {
+                    emit(callback, ctx, KIND_DYNAMIC_TOOL_CALL, &json);
+                }
+                match resp_rx.recv().await {
+                    Some((call_id, response)) => {
+                        thread
+                            .submit(Op::DynamicToolResponse {
+                                id: call_id,
+                                response,
+                            })
+                            .await
+                            .map_err(|e| {
+                                format!("failed to submit dynamic tool response: {e}")
+                            })?;
+                    }
+                    None => {
+                        emit(
+                            callback,
+                            ctx,
+                            KIND_ERROR,
+                            "dynamic tool response channel closed",
+                        );
+                        return Ok(());
+                    }
+                }
             }
             EventMsg::Error(ev) => {
                 emit(callback, ctx, KIND_ERROR, &ev.message);
@@ -975,5 +1098,73 @@ pub unsafe fn run_turn_streaming(
         Ok(Ok(())) => {}
         Ok(Err(message)) => emit(callback, ctx, KIND_ERROR, &message),
         Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
+    }
+}
+
+/// Resolve an in-flight dynamic tool call: deliver the client's result back to
+/// the paused turn identified by `turn_handle` so it can resume. Call this once
+/// per KIND_DYNAMIC_TOOL_CALL event, echoing back the `call_id` from that
+/// event's payload.
+///
+/// `response_json` is a NUL-terminated UTF-8 JSON object `{"text": <string>,
+/// "success": <bool>}` (both fields optional: `text` defaults to "", `success`
+/// to true). Rust wraps it into a `DynamicToolResponse` with one `InputText`
+/// content item.
+///
+/// Returns 0 on success. Non-zero codes: 1 = bad call_id pointer, 2 = bad
+/// response_json pointer, 3 = response_json failed to parse, 4 = registry lock
+/// poisoned, 5 = the turn already ended (receiver dropped), 6 = unknown
+/// turn_handle (no such in-flight turn).
+///
+/// # Safety
+/// `call_id` and `response_json` must be valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub extern "C" fn codex_respond_dynamic_tool(
+    turn_handle: u64,
+    call_id: *const c_char,
+    response_json: *const c_char,
+) -> c_int {
+    let call_id = match c_str_to_string(call_id, "call_id") {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+    let response_json = match c_str_to_string(response_json, "response_json") {
+        Ok(s) => s,
+        Err(_) => return 2,
+    };
+    // Minimal `{ "text": <string>, "success": <bool> }` shape (both optional:
+    // text defaults to "", success to true). Parsed via serde_json::Value since
+    // codex-ios depends on serde_json only (no serde derive).
+    let value: serde_json::Value = match serde_json::from_str(&response_json) {
+        Ok(v) => v,
+        Err(_) => return 3,
+    };
+    let text = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let success = value
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let response = DynamicToolResponse {
+        content_items: vec![DynamicToolCallOutputContentItem::InputText { text }],
+        success,
+    };
+
+    let sender = {
+        let map = match dynamic_tool_registry().lock() {
+            Ok(m) => m,
+            Err(_) => return 4,
+        };
+        map.get(&turn_handle).cloned()
+    };
+    match sender {
+        Some(tx) => match tx.send((call_id, response)) {
+            Ok(()) => 0,
+            Err(_) => 5,
+        },
+        None => 6,
     }
 }

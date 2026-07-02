@@ -39,7 +39,12 @@ void codex_free_string(char *s);
  *               4 = history (full updated rollout as a JSON array of ResponseItems,
  *                   emitted once just before done; persist it per node),
  *               5 = tool call, as JSON {"tool": <name>, "args": <value>},
- *               6 = reasoning section break (start a new thinking bubble).
+ *               6 = reasoning section break (start a new thinking bubble),
+ *               7 = dynamic tool call — the turn is PAUSED until the client
+ *                   replies via codex_respond_dynamic_tool(). Payload is JSON
+ *                   {"turn_handle": <uint64>, "call_id": <string>,
+ *                    "tool": <string>, "namespace": <string|null>,
+ *                    "arguments": <value>}.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */
@@ -152,6 +157,26 @@ void codex_run_turn_streaming_server(const char *access_token,
                                      const char *ssh_fingerprint,
                                      void *ctx,
                                      codex_event_callback callback);
+
+/*
+ * Resolve an in-flight dynamic tool call (event_kind 7): deliver the client's
+ * result back to the PAUSED turn identified by turn_handle so it can resume.
+ * Call this exactly once per event_kind-7 callback, passing the same
+ * turn_handle and call_id carried in that event's JSON payload.
+ *
+ *   turn_handle    the "turn_handle" from the dynamic-tool-call payload.
+ *   call_id        the "call_id" from the dynamic-tool-call payload.
+ *   response_json  NUL-terminated UTF-8 JSON object {"text": <string>,
+ *                  "success": <bool>} (both optional: text defaults to "",
+ *                  success to true). Wrapped into the tool output the model sees.
+ *
+ * Returns 0 on success. Non-zero: 1 = bad call_id pointer, 2 = bad
+ * response_json pointer, 3 = response_json parse failure, 4 = internal lock
+ * poisoned, 5 = the turn already ended, 6 = unknown turn_handle.
+ */
+int codex_respond_dynamic_tool(uint64_t turn_handle,
+                               const char *call_id,
+                               const char *response_json);
 
 #ifdef __cplusplus
 }
