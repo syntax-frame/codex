@@ -87,18 +87,18 @@ void codex_run_turn_streaming(const char *access_token,
 
 /*
  * Generic API-key counterpart of codex_run_turn_streaming(): drive ONE user
- * turn against ANY OpenAI-Responses-compatible endpoint using a plain bearer
- * API key instead of ChatGPT OAuth. Use for OpenAI proper (with an API key), a
- * local Ollama / LM Studio server, or any paid compatible provider. Same
+ * turn against an API-key endpoint using a plain bearer API key instead of
+ * ChatGPT OAuth. Use `wire_api` to select either an OpenAI Responses-compatible
+ * endpoint or a Chat Completions-compatible endpoint. Same
  * streaming/callback contract and event kinds as codex_run_turn_streaming().
  * Local mode only (shell/exec disabled, on-device file tools).
  *
  * All string args are NUL-terminated UTF-8 C strings (null/empty as noted):
- *   base_url        Provider API root exposing the Responses API at
- *                   "<base_url>/responses" (e.g. "http://localhost:11434/v1"
- *                   for a local Ollama, or "https://api.openai.com/v1").
+ *   base_url        Provider API root, e.g. "https://api.openai.com/v1".
  *   api_key         Sent as "Authorization: Bearer <api_key>". For a local
  *                   server that ignores auth, any non-empty placeholder works.
+ *   wire_api        "responses" for "<base_url>/responses", or
+ *                   "chat_completions" for "<base_url>/chat/completions".
  *   model           Model slug, e.g. "granite4.1:8b" or "gpt-5.4".
  *   prompt          The user prompt.
  *   history_json    Prior conversation rollout as a JSON array of ResponseItems,
@@ -110,6 +110,7 @@ void codex_run_turn_streaming(const char *access_token,
  */
 void codex_run_turn_streaming_apikey(const char *base_url,
                                      const char *api_key,
+                                     const char *wire_api,
                                      const char *model,
                                      const char *prompt,
                                      const char *history_json,

@@ -39,13 +39,13 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_protocol::config_types::CollaborationMode;
-use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
-use codex_protocol::dynamic_tools::DynamicToolResponse;
-use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::Settings;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolResponse;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -159,8 +159,7 @@ static NEXT_TURN_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 /// Sender half used to deliver a client-provided dynamic tool response into the
 /// event loop of the turn identified by a turn handle.
-type ResponseSender =
-    tokio::sync::mpsc::UnboundedSender<(String, DynamicToolResponse)>;
+type ResponseSender = tokio::sync::mpsc::UnboundedSender<(String, DynamicToolResponse)>;
 
 /// Global registry mapping a turn handle to the channel its event loop is
 /// awaiting a dynamic tool response on. Populated for the duration of each turn
@@ -276,9 +275,20 @@ fn toml_basic_string(value: &str) -> String {
     out
 }
 
+fn parse_wire_api(value: &str) -> Result<WireApi, String> {
+    match value.trim() {
+        "" | "responses" => Ok(WireApi::Responses),
+        "chat_completions" => Ok(WireApi::ChatCompletions),
+        other => Err(format!(
+            "unsupported wire_api {other:?}; expected \"responses\" or \"chat_completions\""
+        )),
+    }
+}
+
 async fn write_api_key_provider_config(
     codex_home: &std::path::Path,
     base_url: &str,
+    wire_api: WireApi,
 ) -> Result<(), String> {
     let config = format!(
         r#"model_provider = "{provider_id}"
@@ -286,12 +296,18 @@ async fn write_api_key_provider_config(
 [model_providers.{provider_id}]
 name = "iOS API key"
 base_url = {base_url}
-wire_api = "responses"
+wire_api = "{wire_api}"
 requires_openai_auth = false
 supports_websockets = false
 "#,
         provider_id = IOS_APIKEY_PROVIDER_ID,
         base_url = toml_basic_string(base_url),
+        // Emit the exact string codex's config deserializer expects — the WireApi
+        // Display renders "chatcompletions" (no underscore), which config parsing rejects.
+        wire_api = match wire_api {
+            WireApi::Responses => "responses",
+            WireApi::ChatCompletions => "chat_completions",
+        },
     );
     tokio::fs::write(codex_home.join("config.toml"), config)
         .await
@@ -313,8 +329,12 @@ pub(crate) enum ProviderAuthConfig {
         account_id: String,
     },
     /// Generic API-key path: `Authorization: Bearer <api_key>` against
-    /// `base_url` (must expose the OpenAI Responses API at `<base_url>/responses`).
-    ApiKey { base_url: String, api_key: String },
+    /// `base_url` using the selected wire protocol.
+    ApiKey {
+        base_url: String,
+        api_key: String,
+        wire_api: WireApi,
+    },
 }
 
 pub(crate) async fn run_turn_async(
@@ -351,7 +371,11 @@ pub(crate) async fn run_turn_async(
             let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
             (auth, provider, None)
         }
-        ProviderAuthConfig::ApiKey { base_url, api_key } => {
+        ProviderAuthConfig::ApiKey {
+            base_url,
+            api_key,
+            wire_api,
+        } => {
             // `CodexAuth::from_api_key` produces a plain `Authorization: Bearer
             // <key>` header. The provider (name != "OpenAI") targets the given
             // base_url via the Responses wire API. requires_openai_auth is false
@@ -360,9 +384,9 @@ pub(crate) async fn run_turn_async(
             // The Config built below must also select a provider with this
             // base_url. Otherwise the thread starts with the default `openai`
             // provider and the request falls back to api.openai.com.
-            write_api_key_provider_config(&codex_home, &base_url).await?;
+            write_api_key_provider_config(&codex_home, &base_url, wire_api).await?;
             let auth = CodexAuth::from_api_key(&api_key);
-            let provider = create_oss_provider_with_base_url(&base_url, WireApi::Responses);
+            let provider = create_oss_provider_with_base_url(&base_url, wire_api);
             (auth, provider, Some(IOS_APIKEY_PROVIDER_ID.to_string()))
         }
     };
@@ -664,9 +688,7 @@ pub(crate) async fn run_turn_async(
                                 response,
                             })
                             .await
-                            .map_err(|e| {
-                                format!("failed to submit dynamic tool response: {e}")
-                            })?;
+                            .map_err(|e| format!("failed to submit dynamic tool response: {e}"))?;
                     }
                     None => {
                         emit(
@@ -834,6 +856,7 @@ pub extern "C" fn codex_run_turn_streaming(
 pub extern "C" fn codex_run_turn_streaming_apikey(
     base_url: *const c_char,
     api_key: *const c_char,
+    wire_api: *const c_char,
     model: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
@@ -848,6 +871,11 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
         // for the duration of this call), then move the owned data into a worker.
         let base_url = c_str_to_string(base_url, "base_url")?;
         let api_key = c_str_to_string(api_key, "api_key")?;
+        let wire_api = if wire_api.is_null() {
+            WireApi::Responses
+        } else {
+            parse_wire_api(&c_str_to_string(wire_api, "wire_api")?)?
+        };
         let model = c_str_to_string(model, "model")?;
         let prompt = c_str_to_string(prompt, "prompt")?;
         // History is optional: NULL or empty means a fresh conversation.
@@ -881,7 +909,11 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
                     .build()
                     .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
                 runtime.block_on(run_turn_async(
-                    ProviderAuthConfig::ApiKey { base_url, api_key },
+                    ProviderAuthConfig::ApiKey {
+                        base_url,
+                        api_key,
+                        wire_api,
+                    },
                     model,
                     prompt,
                     history,
