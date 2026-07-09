@@ -56,9 +56,10 @@ pub fn item_event_to_server_notification(
                             CoreDynamicToolCallOutputContentItem::InputText { text } => {
                                 DynamicToolCallOutputContentItem::InputText { text }
                             }
-                            CoreDynamicToolCallOutputContentItem::InputImage { image_url } => {
-                                DynamicToolCallOutputContentItem::InputImage { image_url }
-                            }
+                            CoreDynamicToolCallOutputContentItem::InputImage {
+                                image_url,
+                                detail: _,
+                            } => DynamicToolCallOutputContentItem::InputImage { image_url },
                         })
                         .collect(),
                 ),

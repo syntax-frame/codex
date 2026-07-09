@@ -11,11 +11,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use codex_exec_server::ExecProcess;
+use codex_exec_server::ExecBackend;
 use codex_exec_server::ExecParams;
+use codex_exec_server::ExecProcess;
 use codex_exec_server::ProcessId;
 use codex_exec_server::SshProcessBackend;
-use codex_exec_server::ExecBackend;
 use codex_utils_path_uri::PathUri;
 
 fn exec_params(process_id: &str, argv: Vec<&str>, tty: bool, pipe_stdin: bool) -> ExecParams {
@@ -35,16 +35,18 @@ fn exec_params(process_id: &str, argv: Vec<&str>, tty: bool, pipe_stdin: bool) -
 }
 
 /// Read until the process reports `exited`, accumulating all stdout/stderr.
-async fn read_until_exit(
-    process: &dyn ExecProcess,
-) -> (Vec<u8>, Option<i32>) {
+async fn read_until_exit(process: &dyn ExecProcess) -> (Vec<u8>, Option<i32>) {
     let mut after_seq: Option<u64> = None;
     let mut buf = Vec::new();
     let exit_code;
 
     loop {
         let response = process
-            .read(after_seq, /*max_bytes*/ None, /*wait_ms*/ Some(2_000))
+            .read(
+                after_seq,
+                /*max_bytes*/ None,
+                /*wait_ms*/ Some(2_000),
+            )
             .await
             .expect("read");
         for chunk in &response.chunks {

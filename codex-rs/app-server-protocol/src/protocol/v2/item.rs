@@ -1579,6 +1579,7 @@ impl From<codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem>
             }
             codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputImage {
                 image_url,
+                detail: _,
             } => Self::InputImage { image_url },
         }
     }
@@ -1590,9 +1591,10 @@ impl From<DynamicToolCallOutputContentItem>
     fn from(item: DynamicToolCallOutputContentItem) -> Self {
         match item {
             DynamicToolCallOutputContentItem::InputText { text } => Self::InputText { text },
-            DynamicToolCallOutputContentItem::InputImage { image_url } => {
-                Self::InputImage { image_url }
-            }
+            DynamicToolCallOutputContentItem::InputImage { image_url } => Self::InputImage {
+                image_url,
+                detail: None,
+            },
         }
     }
 }

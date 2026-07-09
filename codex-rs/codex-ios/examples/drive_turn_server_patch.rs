@@ -140,8 +140,7 @@ fn main() {
 
     // 4. The deliverable signal: the on-disk file changed to contain "hello SSH"
     //    and no longer contains the original "hello world".
-    let landed =
-        on_disk.contains(EXPECTED_SUBSTRING) && !on_disk.contains("hello world");
+    let landed = on_disk.contains(EXPECTED_SUBSTRING) && !on_disk.contains("hello world");
 
     if landed {
         println!("SERVER_APPLY_PATCH_OK");

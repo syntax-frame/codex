@@ -116,11 +116,16 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
         )]);
         ToolSpec::Function(ResponsesApiTool {
             name: "read_file".to_string(),
-            description: "Read a UTF-8 text file from the working directory and return its contents."
-                .to_string(),
+            description:
+                "Read a UTF-8 text file from the working directory and return its contents."
+                    .to_string(),
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(props, Some(vec!["path".to_string()]), Some(false.into())),
+            parameters: JsonSchema::object(
+                props,
+                Some(vec!["path".to_string()]),
+                Some(false.into()),
+            ),
             output_schema: None,
         })
     }

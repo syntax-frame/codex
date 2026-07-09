@@ -7,10 +7,6 @@ use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
 use crate::tools::handlers::ApplyPatchHandler;
-use crate::tools::handlers::HttpRequestHandler;
-use crate::tools::handlers::ListDirHandler;
-use crate::tools::handlers::ReadFileHandler;
-use crate::tools::handlers::WriteFileHandler;
 #[cfg(feature = "code-mode")]
 use crate::tools::handlers::CodeModeExecuteHandler;
 #[cfg(feature = "code-mode")]
@@ -20,12 +16,15 @@ use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
 use crate::tools::handlers::GetContextRemainingHandler;
+use crate::tools::handlers::HttpRequestHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
+use crate::tools::handlers::ListDirHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
 use crate::tools::handlers::ListMcpResourcesHandler;
 use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::NewContextWindowHandler;
 use crate::tools::handlers::PlanHandler;
+use crate::tools::handlers::ReadFileHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
@@ -37,6 +36,7 @@ use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
 use crate::tools::handlers::WaitForEnvironmentHandler;
+use crate::tools::handlers::WriteFileHandler;
 use crate::tools::handlers::WriteStdinHandler;
 use crate::tools::handlers::agent_jobs::ReportAgentJobResultHandler;
 use crate::tools::handlers::agent_jobs::SpawnAgentsOnCsvHandler;
@@ -473,9 +473,9 @@ fn is_hidden_by_code_mode_only(
     let tool_mode = effective_tool_mode(turn_context);
     tool_mode == ToolMode::CodeModeOnly
         && exposure != ToolExposure::DirectModelOnly
-        && codex_code_mode_protocol::is_code_mode_nested_tool(&codex_tools::code_mode_name_for_tool_name(
-            tool_name,
-        ))
+        && codex_code_mode_protocol::is_code_mode_nested_tool(
+            &codex_tools::code_mode_name_for_tool_name(tool_name),
+        )
 }
 
 fn is_excluded_from_code_mode(turn_context: &TurnContext, tool_name: &ToolName) -> bool {
@@ -1013,8 +1013,7 @@ fn prepend_code_mode_executors(
     #[cfg(feature = "code-mode")]
     {
         let turn_context = context.step_context.turn.as_ref();
-        let code_mode_executors =
-            build_code_mode_executors(turn_context, planned_tools.runtimes());
+        let code_mode_executors = build_code_mode_executors(turn_context, planned_tools.runtimes());
         planned_tools.runtimes.splice(0..0, code_mode_executors);
     }
 }
@@ -1151,7 +1150,10 @@ fn compare_code_mode_tools(
 #[cfg(feature = "code-mode")]
 fn code_mode_namespace_name<'a>(
     tool: &codex_code_mode_protocol::ToolDefinition,
-    namespace_descriptions: &'a BTreeMap<String, codex_code_mode_protocol::ToolNamespaceDescription>,
+    namespace_descriptions: &'a BTreeMap<
+        String,
+        codex_code_mode_protocol::ToolNamespaceDescription,
+    >,
 ) -> Option<&'a str> {
     tool.tool_name
         .namespace

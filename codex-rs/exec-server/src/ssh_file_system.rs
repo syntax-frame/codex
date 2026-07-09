@@ -271,7 +271,9 @@ impl client::Handler for SshFsHandler {
             None => Ok(true),
             Some(expected) => {
                 let actual = server_public_key.fingerprint();
-                let expected = expected.strip_prefix("SHA256:").unwrap_or(expected.as_str());
+                let expected = expected
+                    .strip_prefix("SHA256:")
+                    .unwrap_or(expected.as_str());
                 Ok(actual == expected)
             }
         }

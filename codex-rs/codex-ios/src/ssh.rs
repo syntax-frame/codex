@@ -14,6 +14,8 @@ use russh::Disconnect;
 use russh::client;
 use russh::keys::key;
 use russh::keys::load_secret_key;
+use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
 
 /// Result of a remote command: combined stdout+stderr and the exit code.
 pub struct SshOutput {
@@ -34,6 +36,30 @@ impl client::Handler for Handler {
         // TODO(integration): pin the server's host key (the app stores its
         // fingerprint) and reject mismatches. Accept for the host-test spike.
         Ok(true)
+    }
+}
+
+struct PinnedHandler {
+    expected_fingerprint: Option<String>,
+}
+
+#[async_trait]
+impl client::Handler for PinnedHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        match &self.expected_fingerprint {
+            None => Ok(true),
+            Some(expected) => {
+                let expected = expected
+                    .strip_prefix("SHA256:")
+                    .unwrap_or(expected.as_str());
+                Ok(server_public_key.fingerprint() == expected)
+            }
+        }
     }
 }
 
@@ -93,4 +119,88 @@ pub async fn ssh_exec(
         output: String::from_utf8_lossy(&buf).into_owned(),
         exit_code: exit_code.unwrap_or(0),
     })
+}
+
+/// Upload `local_path` to `remote_path` over SFTP using the same SSH settings as
+/// server-mode turns. Parent directories are created best-effort.
+pub async fn ssh_upload_file(
+    host: &str,
+    port: u16,
+    user: &str,
+    key_path: &str,
+    host_fingerprint: Option<String>,
+    local_path: &str,
+    remote_path: &str,
+) -> Result<(), String> {
+    let bytes = tokio::fs::read(local_path)
+        .await
+        .map_err(|e| format!("read local file: {e}"))?;
+    let key_pair = load_secret_key(key_path, None).map_err(|e| format!("load key: {e}"))?;
+
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
+    let handler = PinnedHandler {
+        expected_fingerprint: host_fingerprint,
+    };
+    let mut session = client::connect(config, (host, port), handler)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+
+    let authed = session
+        .authenticate_publickey(user, Arc::new(key_pair))
+        .await
+        .map_err(|e| format!("auth: {e}"))?;
+    if !authed {
+        return Err("authentication failed (publickey rejected)".to_string());
+    }
+
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("open channel: {e}"))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| format!("request sftp subsystem: {e}"))?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| format!("sftp handshake: {e}"))?;
+
+    if let Some(parent) = std::path::Path::new(remote_path).parent() {
+        let mut dirs = Vec::new();
+        let mut cur = Some(parent);
+        while let Some(path) = cur {
+            if path.parent().is_none() {
+                break;
+            }
+            dirs.push(path.to_string_lossy().into_owned());
+            cur = path.parent();
+        }
+        dirs.reverse();
+        for dir in dirs {
+            let _ = sftp.create_dir(dir).await;
+        }
+    }
+
+    let mut file = sftp
+        .open_with_flags(
+            remote_path.to_string(),
+            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+        )
+        .await
+        .map_err(|e| format!("open remote file: {e}"))?;
+    use tokio::io::AsyncWriteExt;
+    file.write_all(&bytes)
+        .await
+        .map_err(|e| format!("write remote file: {e}"))?;
+    file.shutdown()
+        .await
+        .map_err(|e| format!("finish remote file: {e}"))?;
+
+    let _ = session
+        .disconnect(Disconnect::ByApplication, "", "English")
+        .await;
+    Ok(())
 }

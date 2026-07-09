@@ -138,6 +138,26 @@ fn chat_request_from_responses_request(
         .collect::<Vec<_>>();
     let mut messages = Vec::new();
 
+    // The model can emit several tool calls in ONE assistant turn (parallel tool
+    // calls). Chat Completions requires those to be a SINGLE assistant message
+    // whose `tool_calls` array holds them all, immediately followed by one `tool`
+    // message per call_id — NOT one assistant message per call (that makes the
+    // first call's result "missing", since the next message is another call, and
+    // the provider rejects the whole request). Buffer consecutive tool calls and
+    // flush them as one assistant message the moment a non-tool-call item arrives.
+    let mut pending_tool_calls: Vec<ChatToolCall> = Vec::new();
+
+    fn flush_tool_calls(messages: &mut Vec<ChatMessage>, pending: &mut Vec<ChatToolCall>) {
+        if !pending.is_empty() {
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(std::mem::take(pending)),
+                tool_call_id: None,
+            });
+        }
+    }
+
     if !request.instructions.trim().is_empty() {
         messages.push(ChatMessage {
             role: "system".to_string(),
@@ -153,6 +173,7 @@ fn chat_request_from_responses_request(
                 tools.extend(more.into_iter().flat_map(chat_tools_from_responses_tool));
             }
             ResponseItem::Message { role, content, .. } => {
+                flush_tool_calls(&mut messages, &mut pending_tool_calls);
                 let Some(text) = content_items_to_text(&content) else {
                     continue;
                 };
@@ -176,31 +197,13 @@ fn chat_request_from_responses_request(
                 call_id,
                 ..
             } => {
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: None,
-                    tool_calls: Some(vec![ChatToolCall {
-                        id: call_id,
-                        kind: "function".to_string(),
-                        function: ChatToolCallFunction {
-                            name: namespaced_tool_name(namespace.as_deref(), &name),
-                            arguments,
-                        },
-                    }]),
-                    tool_call_id: None,
-                });
-            }
-            ResponseItem::FunctionCallOutput {
-                call_id, output, ..
-            }
-            | ResponseItem::CustomToolCallOutput {
-                call_id, output, ..
-            } => {
-                messages.push(ChatMessage {
-                    role: "tool".to_string(),
-                    content: Some(output.to_string()),
-                    tool_calls: None,
-                    tool_call_id: Some(call_id),
+                pending_tool_calls.push(ChatToolCall {
+                    id: call_id,
+                    kind: "function".to_string(),
+                    function: ChatToolCallFunction {
+                        name: namespaced_tool_name(namespace.as_deref(), &name),
+                        arguments,
+                    },
                 });
             }
             ResponseItem::CustomToolCall {
@@ -210,23 +213,37 @@ fn chat_request_from_responses_request(
                 call_id,
                 ..
             } => {
+                pending_tool_calls.push(ChatToolCall {
+                    id: call_id,
+                    kind: "function".to_string(),
+                    function: ChatToolCallFunction {
+                        name: namespaced_tool_name(namespace.as_deref(), &name),
+                        arguments: input,
+                    },
+                });
+            }
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            }
+            | ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => {
+                // Emit the buffered assistant tool_calls message right before its
+                // results, so every tool_call_id is immediately answered.
+                flush_tool_calls(&mut messages, &mut pending_tool_calls);
                 messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: None,
-                    tool_calls: Some(vec![ChatToolCall {
-                        id: call_id,
-                        kind: "function".to_string(),
-                        function: ChatToolCallFunction {
-                            name: namespaced_tool_name(namespace.as_deref(), &name),
-                            arguments: input,
-                        },
-                    }]),
-                    tool_call_id: None,
+                    role: "tool".to_string(),
+                    content: Some(output.to_string()),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id),
                 });
             }
             _ => {}
         }
     }
+    // Any trailing tool calls with no results yet (e.g. mid-turn) still go out as
+    // one well-formed assistant message.
+    flush_tool_calls(&mut messages, &mut pending_tool_calls);
 
     Ok(ChatCompletionsRequest {
         model: request.model,

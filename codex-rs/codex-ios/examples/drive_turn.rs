@@ -24,17 +24,18 @@ extern "C" fn on_event(ctx: *mut c_void, kind: c_int, text: *const c_char) {
     };
     let cap = unsafe { &mut *(ctx as *mut Capture) };
     match kind {
-        0 => {}                                   // reasoning delta (ignore here)
-        1 => {                                     // text delta
+        0 => {} // reasoning delta (ignore here)
+        1 => {
+            // text delta
             print!("{s}");
             use std::io::Write;
             let _ = std::io::stdout().flush();
             cap.answer.push_str(&s);
         }
-        4 => cap.history = s,                       // KIND_HISTORY (full rollout)
-        5 => println!("\n  [TOOL] {s}"),            // KIND_TOOL_CALL
-        2 => println!("\n  «done»"),                // done
-        3 => println!("\n  «ERROR: {s}»"),          // error
+        4 => cap.history = s,              // KIND_HISTORY (full rollout)
+        5 => println!("\n  [TOOL] {s}"),   // KIND_TOOL_CALL
+        2 => println!("\n  «done»"),       // done
+        3 => println!("\n  «ERROR: {s}»"), // error
         _ => {}
     }
 }
@@ -45,12 +46,24 @@ fn run(token: &str, id: &str, account: &str, prompt: &str, history: &str, cap: &
     let ws = std::env::temp_dir().join("codex_drive_turn_ws");
     let _ = std::fs::create_dir_all(&ws);
     let (ct, ci, ca, cm, cp, ch, cw) = (
-        c(token), c(id), c(account), c("gpt-5.4"), c(prompt), c(history),
+        c(token),
+        c(id),
+        c(account),
+        c("gpt-5.4"),
+        c(prompt),
+        c(history),
         c(ws.to_str().unwrap()),
     );
     codex_run_turn_streaming(
-        ct.as_ptr(), ci.as_ptr(), ca.as_ptr(), cm.as_ptr(), cp.as_ptr(), ch.as_ptr(), cw.as_ptr(),
-        cap as *mut Capture as *mut c_void, on_event,
+        ct.as_ptr(),
+        ci.as_ptr(),
+        ca.as_ptr(),
+        cm.as_ptr(),
+        cp.as_ptr(),
+        ch.as_ptr(),
+        cw.as_ptr(),
+        cap as *mut Capture as *mut c_void,
+        on_event,
     );
 }
 
@@ -62,20 +75,32 @@ fn main() {
     let id = v["tokens"]["id_token"].as_str().unwrap().to_string();
     let account = v["tokens"]["account_id"].as_str().unwrap().to_string();
 
-    let mut cap = Capture { history: String::new(), answer: String::new() };
+    let mut cap = Capture {
+        history: String::new(),
+        answer: String::new(),
+    };
 
     println!("=== HTTP TOOL TEST (local node) ===");
     print!("answer: ");
-    run(&token, &id, &account,
+    run(
+        &token,
+        &id,
+        &account,
         "Use your http_request tool to GET https://api.github.com/zen (send a User-Agent header like 'agentapp'), then tell me exactly what the response body says. If you don't have an http_request tool, say so explicitly.",
-        "", &mut cap);
+        "",
+        &mut cap,
+    );
     println!("\n--- workspace contents on disk ---");
     let ws = std::env::temp_dir().join("codex_drive_turn_ws");
     if let Ok(entries) = std::fs::read_dir(&ws) {
         for e in entries.flatten() {
             let p = e.path();
             let body = std::fs::read_to_string(&p).unwrap_or_default();
-            println!("  {} => {:?}", p.file_name().unwrap().to_string_lossy(), body);
+            println!(
+                "  {} => {:?}",
+                p.file_name().unwrap().to_string_lossy(),
+                body
+            );
         }
     }
 }

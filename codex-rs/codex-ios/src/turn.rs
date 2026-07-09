@@ -23,6 +23,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -46,6 +47,7 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -55,6 +57,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use tokio::time::timeout;
 
 /// Steers the model toward the on-device tools. This build runs on a phone with
 /// no shell and no patch environment, so `apply_patch` and any shell/exec tool
@@ -97,6 +100,12 @@ pub struct ServerMode {
     pub host_fingerprint: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct ServerFileUpload {
+    local_path: String,
+    relative_path: String,
+}
+
 /// Environment id under which the SSH server-mode environment is registered and
 /// selected for the turn.
 const SERVER_MODE_ENVIRONMENT_ID: &str = "ssh-server";
@@ -122,6 +131,10 @@ const KIND_REASONING_BREAK: c_int = 6;
 const KIND_DYNAMIC_TOOL_CALL: c_int = 7;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
+const POST_DYNAMIC_IMAGE_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
+const DYNAMIC_IMAGE_RESPONSE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+const PROMPT_IMAGE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(45);
+const PROMPT_IMAGE_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Callback invoked for each streamed event. `text` is a NUL-terminated UTF-8
 /// C string that is ONLY valid for the duration of the call; the callee must
@@ -141,6 +154,66 @@ fn c_str_to_string(ptr: *const c_char, field: &str) -> Result<String, String> {
         .map_err(|e| format!("{field} was not valid UTF-8: {e}"))
 }
 
+fn parse_server_file_uploads(uploads_json: &str) -> Result<Vec<ServerFileUpload>, String> {
+    let trimmed = uploads_json.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("uploads_json was not valid JSON: {e}"))?;
+    let Some(items) = value.as_array() else {
+        return Err("uploads_json must be a JSON array".to_string());
+    };
+
+    let mut uploads = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let local_path = item
+            .get("local_path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("uploads_json[{index}].local_path must be a string"))?;
+        let relative_path = item
+            .get("relative_path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("uploads_json[{index}].relative_path must be a string"))?;
+
+        if local_path.trim().is_empty() {
+            return Err(format!("uploads_json[{index}].local_path was empty"));
+        }
+        validate_upload_relative_path(relative_path)
+            .map_err(|e| format!("uploads_json[{index}].relative_path {e}"))?;
+
+        uploads.push(ServerFileUpload {
+            local_path: local_path.to_string(),
+            relative_path: relative_path.to_string(),
+        });
+    }
+
+    Ok(uploads)
+}
+
+fn validate_upload_relative_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("was empty".to_string());
+    }
+    if path.starts_with('/') {
+        return Err("must be relative".to_string());
+    }
+    if path.split('/').any(|part| part == "..") {
+        return Err("must not contain '..' segments".to_string());
+    }
+    Ok(())
+}
+
+fn join_remote_workspace_path(workspace: &str, relative_path: &str) -> String {
+    let workspace = workspace.trim_end_matches('/');
+    if workspace.is_empty() {
+        relative_path.to_string()
+    } else {
+        format!("{workspace}/{relative_path}")
+    }
+}
+
 /// Invoke the caller's callback with an owned Rust string. The C string is
 /// freed as soon as the callback returns.
 fn emit(callback: EventCallback, ctx: *mut c_void, kind: c_int, text: &str) {
@@ -149,6 +222,10 @@ fn emit(callback: EventCallback, ctx: *mut c_void, kind: c_int, text: &str) {
     if let Ok(cstr) = CString::new(sanitized) {
         callback(ctx, kind, cstr.as_ptr());
     }
+}
+
+fn emit_debug_stage(callback: EventCallback, ctx: *mut c_void, stage: &str) {
+    let _ = (callback, ctx, stage);
 }
 
 /// Monotonic per-turn handle allocated for each turn that may pause on a dynamic
@@ -344,10 +421,12 @@ pub(crate) async fn run_turn_async(
     history_json: String,
     workspace: String,
     dynamic_tools_json: String,
+    uploads: Vec<ServerFileUpload>,
     server_mode: Option<ServerMode>,
     callback: EventCallback,
     ctx: *mut c_void,
 ) -> Result<(), String> {
+    emit_debug_stage(callback, ctx, "run_turn_async_entered");
     // Ephemeral codex_home: holds auth.json + any thread store artifacts. It is
     // deleted when `_home_guard` drops at the end of this function.
     let home_guard = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
@@ -390,6 +469,7 @@ pub(crate) async fn run_turn_async(
             (auth, provider, Some(IOS_APIKEY_PROVIDER_ID.to_string()))
         }
     };
+    emit_debug_stage(callback, ctx, "auth_ready");
 
     // Minimal ThreadManager: a dummy AuthManager wrapping our CodexAuth plus the
     // codex provider. This is the smallest public construction path; it manages
@@ -455,6 +535,7 @@ pub(crate) async fn run_turn_async(
         .build()
         .await
         .map_err(|e| format!("failed to build config: {e}"))?;
+    emit_debug_stage(callback, ctx, "config_ready");
 
     // Enable reasoning so the model emits reasoning-summary deltas (rendered as
     // "thinking" bubbles in the app). Without these the turn streams only the
@@ -479,11 +560,17 @@ pub(crate) async fn run_turn_async(
         let _ = config.features.disable(Feature::ShellTool);
     }
 
-    // Disable Codex's built-in MultiAgentV2 spike (spawn_agent / send_message /
-    // followup_task / wait_agent / interrupt_agent / list_agents). Its tool names
-    // clash with OUR orchestration dynamic tools (executed in Swift as persistent
-    // graph nodes), so the built-in in-process suite must be off.
+    // Disable Codex's built-in multi-agent suites (spawn_agent / wait_agent /
+    // close_agent / send_message / …). Their tool names clash with OUR
+    // orchestration dynamic tools (executed in Swift as persistent, visible graph
+    // nodes), and the built-ins run in-process — invisible to the graph and
+    // capped at ~6 concurrent threads. BOTH versions must be off:
+    //   - MultiAgentV2 (feature `multi_agent_v2`) → the V2 suite
+    //   - Collab       (feature `multi_agent`)    → the V1 (`multi_agent_v1__…`)
+    // Missing the Collab one let the model fall back to the V1 built-ins, which
+    // spawned invisible, capped sub-agents instead of our graph nodes.
     let _ = config.features.disable(Feature::MultiAgentV2);
+    let _ = config.features.disable(Feature::Collab);
 
     // Orchestration tools are supplied by the client (Swift) as dynamic tool
     // specs and executed on-device. Parse the JSON array into DynamicToolSpecs;
@@ -499,6 +586,7 @@ pub(crate) async fn run_turn_async(
         .start_thread_with_tools(config, dynamic_tools)
         .await
         .map_err(|e| format!("failed to start thread: {e}"))?;
+    emit_debug_stage(callback, ctx, "thread_started");
     let thread = new_thread.thread;
     let session_model = new_thread.session_configured.model.clone();
 
@@ -526,58 +614,139 @@ pub(crate) async fn run_turn_async(
     let mut replayed_tool_calls: HashSet<String> =
         prior.iter().filter_map(tool_call_replay_key).collect();
     if !prior.is_empty() {
+        emit_debug_stage(callback, ctx, "history_inject_begin");
         thread
             .inject_response_items(prior)
             .await
             .map_err(|e| format!("failed to seed history: {e}"))?;
+        emit_debug_stage(callback, ctx, "history_inject_end");
     }
 
     // Submit a single user turn through the real loop, pinning the model.
-    thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: prompt,
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides {
-                collaboration_mode: Some(CollaborationMode {
-                    mode: ModeKind::Default,
-                    settings: Settings {
-                        model: if model.is_empty() {
-                            session_model
-                        } else {
-                            model
-                        },
-                        reasoning_effort: Some(ReasoningEffort::High),
-                        developer_instructions: Some(
-                            if server_mode.is_some() {
-                                SERVER_MODE_DEVELOPER_INSTRUCTIONS
-                            } else {
-                                MOBILE_DEVELOPER_INSTRUCTIONS
-                            }
-                            .to_string(),
-                        ),
+    // Image uploads go in as normal prompt images instead of dynamic-tool output:
+    // this uses Codex's upstream multimodal path and avoids wedging after a
+    // tool-returned input_image.
+    let image_uploads = uploads
+        .iter()
+        .filter(|upload| is_supported_image_upload(&upload.relative_path))
+        .take(4)
+        .collect::<Vec<_>>();
+    let prompt_contains_images = !image_uploads.is_empty();
+    let mut user_items = vec![UserInput::Text {
+        text: prompt,
+        text_elements: Vec::new(),
+    }];
+    user_items.extend(image_uploads.into_iter().map(|upload| UserInput::LocalImage {
+        path: std::path::PathBuf::from(upload.local_path.clone()),
+        detail: Some(ImageDetail::Auto),
+    }));
+    let user_input_op = Op::UserInput {
+        items: user_items,
+        final_output_json_schema: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: ThreadSettingsOverrides {
+            collaboration_mode: Some(CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: if model.is_empty() {
+                        session_model
+                    } else {
+                        model
                     },
-                }),
-                ..Default::default()
-            },
-        })
-        .await
-        .map_err(|e| format!("failed to submit user input: {e}"))?;
+                    reasoning_effort: Some(ReasoningEffort::High),
+                    developer_instructions: Some(
+                        if server_mode.is_some() {
+                            SERVER_MODE_DEVELOPER_INSTRUCTIONS
+                        } else {
+                            MOBILE_DEVELOPER_INSTRUCTIONS
+                        }
+                        .to_string(),
+                    ),
+                },
+            }),
+            ..Default::default()
+        },
+    };
+    if prompt_contains_images {
+        emit_debug_stage(callback, ctx, "prompt_image_submit_begin");
+        match timeout(PROMPT_IMAGE_SUBMIT_TIMEOUT, thread.submit(user_input_op)).await {
+            Ok(result) => {
+                let _ = result.map_err(|e| format!("failed to submit user input: {e}"))?;
+                emit_debug_stage(callback, ctx, "prompt_image_submit_end");
+            }
+            Err(_) => {
+                emit(
+                    callback,
+                    ctx,
+                    KIND_ERROR,
+                    "timed out submitting prompt image input to the model",
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        emit_debug_stage(callback, ctx, "prompt_submit_begin");
+        thread
+            .submit(user_input_op)
+            .await
+            .map_err(|e| format!("failed to submit user input: {e}"))?;
+        emit_debug_stage(callback, ctx, "prompt_submit_end");
+    }
 
     // Drain events until the turn completes (or errors).
     // Track the reasoning summary section so we can signal bubble boundaries:
     // Codex streams reasoning as multiple summary sections (each its own thought),
     // distinguished by `summary_index`.
     let mut last_summary_index: Option<i64> = None;
+    // Whether the current assistant message streamed any content deltas.
+    // Providers on the Chat Completions wire API deliver the reply as a single
+    // final `AgentMessage` with no `AgentMessageContentDelta`s; when that
+    // happens we surface the final text as one text-delta so the app renders +
+    // persists it. Responses streams deltas, so this stays true → no double-emit.
+    let mut saw_message_delta = false;
+    // A dynamic tool may return images back into the model. If the provider
+    // wedges after accepting that output, the app otherwise waits forever with
+    // no additional stream event. Keep the timeout scoped to image outputs so
+    // long-running normal tools are not interrupted.
+    let mut awaiting_event_after_dynamic_image = false;
+    let mut awaiting_first_event_after_prompt_image = prompt_contains_images;
     loop {
-        let event = thread
-            .next_event()
-            .await
-            .map_err(|e| format!("event stream error: {e}"))?;
+        let event = if awaiting_first_event_after_prompt_image {
+            emit_debug_stage(callback, ctx, "prompt_image_first_event_wait");
+            match timeout(PROMPT_IMAGE_FIRST_EVENT_TIMEOUT, thread.next_event()).await {
+                Ok(result) => result.map_err(|e| format!("event stream error: {e}"))?,
+                Err(_) => {
+                    emit(
+                        callback,
+                        ctx,
+                        KIND_ERROR,
+                        "model did not produce an event after receiving prompt image input",
+                    );
+                    return Ok(());
+                }
+            }
+        } else if awaiting_event_after_dynamic_image {
+            match timeout(POST_DYNAMIC_IMAGE_EVENT_TIMEOUT, thread.next_event()).await {
+                Ok(result) => result.map_err(|e| format!("event stream error: {e}"))?,
+                Err(_) => {
+                    emit(
+                        callback,
+                        ctx,
+                        KIND_ERROR,
+                        "model did not continue after receiving image tool output",
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            thread
+                .next_event()
+                .await
+                .map_err(|e| format!("event stream error: {e}"))?
+        };
+        awaiting_first_event_after_prompt_image = false;
+        awaiting_event_after_dynamic_image = false;
         match event.msg {
             // Safety net: with approval_policy=Never these should not fire, but
             // if any approval-gated tool ever requests a decision there is no UI
@@ -660,7 +829,18 @@ pub(crate) async fn run_turn_async(
                 }
             }
             EventMsg::AgentMessageContentDelta(ev) => {
+                saw_message_delta = true;
                 emit(callback, ctx, KIND_TEXT_DELTA, &ev.delta);
+            }
+            // The finalized assistant message. If it already streamed as deltas
+            // (Responses), those carried the text — do nothing. If it did NOT
+            // (Chat Completions), emit the full text once so the reply isn't
+            // lost from the transcript / live view. Reset for the next message.
+            EventMsg::AgentMessage(ev) => {
+                if !saw_message_delta && !ev.message.is_empty() {
+                    emit(callback, ctx, KIND_TEXT_DELTA, &ev.message);
+                }
+                saw_message_delta = false;
             }
             // A dynamic tool call: the turn is now PAUSED. Surface it to the
             // client with the turn handle + call id, then block THIS loop
@@ -682,13 +862,51 @@ pub(crate) async fn run_turn_async(
                 }
                 match resp_rx.recv().await {
                     Some((call_id, response)) => {
-                        thread
-                            .submit(Op::DynamicToolResponse {
-                                id: call_id,
-                                response,
-                            })
-                            .await
-                            .map_err(|e| format!("failed to submit dynamic tool response: {e}"))?;
+                        let response_contains_image = response.content_items.iter().any(|item| {
+                            matches!(item, DynamicToolCallOutputContentItem::InputImage { .. })
+                        });
+                        let op = Op::DynamicToolResponse {
+                            id: call_id,
+                            response,
+                        };
+                        if response_contains_image {
+                            emit(
+                                callback,
+                                ctx,
+                                KIND_TOOL_CALL,
+                                r#"{"tool":"dynamic_image_response_submit","args":{"phase":"begin"}}"#,
+                            );
+                            match timeout(DYNAMIC_IMAGE_RESPONSE_SUBMIT_TIMEOUT, thread.submit(op)).await {
+                                Ok(result) => {
+                                    result.map_err(|e| {
+                                        format!("failed to submit dynamic image tool response: {e}")
+                                    })?;
+                                    emit(
+                                        callback,
+                                        ctx,
+                                        KIND_TOOL_CALL,
+                                        r#"{"tool":"dynamic_image_response_submit","args":{"phase":"end"}}"#,
+                                    );
+                                }
+                                Err(_) => {
+                                    emit(
+                                        callback,
+                                        ctx,
+                                        KIND_ERROR,
+                                        "timed out submitting image tool output to the model",
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        } else {
+                            thread
+                                .submit(op)
+                                .await
+                                .map_err(|e| {
+                                    format!("failed to submit dynamic tool response: {e}")
+                                })?;
+                        }
+                        awaiting_event_after_dynamic_image = response_contains_image;
                     }
                     None => {
                         emit(
@@ -737,6 +955,17 @@ pub(crate) async fn run_turn_async(
     }
 }
 
+fn is_supported_image_upload(relative_path: &str) -> bool {
+    let Some(ext) = std::path::Path::new(relative_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return false;
+    };
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp")
+}
+
 /// Drive ONE user turn through the real Codex turn loop and stream events to
 /// `callback`. Blocks on a tokio runtime built inside the call.
 ///
@@ -760,6 +989,7 @@ pub extern "C" fn codex_run_turn_streaming(
     history_json: *const c_char,
     workspace_path: *const c_char,
     dynamic_tools_json: *const c_char,
+    uploads_json: *const c_char,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
@@ -790,6 +1020,11 @@ pub extern "C" fn codex_run_turn_streaming(
         } else {
             c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
         };
+        let uploads = if uploads_json.is_null() {
+            Vec::new()
+        } else {
+            parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
+        };
 
         // `block_on` drives the main future on the CALLING thread. On iOS the
         // caller is a GCD worker (~512 KiB stack), which Codex's deep async
@@ -803,6 +1038,7 @@ pub extern "C" fn codex_run_turn_streaming(
             .spawn(move || -> Result<(), String> {
                 let ctx = ctx_addr as *mut c_void;
                 let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .thread_stack_size(16 * 1024 * 1024)
                     .build()
@@ -818,6 +1054,7 @@ pub extern "C" fn codex_run_turn_streaming(
                     history,
                     workspace,
                     dynamic_tools,
+                    uploads,
                     /*server_mode*/ None,
                     callback,
                     ctx,
@@ -862,6 +1099,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
     history_json: *const c_char,
     workspace_path: *const c_char,
     dynamic_tools_json: *const c_char,
+    uploads_json: *const c_char,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
@@ -896,6 +1134,11 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
         } else {
             c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
         };
+        let uploads = if uploads_json.is_null() {
+            Vec::new()
+        } else {
+            parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
+        };
 
         // Same big-stack worker + multi-thread runtime dance as the OAuth FFI.
         std::thread::Builder::new()
@@ -904,6 +1147,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
             .spawn(move || -> Result<(), String> {
                 let ctx = ctx_addr as *mut c_void;
                 let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .thread_stack_size(16 * 1024 * 1024)
                     .build()
@@ -919,6 +1163,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
                     history,
                     workspace,
                     dynamic_tools,
+                    uploads,
                     /*server_mode*/ None,
                     callback,
                     ctx,
@@ -972,6 +1217,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
     ssh_user: *const c_char,
     ssh_key_pem: *const c_char,
     ssh_fingerprint: *const c_char,
+    uploads_json: *const c_char,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
@@ -1001,6 +1247,11 @@ pub extern "C" fn codex_run_turn_streaming_server(
             String::new()
         } else {
             c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
+        };
+        let uploads = if uploads_json.is_null() {
+            Vec::new()
+        } else {
+            parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
         };
 
         // SSH connection settings.
@@ -1048,25 +1299,51 @@ pub extern "C" fn codex_run_turn_streaming_server(
                 let _key_dir = key_dir;
                 let ctx = ctx_addr as *mut c_void;
                 let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .thread_stack_size(16 * 1024 * 1024)
                     .build()
                     .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
-                runtime.block_on(run_turn_async(
-                    ProviderAuthConfig::ChatgptOAuth {
-                        access_token: token,
-                        id_token: id_tok,
-                        account_id: account,
-                    },
-                    model,
-                    prompt,
-                    history,
-                    workspace,
-                    dynamic_tools,
-                    /*server_mode*/ Some(server_mode),
-                    callback,
-                    ctx,
-                ))
+                runtime.block_on(async move {
+                    for upload in &uploads {
+                        let remote_path =
+                            join_remote_workspace_path(&workspace, &upload.relative_path);
+                        crate::ssh::ssh_upload_file(
+                            &server_mode.host,
+                            server_mode.port,
+                            &server_mode.user,
+                            &server_mode.key_path,
+                            server_mode.host_fingerprint.clone(),
+                            &upload.local_path,
+                            &remote_path,
+                        )
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "failed to upload {} to SSH workspace: {e}",
+                                upload.relative_path
+                            )
+                        })?;
+                    }
+
+                    run_turn_async(
+                        ProviderAuthConfig::ChatgptOAuth {
+                            access_token: token,
+                            id_token: id_tok,
+                            account_id: account,
+                        },
+                        model,
+                        prompt,
+                        history,
+                        workspace,
+                        dynamic_tools,
+                        uploads,
+                        /*server_mode*/ Some(server_mode),
+                        callback,
+                        ctx,
+                    )
+                    .await
+                })
             })
             .map_err(|e| format!("failed to spawn worker thread: {e}"))?
             .join()
@@ -1102,6 +1379,7 @@ pub unsafe fn run_turn_streaming(
     history_json: String,
     workspace: String,
     dynamic_tools_json: String,
+    uploads: Vec<ServerFileUpload>,
     server_mode: Option<ServerMode>,
     ctx: *mut c_void,
     callback: EventCallback,
@@ -1114,6 +1392,7 @@ pub unsafe fn run_turn_streaming(
             .spawn(move || -> Result<(), String> {
                 let ctx = ctx_addr as *mut c_void;
                 let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .thread_stack_size(16 * 1024 * 1024)
                     .build()
@@ -1129,6 +1408,7 @@ pub unsafe fn run_turn_streaming(
                     history_json,
                     workspace,
                     dynamic_tools_json,
+                    uploads,
                     server_mode,
                     callback,
                     ctx,
@@ -1151,10 +1431,11 @@ pub unsafe fn run_turn_streaming(
 /// per KIND_DYNAMIC_TOOL_CALL event, echoing back the `call_id` from that
 /// event's payload.
 ///
-/// `response_json` is a NUL-terminated UTF-8 JSON object `{"text": <string>,
-/// "success": <bool>}` (both fields optional: `text` defaults to "", `success`
-/// to true). Rust wraps it into a `DynamicToolResponse` with one `InputText`
-/// content item.
+/// `response_json` is a NUL-terminated UTF-8 JSON object. Text-only clients may
+/// pass `{"text": <string>, "success": <bool>}`. Multimodal clients may pass
+/// `{"content_items": [{"type": "input_text", "text": "..."}, {"type":
+/// "input_image", "image_url": "data:...", "detail": "high"}], "success":
+/// <bool>}`. `text` defaults to "", `success` to true.
 ///
 /// Returns 0 on success. Non-zero codes: 1 = bad call_id pointer, 2 = bad
 /// response_json pointer, 3 = response_json failed to parse, 4 = registry lock
@@ -1177,24 +1458,30 @@ pub extern "C" fn codex_respond_dynamic_tool(
         Ok(s) => s,
         Err(_) => return 2,
     };
-    // Minimal `{ "text": <string>, "success": <bool> }` shape (both optional:
-    // text defaults to "", success to true). Parsed via serde_json::Value since
-    // codex-ios depends on serde_json only (no serde derive).
+    // Parsed via serde_json::Value to keep the C ABI stable while allowing newer
+    // multimodal clients to send structured dynamic-tool content items.
     let value: serde_json::Value = match serde_json::from_str(&response_json) {
         Ok(v) => v,
         Err(_) => return 3,
     };
-    let text = value
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
     let success = value
         .get("success")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
+    let content_items = match parse_dynamic_tool_content_items(&value) {
+        Ok(Some(items)) => items,
+        Ok(None) => {
+            let text = value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            vec![DynamicToolCallOutputContentItem::InputText { text }]
+        }
+        Err(_) => return 3,
+    };
     let response = DynamicToolResponse {
-        content_items: vec![DynamicToolCallOutputContentItem::InputText { text }],
+        content_items,
         success,
     };
 
@@ -1212,4 +1499,52 @@ pub extern "C" fn codex_respond_dynamic_tool(
         },
         None => 6,
     }
+}
+
+fn parse_dynamic_tool_content_items(
+    value: &serde_json::Value,
+) -> Result<Option<Vec<DynamicToolCallOutputContentItem>>, ()> {
+    let Some(raw_items) = value
+        .get("content_items")
+        .or_else(|| value.get("contentItems"))
+    else {
+        return Ok(None);
+    };
+    let items = raw_items.as_array().ok_or(())?;
+    let mut parsed = Vec::with_capacity(items.len());
+    for item in items {
+        let item_type = item
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?;
+        match item_type {
+            "input_text" | "inputText" => {
+                let text = item
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_string();
+                parsed.push(DynamicToolCallOutputContentItem::InputText { text });
+            }
+            "input_image" | "inputImage" => {
+                let image_url = item
+                    .get("image_url")
+                    .or_else(|| item.get("imageUrl"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(())?
+                    .to_string();
+                let detail = match item.get("detail").and_then(serde_json::Value::as_str) {
+                    None => None,
+                    Some("auto") => Some(ImageDetail::Auto),
+                    Some("low") => Some(ImageDetail::Low),
+                    Some("high") => Some(ImageDetail::High),
+                    Some("original") => Some(ImageDetail::Original),
+                    Some(_) => return Err(()),
+                };
+                parsed.push(DynamicToolCallOutputContentItem::InputImage { image_url, detail });
+            }
+            _ => return Err(()),
+        }
+    }
+    Ok(Some(parsed))
 }

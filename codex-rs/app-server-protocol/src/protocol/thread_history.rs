@@ -1461,6 +1461,7 @@ fn convert_dynamic_tool_content_items(
             }
             codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputImage {
                 image_url,
+                detail: _,
             } => DynamicToolCallOutputContentItem::InputImage { image_url },
         })
         .collect()

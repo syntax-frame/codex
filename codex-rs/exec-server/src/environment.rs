@@ -339,7 +339,13 @@ impl EnvironmentManager {
         host_fingerprint: Option<String>,
     ) -> Self {
         let environment_id = environment_id.into();
-        let environment = Arc::new(Environment::ssh(host, port, user, key_path, host_fingerprint));
+        let environment = Arc::new(Environment::ssh(
+            host,
+            port,
+            user,
+            key_path,
+            host_fingerprint,
+        ));
         Self {
             default_environment: Some(environment_id.clone()),
             environments: RwLock::new(HashMap::from([(environment_id, environment)])),
@@ -364,7 +370,13 @@ impl EnvironmentManager {
                 "environment id cannot be empty".to_string(),
             ));
         }
-        let environment = Arc::new(Environment::ssh(host, port, user, key_path, host_fingerprint));
+        let environment = Arc::new(Environment::ssh(
+            host,
+            port,
+            user,
+            key_path,
+            host_fingerprint,
+        ));
         self.environments
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

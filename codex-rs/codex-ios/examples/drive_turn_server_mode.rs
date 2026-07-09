@@ -82,8 +82,8 @@ extern "C" fn on_event(ctx: *mut c_void, kind: c_int, text: *const c_char) {
 
 fn main() {
     let home = std::env::var("HOME").expect("HOME");
-    let raw =
-        std::fs::read_to_string(format!("{home}/.codex/auth.json")).expect("read ~/.codex/auth.json");
+    let raw = std::fs::read_to_string(format!("{home}/.codex/auth.json"))
+        .expect("read ~/.codex/auth.json");
     let v: serde_json::Value = serde_json::from_str(&raw).expect("parse auth.json");
     let token = v["tokens"]["access_token"].as_str().unwrap().to_string();
     let id = v["tokens"]["id_token"].as_str().unwrap().to_string();
@@ -95,9 +95,7 @@ fn main() {
         port: 22,
         user: "ivica".to_string(),
         key_path: format!("{home}/.ssh/agentapp_key"),
-        host_fingerprint: Some(
-            "SHA256:CY78+2WDrz98u7UEHZx8AhuwLAeHU5wbpBfULEh6jVc".to_string(),
-        ),
+        host_fingerprint: Some("SHA256:CY78+2WDrz98u7UEHZx8AhuwLAeHU5wbpBfULEh6jVc".to_string()),
     };
 
     let mut cap = Capture::default();

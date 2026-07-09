@@ -71,6 +71,10 @@ typedef void (*codex_event_callback)(void *ctx, int event_kind, const char *text
  *                 "inputSchema":{...}}). When one is called the turn PAUSES and
  *                 emits event kind 7; reply with codex_respond_dynamic_tool().
  *                 NULL/empty = no dynamic tools. (Same param on all three turn fns.)
+ *   uploads_json  Optional JSON array of local files attached to the turn:
+ *                 [{"local_path":"...","relative_path":"uploads/file.png"}].
+ *                 Supported image files are added to the model input as normal
+ *                 prompt images.
  *   ctx           opaque pointer forwarded to every callback invocation.
  *   callback      invoked for each streamed event (see codex_event_callback).
  */
@@ -82,6 +86,7 @@ void codex_run_turn_streaming(const char *access_token,
                               const char *history_json,
                               const char *workspace_path,
                               const char *dynamic_tools_json,
+                              const char *uploads_json,
                               void *ctx,
                               codex_event_callback callback);
 
@@ -105,6 +110,10 @@ void codex_run_turn_streaming(const char *access_token,
  *                   or NULL/empty for a fresh conversation.
  *   workspace_path  Absolute path to the node's working directory; the turn is
  *                   rooted here so file tools operate inside it. NULL/empty = none.
+ *   uploads_json    Optional JSON array of local files attached to the turn:
+ *                   [{"local_path":"...","relative_path":"uploads/file.png"}].
+ *                   Supported image files are added to the model input as normal
+ *                   prompt images.
  *   ctx             opaque pointer forwarded to every callback invocation.
  *   callback        invoked for each streamed event (see codex_event_callback).
  */
@@ -116,6 +125,7 @@ void codex_run_turn_streaming_apikey(const char *base_url,
                                      const char *history_json,
                                      const char *workspace_path,
                                      const char *dynamic_tools_json,
+                                     const char *uploads_json,
                                      void *ctx,
                                      codex_event_callback callback);
 
@@ -148,6 +158,11 @@ void codex_run_turn_streaming_apikey(const char *base_url,
  *                   form. When NULL or empty, host-key pinning is disabled
  *                   (any host key accepted). When set, the connection is
  *                   rejected unless the server's host key matches.
+ *   uploads_json    Optional JSON array of local files to mirror to the remote
+ *                   workspace before the turn starts:
+ *                   [{"local_path":"...","relative_path":"uploads/file.png"}].
+ *                   Supported image files are also added to the model input as
+ *                   normal prompt images.
  *   ctx             opaque pointer forwarded to every callback invocation.
  *   callback        invoked for each streamed event (see codex_event_callback).
  */
@@ -164,6 +179,7 @@ void codex_run_turn_streaming_server(const char *access_token,
                                      const char *ssh_user,
                                      const char *ssh_key_pem,
                                      const char *ssh_fingerprint,
+                                     const char *uploads_json,
                                      void *ctx,
                                      codex_event_callback callback);
 
@@ -175,9 +191,12 @@ void codex_run_turn_streaming_server(const char *access_token,
  *
  *   turn_handle    the "turn_handle" from the dynamic-tool-call payload.
  *   call_id        the "call_id" from the dynamic-tool-call payload.
- *   response_json  NUL-terminated UTF-8 JSON object {"text": <string>,
- *                  "success": <bool>} (both optional: text defaults to "",
- *                  success to true). Wrapped into the tool output the model sees.
+ *   response_json  NUL-terminated UTF-8 JSON object. Text clients may pass
+ *                  {"text": <string>, "success": <bool>}. Multimodal clients
+ *                  may pass {"content_items": [{"type": "input_text",
+ *                  "text": "..."}, {"type": "input_image", "image_url":
+ *                  "data:...", "detail": "high"}], "success": <bool>}.
+ *                  text defaults to "", success to true.
  *
  * Returns 0 on success. Non-zero: 1 = bad call_id pointer, 2 = bad
  * response_json pointer, 3 = response_json parse failure, 4 = internal lock

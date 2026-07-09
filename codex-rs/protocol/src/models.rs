@@ -1865,12 +1865,13 @@ impl From<crate::dynamic_tools::DynamicToolCallOutputContentItem>
             crate::dynamic_tools::DynamicToolCallOutputContentItem::InputText { text } => {
                 Self::InputText { text }
             }
-            crate::dynamic_tools::DynamicToolCallOutputContentItem::InputImage { image_url } => {
-                Self::InputImage {
-                    image_url,
-                    detail: Some(DEFAULT_IMAGE_DETAIL),
-                }
-            }
+            crate::dynamic_tools::DynamicToolCallOutputContentItem::InputImage {
+                image_url,
+                detail,
+            } => Self::InputImage {
+                image_url,
+                detail: Some(detail.unwrap_or(DEFAULT_IMAGE_DETAIL)),
+            },
         }
     }
 }

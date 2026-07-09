@@ -40,7 +40,8 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                             output_schema: tool.output_schema.clone(),
                         };
                         tool.description =
-                            codex_code_mode_protocol::augment_tool_definition(definition).description;
+                            codex_code_mode_protocol::augment_tool_definition(definition)
+                                .description;
                     }
                 }
             }

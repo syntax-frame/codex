@@ -125,10 +125,9 @@ impl SshProcessBackend {
         let handler = SshClientHandler {
             expected_fingerprint: self.host_fingerprint.clone(),
         };
-        let mut session =
-            client::connect(config, (self.host.as_str(), self.port), handler)
-                .await
-                .map_err(|e| ExecServerError::Protocol(format!("ssh connect: {e}")))?;
+        let mut session = client::connect(config, (self.host.as_str(), self.port), handler)
+            .await
+            .map_err(|e| ExecServerError::Protocol(format!("ssh connect: {e}")))?;
 
         let authed = session
             .authenticate_publickey(&self.user, Arc::new(key_pair))
@@ -175,8 +174,10 @@ impl SshProcessBackend {
             ExecOutputStream::Stdout
         };
 
-        let events =
-            ExecProcessEventLog::new(PROCESS_EVENT_CHANNEL_CAPACITY, RETAINED_OUTPUT_BYTES_PER_PROCESS);
+        let events = ExecProcessEventLog::new(
+            PROCESS_EVENT_CHANNEL_CAPACITY,
+            RETAINED_OUTPUT_BYTES_PER_PROCESS,
+        );
         let (wake_tx, _wake_rx) = watch::channel(0);
         let output_notify = Arc::new(Notify::new());
         let state = Arc::new(StdMutex::new(SharedState::default()));
@@ -228,12 +229,14 @@ fn build_remote_command(params: &ExecParams) -> String {
         prefix.push_str(&format!("cd {} && ", shell_quote(&cwd.to_string_lossy())));
     }
 
+    if !params.env.contains_key("PATH") {
+        prefix.push_str(
+            "export PATH='/Users/ivica/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin' && ",
+        );
+    }
+
     for (key, value) in &params.env {
-        prefix.push_str(&format!(
-            "export {}={} && ",
-            key,
-            shell_quote(value)
-        ));
+        prefix.push_str(&format!("export {}={} && ", key, shell_quote(value)));
     }
 
     let joined = params

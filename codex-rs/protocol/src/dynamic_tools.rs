@@ -1,3 +1,4 @@
+use crate::models::ImageDetail;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -69,7 +70,11 @@ pub enum DynamicToolCallOutputContentItem {
     #[serde(rename_all = "camelCase")]
     InputText { text: String },
     #[serde(rename_all = "camelCase")]
-    InputImage { image_url: String },
+    InputImage {
+        image_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<ImageDetail>,
+    },
 }
 
 /// Former flat `SessionMeta` shape, including the old `exposeToContext` flag.
