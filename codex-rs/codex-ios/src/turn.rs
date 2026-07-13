@@ -650,8 +650,12 @@ pub(crate) async fn run_turn_async(
     //   backend.
     if server_mode.is_some() {
         let _ = config.features.enable(Feature::ShellTool);
+        // Keep the mobile bridge's public contract explicit: server mode offers
+        // exec_command + write_stdin even if an upstream default changes.
+        let _ = config.features.enable(Feature::UnifiedExec);
     } else {
         let _ = config.features.disable(Feature::ShellTool);
+        let _ = config.features.disable(Feature::UnifiedExec);
     }
 
     // Disable Codex's built-in multi-agent suites (spawn_agent / wait_agent /
