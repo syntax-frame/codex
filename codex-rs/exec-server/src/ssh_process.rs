@@ -7,20 +7,14 @@
 //! none of the local OS-PTY / sandbox machinery is reused here.
 //!
 //! Lifecycle:
-//! - [`SshProcessBackend::start`] connects, authenticates with a private key,
-//!   opens a session channel, optionally requests a PTY, and execs the command
-//!   built from [`ExecParams`].
-//! - A single background task *owns* the russh [`Channel`] and runs a
-//!   `select!` loop. It drains `Data`/`ExtendedData` into the
-//!   [`ExecProcessEventLog`] (and a retained, seq-numbered output buffer for
-//!   `read`), publishes `Exited` on `ExitStatus`, and `Closed` on channel
-//!   close. All mutating channel operations (`write`/`signal`/`terminate`) are
-//!   funneled to that task over an mpsc command channel, which sidesteps russh
-//!   0.45's split between `wait(&mut self)` (reads) and `data`/`signal`/`eof`
-//!   (`&self`).
+//! - Physical transports are pooled per saved connection profile.
+//! - In tmux mode, each agent has a logical session and each process has a
+//!   window whose output and exit status survive transport reconnects.
+//! - In direct mode, a background task owns the pooled russh channel, drains
+//!   output into [`ExecProcessEventLog`], and serializes stdin/signal/terminate
+//!   operations over an mpsc command channel.
 
 use std::collections::VecDeque;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -28,9 +22,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use russh::ChannelMsg;
 use russh::Sig;
-use russh::client;
-use russh::keys::key;
-use russh::keys::load_secret_key;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -53,26 +44,37 @@ use crate::protocol::ProcessSignal;
 use crate::protocol::ReadResponse;
 use crate::protocol::WriteResponse;
 use crate::protocol::WriteStatus;
+use crate::ssh_transport::PooledSshChannel;
+use crate::ssh_transport::SshAuthentication;
+use crate::ssh_transport::SshTransport;
+use crate::ssh_transport::classified_protocol_error;
+use crate::ssh_transport::is_reconnectable_ssh_error;
+
+#[path = "ssh_tmux.rs"]
+mod tmux;
 
 const RETAINED_OUTPUT_BYTES_PER_PROCESS: usize = 1024 * 1024;
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
-/// russh inactivity timeout for the control connection.
-const SSH_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+const SSH_START_ATTEMPTS: usize = 2;
+const REMOTE_PATH_EXPORT: &str = "export PATH=\"$HOME/bin:$HOME/.local/bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}\"";
+
+/// Whether server-mode process execution requires tmux continuity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SshTmuxMode {
+    Required,
+    Preferred,
+    Disabled,
+}
 
 /// Connection + auth material for opening SSH sessions.
 ///
-/// Cloneable so the backend can open a fresh connection per `start()` call.
+/// Cloneable process backend. Physical SSH transports are pooled per saved
+/// connection profile; `session_key` identifies the agent's tmux namespace.
 #[derive(Clone)]
 pub struct SshProcessBackend {
-    host: String,
-    port: u16,
-    user: String,
-    key_path: String,
-    /// Expected server host-key fingerprint in OpenSSH `SHA256:<base64nopad>`
-    /// form (as printed by `ssh-keygen -lf`). When `Some`, the connection is
-    /// accepted only if the server's host key fingerprint matches; when `None`,
-    /// any host key is accepted (permissive).
-    host_fingerprint: Option<String>,
+    transport: SshTransport,
+    session_key: String,
+    tmux_mode: SshTmuxMode,
 }
 
 impl SshProcessBackend {
@@ -84,13 +86,7 @@ impl SshProcessBackend {
         user: impl Into<String>,
         key_path: impl Into<String>,
     ) -> Self {
-        Self {
-            host: host.into(),
-            port,
-            user: user.into(),
-            key_path: key_path.into(),
-            host_fingerprint: None,
-        }
+        Self::with_fingerprint(host, port, user, key_path, None)
     }
 
     /// Like [`SshProcessBackend::new`], but pins the server host key to
@@ -104,75 +100,170 @@ impl SshProcessBackend {
         key_path: impl Into<String>,
         host_fingerprint: Option<String>,
     ) -> Self {
-        Self {
-            host: host.into(),
+        let host = host.into();
+        let user = user.into();
+        let key_path = key_path.into();
+        let session_key = format!("{user}@{host}:{port}:{key_path}");
+        Self::with_authentication_and_keys(
+            host,
             port,
-            user: user.into(),
-            key_path: key_path.into(),
+            user,
+            SshAuthentication::PrivateKeyPath(key_path),
             host_fingerprint,
+            session_key.clone(),
+            session_key,
+            SshTmuxMode::Disabled,
+        )
+    }
+
+    /// Like [`SshProcessBackend::with_fingerprint`], but with an explicit
+    /// stable session key. iOS server mode passes a per-agent key here so the
+    /// same SSH connection survives across model turns for that agent.
+    pub fn with_fingerprint_and_session_key(
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        key_path: impl Into<String>,
+        host_fingerprint: Option<String>,
+        session_key: impl Into<String>,
+    ) -> Self {
+        let host = host.into();
+        let user = user.into();
+        let session_key = session_key.into();
+        let connection_key = format!("{user}@{host}:{port}");
+        Self::with_authentication_and_keys(
+            host,
+            port,
+            user,
+            SshAuthentication::PrivateKeyPath(key_path.into()),
+            host_fingerprint,
+            connection_key,
+            session_key,
+            SshTmuxMode::Disabled,
+        )
+    }
+
+    /// Build a backend with independent physical-connection and logical-agent
+    /// keys. AgentApp passes the saved profile ID as `connection_key` and the
+    /// node conversation ID as `session_key`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_authentication_and_keys(
+        host: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        authentication: SshAuthentication,
+        host_fingerprint: Option<String>,
+        connection_key: impl Into<String>,
+        session_key: impl Into<String>,
+        tmux_mode: SshTmuxMode,
+    ) -> Self {
+        Self::from_transport(
+            SshTransport::new(
+                connection_key,
+                host,
+                port,
+                user,
+                authentication,
+                host_fingerprint,
+            ),
+            session_key,
+            tmux_mode,
+        )
+    }
+
+    pub(crate) fn from_transport(
+        transport: SshTransport,
+        session_key: impl Into<String>,
+        tmux_mode: SshTmuxMode,
+    ) -> Self {
+        Self {
+            transport,
+            session_key: session_key.into(),
+            tmux_mode,
         }
     }
 
     async fn start(&self, params: ExecParams) -> Result<StartedExecProcess, ExecServerError> {
-        let key_pair = load_secret_key(Path::new(&self.key_path), None)
-            .map_err(|e| ExecServerError::Protocol(format!("ssh load key: {e}")))?;
+        match self.tmux_mode {
+            SshTmuxMode::Required => tmux::start(self.clone(), params).await,
+            SshTmuxMode::Preferred => match tmux::start(self.clone(), params.clone()).await {
+                Ok(process) => Ok(process),
+                Err(error) if tmux::is_unavailable(&error) => {
+                    tracing::warn!(
+                        session_key = %self.session_key,
+                        "tmux unavailable; falling back to direct ssh execution"
+                    );
+                    self.start_direct(params).await
+                }
+                Err(error) => Err(error),
+            },
+            SshTmuxMode::Disabled => self.start_direct(params).await,
+        }
+    }
 
-        let config = Arc::new(client::Config {
-            inactivity_timeout: Some(SSH_INACTIVITY_TIMEOUT),
-            ..Default::default()
-        });
+    async fn start_direct(
+        &self,
+        params: ExecParams,
+    ) -> Result<StartedExecProcess, ExecServerError> {
+        let (channel, stream) = {
+            let mut result = None;
+            for attempt in 0..SSH_START_ATTEMPTS {
+                let channel = self.transport.open_work_channel().await?;
 
-        let handler = SshClientHandler {
-            expected_fingerprint: self.host_fingerprint.clone(),
+                // The remote sshd provides the PTY; request one when the caller wants a
+                // tty so interactive programs behave (line editing, signals, echo).
+                if params.tty
+                    && let Err(error) = channel
+                        .channel()
+                        .request_pty(
+                            false,
+                            "xterm-256color",
+                            /*col_width*/ 80,
+                            /*row_height*/ 24,
+                            /*pix_width*/ 0,
+                            /*pix_height*/ 0,
+                            &[],
+                        )
+                        .await
+                {
+                    if attempt + 1 < SSH_START_ATTEMPTS && is_reconnectable_ssh_error(&error) {
+                        tracing::debug!(
+                            session_key = %self.session_key,
+                            error = %error,
+                            "retrying ssh process start after pty failure"
+                        );
+                        continue;
+                    }
+                    return Err(classified_protocol_error("request_pty", &error));
+                }
+
+                let command = build_remote_command(&params);
+                if let Err(error) = channel.channel().exec(true, command).await {
+                    if attempt + 1 < SSH_START_ATTEMPTS && is_reconnectable_ssh_error(&error) {
+                        tracing::debug!(
+                            session_key = %self.session_key,
+                            error = %error,
+                            "retrying ssh process start after exec failure"
+                        );
+                        continue;
+                    }
+                    return Err(classified_protocol_error("exec", &error));
+                }
+
+                let stream = if params.tty {
+                    ExecOutputStream::Pty
+                } else {
+                    ExecOutputStream::Stdout
+                };
+                result = Some((channel, stream));
+                break;
+            }
+            result.ok_or_else(|| {
+                ExecServerError::Protocol("ssh process start failed: exhausted_retries".to_string())
+            })?
         };
-        let mut session = client::connect(config, (self.host.as_str(), self.port), handler)
-            .await
-            .map_err(|e| ExecServerError::Protocol(format!("ssh connect: {e}")))?;
-
-        let authed = session
-            .authenticate_publickey(&self.user, Arc::new(key_pair))
-            .await
-            .map_err(|e| ExecServerError::Protocol(format!("ssh auth: {e}")))?;
-        if !authed {
-            return Err(ExecServerError::Protocol(
-                "ssh authentication failed (publickey rejected)".to_string(),
-            ));
-        }
-
-        let channel = session
-            .channel_open_session()
-            .await
-            .map_err(|e| ExecServerError::Protocol(format!("ssh open channel: {e}")))?;
-
-        // The remote sshd provides the PTY; request one when the caller wants a
-        // tty so interactive programs behave (line editing, signals, echo).
-        if params.tty {
-            channel
-                .request_pty(
-                    false,
-                    "xterm-256color",
-                    /*col_width*/ 80,
-                    /*row_height*/ 24,
-                    /*pix_width*/ 0,
-                    /*pix_height*/ 0,
-                    &[],
-                )
-                .await
-                .map_err(|e| ExecServerError::Protocol(format!("ssh request pty: {e}")))?;
-        }
-
-        let command = build_remote_command(&params);
-        channel
-            .exec(true, command)
-            .await
-            .map_err(|e| ExecServerError::Protocol(format!("ssh exec: {e}")))?;
 
         let process_id = params.process_id.clone();
-        let stream = if params.tty {
-            ExecOutputStream::Pty
-        } else {
-            ExecOutputStream::Stdout
-        };
 
         let events = ExecProcessEventLog::new(
             PROCESS_EVENT_CHANNEL_CAPACITY,
@@ -183,11 +274,7 @@ impl SshProcessBackend {
         let state = Arc::new(StdMutex::new(SharedState::default()));
         let (cmd_tx, cmd_rx) = mpsc::channel::<ChannelCommand>(64);
 
-        // Keep the russh session alive for the lifetime of the channel pump.
-        // Dropping the `Handle` tears down the transport, so the pump task owns
-        // it. `_session` is otherwise unused.
         tokio::spawn(channel_pump(
-            session,
             channel,
             stream,
             events.clone(),
@@ -201,6 +288,7 @@ impl SshProcessBackend {
             process: Arc::new(SshProcess {
                 process_id,
                 tty: params.tty,
+                tmux: false,
                 events,
                 wake_tx,
                 output_notify,
@@ -208,6 +296,14 @@ impl SshProcessBackend {
                 cmd_tx,
             }),
         })
+    }
+
+    pub(super) fn transport(&self) -> &SshTransport {
+        &self.transport
+    }
+
+    pub(super) fn session_key(&self) -> &str {
+        &self.session_key
     }
 }
 
@@ -223,6 +319,16 @@ impl ExecBackend for SshProcessBackend {
 /// and `export`s. The whole thing runs under the remote login shell (russh
 /// `exec` already passes the string to a shell).
 fn build_remote_command(params: &ExecParams) -> String {
+    build_remote_command_with_argv_prefix(params, "exec ")
+}
+
+/// Variant used inside the tmux wrapper, which must regain control after the
+/// child exits so it can persist the exit status for reconnection.
+fn build_remote_command_body(params: &ExecParams) -> String {
+    build_remote_command_with_argv_prefix(params, "")
+}
+
+fn build_remote_command_with_argv_prefix(params: &ExecParams, argv_prefix: &str) -> String {
     let mut prefix = String::new();
 
     if let Ok(cwd) = params.cwd.to_abs_path() {
@@ -230,9 +336,8 @@ fn build_remote_command(params: &ExecParams) -> String {
     }
 
     if !params.env.contains_key("PATH") {
-        prefix.push_str(
-            "export PATH='/Users/ivica/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin' && ",
-        );
+        prefix.push_str(REMOTE_PATH_EXPORT);
+        prefix.push_str(" && ");
     }
 
     for (key, value) in &params.env {
@@ -246,13 +351,17 @@ fn build_remote_command(params: &ExecParams) -> String {
         .collect::<Vec<_>>()
         .join(" ");
 
-    format!("{prefix}exec {joined}")
+    format!("{prefix}{argv_prefix}{joined}")
 }
 
 /// Single-quote a string for POSIX shells, escaping embedded single quotes.
 fn shell_quote(s: &str) -> String {
     let escaped = s.replace('\'', r#"'\''"#);
     format!("'{escaped}'")
+}
+
+fn with_remote_path(command: &str) -> String {
+    format!("{REMOTE_PATH_EXPORT} && {command}")
 }
 
 /// Output retained for seq-numbered [`ExecProcess::read`] paging.
@@ -297,6 +406,7 @@ enum ChannelCommand {
 struct SshProcess {
     process_id: ProcessId,
     tty: bool,
+    tmux: bool,
     events: ExecProcessEventLog,
     wake_tx: watch::Sender<u64>,
     output_notify: Arc<Notify>,
@@ -420,7 +530,7 @@ impl ExecProcessImpl for SshProcess {
             tracing::debug!("ssh signal: channel pump gone, dropping signal");
             return Ok(());
         }
-        if self.tty {
+        if self.tty && !self.tmux {
             let (ack_tx, _ack_rx) = oneshot::channel();
             let _ = self
                 .cmd_tx
@@ -491,44 +601,10 @@ impl ExecProcess for SshProcess {
     }
 }
 
-struct SshClientHandler {
-    /// Expected host-key fingerprint in OpenSSH `SHA256:<base64nopad>` form. The
-    /// `SHA256:` prefix is optional. When `None`, any host key is accepted.
-    expected_fingerprint: Option<String>,
-}
-
-#[async_trait]
-impl client::Handler for SshClientHandler {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        server_public_key: &key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        match &self.expected_fingerprint {
-            // No pin configured: permissive (matches the host spike behavior).
-            None => Ok(true),
-            Some(expected) => {
-                // russh's `PublicKey::fingerprint()` returns the base64 (no
-                // padding) SHA256 of the serialized public key — i.e. exactly
-                // what OpenSSH's `ssh-keygen -lf` prints after the `SHA256:`
-                // prefix. Compare against the expected fingerprint, tolerating
-                // an optional leading `SHA256:`.
-                let actual = server_public_key.fingerprint();
-                let expected = expected
-                    .strip_prefix("SHA256:")
-                    .unwrap_or(expected.as_str());
-                Ok(actual == expected)
-            }
-        }
-    }
-}
-
 /// Owns the russh channel for its whole lifetime and pumps both directions.
 #[allow(clippy::too_many_arguments)]
 async fn channel_pump(
-    _session: client::Handle<SshClientHandler>,
-    mut channel: russh::Channel<client::Msg>,
+    mut channel: PooledSshChannel,
     stream: ExecOutputStream,
     events: ExecProcessEventLog,
     wake_tx: watch::Sender<u64>,
@@ -540,7 +616,7 @@ async fn channel_pump(
 
     loop {
         tokio::select! {
-            msg = channel.wait() => {
+            msg = channel.channel_mut().wait() => {
                 let Some(msg) = msg else {
                     // Channel fully closed.
                     break;
@@ -575,16 +651,17 @@ async fn channel_pump(
                 match cmd {
                     Some(ChannelCommand::Write { data, ack }) => {
                         let result = channel
+                            .channel()
                             .data(&data[..])
                             .await
                             .map_err(|e| e.to_string());
                         let _ = ack.send(result);
                     }
                     Some(ChannelCommand::Signal(sig)) => {
-                        let _ = channel.signal(sig).await;
+                        let _ = channel.channel().signal(sig).await;
                     }
                     Some(ChannelCommand::Eof) => {
-                        let _ = channel.eof().await;
+                        let _ = channel.channel().eof().await;
                     }
                     None => {
                         // All process handles dropped; nothing left to drive

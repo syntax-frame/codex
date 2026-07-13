@@ -29,6 +29,7 @@ use http::HeaderValue;
 
 mod turn;
 pub use turn::EventCallback;
+pub use turn::ServerFileUpload;
 pub use turn::ServerMode;
 pub use turn::codex_run_turn_streaming;
 pub use turn::run_turn_streaming;
@@ -228,10 +229,41 @@ pub extern "C" fn codex_run_prompt(
     }
 }
 
+/// Return the authenticated Codex model catalog as a JSON array of ModelPreset
+/// objects. The result is account-aware and picker-ready; release it with
+/// [`codex_free_string`].
+///
+/// # Safety
+/// All pointers must be valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub extern "C" fn codex_list_models_json(
+    access_token: *const c_char,
+    id_token: *const c_char,
+    account_id: *const c_char,
+) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let token = c_str_to_string(access_token, "access_token")?;
+        let id_token = c_str_to_string(id_token, "id_token")?;
+        let account = c_str_to_string(account_id, "account_id")?;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+        runtime.block_on(turn::list_oauth_models_json(token, id_token, account))
+    });
+
+    match result {
+        Ok(Ok(json)) => into_c_string(json),
+        Ok(Err(message)) => error_string(message),
+        Err(_) => error_string("panic while listing models"),
+    }
+}
+
 /// Free a string previously returned by [`codex_run_prompt`].
 ///
 /// # Safety
-/// `s` must be a pointer returned by [`codex_run_prompt`] (or null).
+/// `s` must be a pointer returned by this library (or null).
 #[unsafe(no_mangle)]
 pub extern "C" fn codex_free_string(s: *mut c_char) {
     if s.is_null() {

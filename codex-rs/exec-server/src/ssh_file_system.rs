@@ -41,15 +41,10 @@
 //! SSH connection. If the session dies, the next call reconnects.
 
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
-use russh::client;
-use russh::keys::key;
-use russh::keys::load_secret_key;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use tokio::sync::Mutex;
@@ -65,10 +60,8 @@ use crate::FileSystemResult;
 use crate::FileSystemSandboxContext;
 use crate::ReadDirectoryEntry;
 use crate::RemoveOptions;
-use async_trait::async_trait;
-
-/// russh inactivity timeout for the SFTP control connection.
-const SSH_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+use crate::ssh_transport::SshAuthentication;
+use crate::ssh_transport::SshTransport;
 
 /// An [`ExecutorFileSystem`] backed by an SFTP session over SSH.
 ///
@@ -76,14 +69,7 @@ const SSH_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 /// `Arc<Mutex<..>>` so clones talk to the same connection.
 #[derive(Clone)]
 pub struct SshFileSystem {
-    host: String,
-    port: u16,
-    user: String,
-    key_path: String,
-    /// Expected server host-key fingerprint in OpenSSH `SHA256:<base64nopad>`
-    /// form (matching [`crate::ssh_process::SshProcessBackend`]). `None` accepts
-    /// any host key.
-    host_fingerprint: Option<String>,
+    transport: SshTransport,
     /// Lazily-opened, reused SFTP session.
     session: Arc<Mutex<Option<Arc<SftpSession>>>>,
 }
@@ -98,12 +84,23 @@ impl SshFileSystem {
         key_path: impl Into<String>,
         host_fingerprint: Option<String>,
     ) -> Self {
-        Self {
-            host: host.into(),
+        let host = host.into();
+        let user = user.into();
+        let key_path = key_path.into();
+        let connection_key = format!("{user}@{host}:{port}");
+        Self::with_transport(SshTransport::new(
+            connection_key,
+            host,
             port,
-            user: user.into(),
-            key_path: key_path.into(),
+            user,
+            SshAuthentication::PrivateKeyPath(key_path),
             host_fingerprint,
+        ))
+    }
+
+    pub(crate) fn with_transport(transport: SshTransport) -> Self {
+        Self {
+            transport,
             session: Arc::new(Mutex::new(None)),
         }
     }
@@ -139,55 +136,21 @@ impl SshFileSystem {
 
     /// Open a fresh SSH connection and start the SFTP subsystem on it.
     async fn connect_sftp(&self) -> io::Result<SftpSession> {
-        let key_pair = load_secret_key(Path::new(&self.key_path), None)
-            .map_err(|e| io::Error::other(format!("ssh load key: {e}")))?;
-
-        let config = Arc::new(client::Config {
-            inactivity_timeout: Some(SSH_INACTIVITY_TIMEOUT),
-            ..Default::default()
-        });
-
-        let handler = SshFsHandler {
-            expected_fingerprint: self.host_fingerprint.clone(),
-        };
-        let mut session = client::connect(config, (self.host.as_str(), self.port), handler)
+        let channel = self
+            .transport
+            .open_work_channel()
             .await
-            .map_err(|e| io::Error::other(format!("ssh connect: {e}")))?;
-
-        let authed = session
-            .authenticate_publickey(&self.user, Arc::new(key_pair))
-            .await
-            .map_err(|e| io::Error::other(format!("ssh auth: {e}")))?;
-        if !authed {
-            return Err(io::Error::other(
-                "ssh authentication failed (publickey rejected)",
-            ));
-        }
-
-        let channel = session
-            .channel_open_session()
-            .await
-            .map_err(|e| io::Error::other(format!("ssh open channel: {e}")))?;
+            .map_err(|error| io::Error::other(error.to_string()))?;
         channel
+            .channel()
             .request_subsystem(true, "sftp")
             .await
-            .map_err(|e| io::Error::other(format!("ssh request sftp subsystem: {e}")))?;
+            .map_err(|error| io::Error::other(format!("ssh request sftp subsystem: {error}")))?;
 
-        // `into_stream()` yields an AsyncRead+AsyncWrite over the channel; the
-        // returned stream owns the channel (and thereby keeps the underlying
-        // russh session alive for the SFTP session's lifetime). We deliberately
-        // leak the russh `Handle` (`session`) by moving it into a detached task
-        // so the transport is not torn down while the SFTP session is in use.
         let stream = channel.into_stream();
         let sftp = SftpSession::new(stream)
             .await
             .map_err(|e| io::Error::other(format!("sftp handshake: {e}")))?;
-
-        // Keep the russh session handle alive for as long as the process lives.
-        // Dropping it would close the transport. `SftpSession` owns only the
-        // channel stream, not the session handle, so we park the handle here.
-        std::mem::forget(session);
-
         Ok(sftp)
     }
 
@@ -253,31 +216,6 @@ fn unsupported(method: &str) -> io::Error {
         io::ErrorKind::Unsupported,
         format!("{method} is unsupported over SSH/SFTP"),
     )
-}
-
-struct SshFsHandler {
-    expected_fingerprint: Option<String>,
-}
-
-#[async_trait]
-impl client::Handler for SshFsHandler {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        server_public_key: &key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        match &self.expected_fingerprint {
-            None => Ok(true),
-            Some(expected) => {
-                let actual = server_public_key.fingerprint();
-                let expected = expected
-                    .strip_prefix("SHA256:")
-                    .unwrap_or(expected.as_str());
-                Ok(actual == expected)
-            }
-        }
-    }
 }
 
 impl ExecutorFileSystem for SshFileSystem {

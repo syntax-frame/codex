@@ -18,6 +18,8 @@
 //! Run:
 //!   cargo run -p codex-ios --example drive_turn_server_patch
 
+use codex_exec_server::SshAuthentication;
+use codex_exec_server::SshTmuxMode;
 use codex_ios::ServerMode;
 use codex_ios::run_turn_streaming;
 use std::os::raw::c_char;
@@ -91,11 +93,14 @@ fn main() {
 
     // SSH params: connect back to THIS Mac, matching the spike harness.
     let server = ServerMode {
+        connection_key: "localhost-ivica".to_string(),
+        session_key: "drive-turn-server-patch".to_string(),
         host: "127.0.0.1".to_string(),
         port: 22,
         user: "ivica".to_string(),
-        key_path: format!("{home}/.ssh/agentapp_key"),
+        authentication: SshAuthentication::PrivateKeyPath(format!("{home}/.ssh/agentapp_key")),
         host_fingerprint: Some("SHA256:CY78+2WDrz98u7UEHZx8AhuwLAeHU5wbpBfULEh6jVc".to_string()),
+        tmux_mode: SshTmuxMode::Preferred,
     };
 
     let mut cap = Capture::default();
@@ -114,9 +119,12 @@ fn main() {
             id,
             account,
             "gpt-5.4".to_string(),
+            "high".to_string(),
             prompt,
             String::new(),
             "/tmp".to_string(),
+            String::new(),
+            Vec::new(),
             Some(server),
             &mut cap as *mut Capture as *mut c_void,
             on_event,

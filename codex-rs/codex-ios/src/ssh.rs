@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use codex_exec_server::SshAuthentication;
 use russh::ChannelMsg;
 use russh::Disconnect;
 use russh::client;
@@ -127,7 +128,7 @@ pub async fn ssh_upload_file(
     host: &str,
     port: u16,
     user: &str,
-    key_path: &str,
+    authentication: &SshAuthentication,
     host_fingerprint: Option<String>,
     local_path: &str,
     remote_path: &str,
@@ -135,7 +136,6 @@ pub async fn ssh_upload_file(
     let bytes = tokio::fs::read(local_path)
         .await
         .map_err(|e| format!("read local file: {e}"))?;
-    let key_pair = load_secret_key(key_path, None).map_err(|e| format!("load key: {e}"))?;
 
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(60)),
@@ -148,12 +148,20 @@ pub async fn ssh_upload_file(
         .await
         .map_err(|e| format!("connect: {e}"))?;
 
-    let authed = session
-        .authenticate_publickey(user, Arc::new(key_pair))
-        .await
-        .map_err(|e| format!("auth: {e}"))?;
+    let authed = match authentication {
+        SshAuthentication::PrivateKeyPath(key_path) => {
+            let key_pair = load_secret_key(key_path, None).map_err(|e| format!("load key: {e}"))?;
+            session
+                .authenticate_publickey(user, Arc::new(key_pair))
+                .await
+        }
+        SshAuthentication::Password(password) => {
+            session.authenticate_password(user, password).await
+        }
+    }
+    .map_err(|e| format!("auth: {e}"))?;
     if !authed {
-        return Err("authentication failed (publickey rejected)".to_string());
+        return Err("authentication failed (credential rejected)".to_string());
     }
 
     let channel = session

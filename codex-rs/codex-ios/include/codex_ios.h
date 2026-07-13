@@ -27,7 +27,16 @@ char *codex_run_prompt(const char *access_token,
                        const char *prompt);
 
 /*
- * Free a string previously returned by codex_run_prompt().
+ * Return the live, account-aware Codex model catalog as a JSON array of model
+ * presets. The caller owns the result and must release it with
+ * codex_free_string(). Errors are returned as strings beginning with "ERROR: ".
+ */
+char *codex_list_models_json(const char *access_token,
+                             const char *id_token,
+                             const char *account_id);
+
+/*
+ * Free a string previously returned by this library.
  * Passing NULL is a no-op.
  */
 void codex_free_string(char *s);
@@ -60,6 +69,8 @@ typedef void (*codex_event_callback)(void *ctx, int event_kind, const char *text
  *   id_token      OAuth id token (JWT) — required to load ChatGPT auth.
  *   account_id    ChatGPT account id.
  *   model         Model slug, e.g. "gpt-5.4".
+ *   reasoning_effort  Exact effort advertised by the model catalog, or
+ *                 NULL/empty to use that model's live default.
  *   prompt        The user prompt.
  *   history_json  Prior conversation rollout as a JSON array of ResponseItems
  *                 (from a previous turn's history event), or NULL/empty for a
@@ -82,6 +93,7 @@ void codex_run_turn_streaming(const char *access_token,
                               const char *id_token,
                               const char *account_id,
                               const char *model,
+                              const char *reasoning_effort,
                               const char *prompt,
                               const char *history_json,
                               const char *workspace_path,
@@ -105,6 +117,7 @@ void codex_run_turn_streaming(const char *access_token,
  *   wire_api        "responses" for "<base_url>/responses", or
  *                   "chat_completions" for "<base_url>/chat/completions".
  *   model           Model slug, e.g. "granite4.1:8b" or "gpt-5.4".
+ *   reasoning_effort Exact effort value, or NULL/empty for model default.
  *   prompt          The user prompt.
  *   history_json    Prior conversation rollout as a JSON array of ResponseItems,
  *                   or NULL/empty for a fresh conversation.
@@ -121,6 +134,7 @@ void codex_run_turn_streaming_apikey(const char *base_url,
                                      const char *api_key,
                                      const char *wire_api,
                                      const char *model,
+                                     const char *reasoning_effort,
                                      const char *prompt,
                                      const char *history_json,
                                      const char *workspace_path,
@@ -128,6 +142,35 @@ void codex_run_turn_streaming_apikey(const char *base_url,
                                      const char *uploads_json,
                                      void *ctx,
                                      codex_event_callback callback);
+
+/*
+ * API-key + server-mode counterpart: provider transport and SSH tool routing
+ * are independent. Drives ONE turn against an API-key provider while shell/exec
+ * tools run on the configured SSH host. Parameter meanings match
+ * codex_run_turn_streaming_apikey() plus the SSH settings documented for
+ * codex_run_turn_streaming_server().
+ */
+void codex_run_turn_streaming_apikey_server(const char *base_url,
+                                            const char *api_key,
+                                            const char *wire_api,
+                                            const char *model,
+                                            const char *reasoning_effort,
+                                            const char *prompt,
+                                            const char *history_json,
+                                            const char *workspace_path,
+                                            const char *dynamic_tools_json,
+                                            const char *ssh_connection_key,
+                                            const char *ssh_session_key,
+                                            const char *ssh_host,
+                                            uint16_t ssh_port,
+                                            const char *ssh_user,
+                                            const char *ssh_auth_method,
+                                            const char *ssh_secret,
+                                            const char *ssh_fingerprint,
+                                            const char *ssh_tmux_mode,
+                                            const char *uploads_json,
+                                            void *ctx,
+                                            codex_event_callback callback);
 
 /*
  * Server-mode counterpart of codex_run_turn_streaming(): drive ONE user turn
@@ -142,22 +185,30 @@ void codex_run_turn_streaming_apikey(const char *base_url,
  *   id_token        OAuth id token (JWT) — required to load ChatGPT auth.
  *   account_id      ChatGPT account id.
  *   model           Model slug, e.g. "gpt-5.4".
+ *   reasoning_effort Exact effort advertised by the model catalog, or
+ *                   NULL/empty to use that model's live default.
  *   prompt          The user prompt.
  *   history_json    Prior conversation rollout as a JSON array of ResponseItems,
  *                   or NULL/empty for a fresh conversation.
  *   workspace_path  Absolute path to the working directory ON THE SERVER; the
  *                   turn is rooted here (must exist on the remote host).
  *                   NULL/empty = none.
+ *   ssh_connection_key Stable saved-profile key used to pool physical SSH
+ *                   transports across agents assigned to the same server.
+ *   ssh_session_key Stable per-agent key used for its independent tmux session.
  *   ssh_host        Remote SSH host (hostname or IP).
  *   ssh_port        Remote SSH port (e.g. 22).
  *   ssh_user        Remote SSH username.
- *   ssh_key_pem     OpenSSH PRIVATE KEY CONTENTS (PEM text), NOT a path. Written
- *                   to a chmod-600 temp file for the duration of the call and
- *                   deleted afterward; never persisted.
+ *   ssh_auth_method "private_key" or "password".
+ *   ssh_secret      Private-key PEM contents or password, according to
+ *                   ssh_auth_method. Private keys use an ephemeral chmod-600
+ *                   file; passwords are never persisted by the Rust layer.
  *   ssh_fingerprint Expected server host-key fingerprint in OpenSSH "SHA256:..."
  *                   form. When NULL or empty, host-key pinning is disabled
  *                   (any host key accepted). When set, the connection is
  *                   rejected unless the server's host key matches.
+ *   ssh_tmux_mode   "required", "preferred", or "disabled". Required is the
+ *                   default and preserves remote commands across SSH drops.
  *   uploads_json    Optional JSON array of local files to mirror to the remote
  *                   workspace before the turn starts:
  *                   [{"local_path":"...","relative_path":"uploads/file.png"}].
@@ -170,15 +221,20 @@ void codex_run_turn_streaming_server(const char *access_token,
                                      const char *id_token,
                                      const char *account_id,
                                      const char *model,
+                                     const char *reasoning_effort,
                                      const char *prompt,
                                      const char *history_json,
                                      const char *workspace_path,
                                      const char *dynamic_tools_json,
+                                     const char *ssh_connection_key,
+                                     const char *ssh_session_key,
                                      const char *ssh_host,
                                      uint16_t ssh_port,
                                      const char *ssh_user,
-                                     const char *ssh_key_pem,
+                                     const char *ssh_auth_method,
+                                     const char *ssh_secret,
                                      const char *ssh_fingerprint,
+                                     const char *ssh_tmux_mode,
                                      const char *uploads_json,
                                      void *ctx,
                                      codex_event_callback callback);

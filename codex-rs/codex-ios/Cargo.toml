@@ -15,6 +15,7 @@ russh-sftp = "2.3"
 async-trait = "0.1"
 codex-login = { workspace = true }
 codex-model-provider-info = { workspace = true }
+codex-models-manager = { workspace = true }
 codex-protocol = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }

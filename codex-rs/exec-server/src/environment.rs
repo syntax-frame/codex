@@ -26,6 +26,9 @@ use crate::protocol::EnvironmentInfo;
 use crate::remote::NoiseRendezvousEnvironmentConfig;
 use crate::remote_file_system::RemoteFileSystem;
 use crate::remote_process::RemoteProcess;
+use crate::ssh_process::SshTmuxMode;
+use crate::ssh_transport::SshAuthentication;
+use crate::ssh_transport::SshTransport;
 use tokio_util::task::AbortOnDropHandle;
 
 pub const CODEX_EXEC_SERVER_URL_ENV_VAR: &str = "CODEX_EXEC_SERVER_URL";
@@ -36,6 +39,21 @@ pub const CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID_ENV_VAR: &str =
 pub const CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR: &str = "CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN";
 pub const CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR: &str =
     "CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID";
+
+/// Complete SSH environment configuration. `connection_key` identifies the
+/// saved server profile for physical transport pooling, while `agent_key`
+/// identifies the node's independent tmux session.
+#[derive(Clone, Debug)]
+pub struct SshEnvironmentConfig {
+    pub connection_key: String,
+    pub agent_key: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub authentication: SshAuthentication,
+    pub host_fingerprint: Option<String>,
+    pub tmux_mode: SshTmuxMode,
+}
 
 /// Owns the execution/filesystem environments available to the Codex runtime.
 ///
@@ -337,15 +355,34 @@ impl EnvironmentManager {
         user: impl Into<String>,
         key_path: impl Into<String>,
         host_fingerprint: Option<String>,
+        session_key: Option<String>,
+    ) -> Self {
+        let host = host.into();
+        let user = user.into();
+        let key_path = key_path.into();
+        let connection_key = format!("{user}@{host}:{port}");
+        let agent_key = session_key.unwrap_or_else(|| connection_key.clone());
+        Self::ssh_with_config(
+            environment_id,
+            SshEnvironmentConfig {
+                connection_key,
+                agent_key,
+                host,
+                port,
+                user,
+                authentication: SshAuthentication::PrivateKeyPath(key_path),
+                host_fingerprint,
+                tmux_mode: SshTmuxMode::Disabled,
+            },
+        )
+    }
+
+    pub fn ssh_with_config(
+        environment_id: impl Into<String>,
+        config: SshEnvironmentConfig,
     ) -> Self {
         let environment_id = environment_id.into();
-        let environment = Arc::new(Environment::ssh(
-            host,
-            port,
-            user,
-            key_path,
-            host_fingerprint,
-        ));
+        let environment = Arc::new(Environment::ssh_with_config(config));
         Self {
             default_environment: Some(environment_id.clone()),
             environments: RwLock::new(HashMap::from([(environment_id, environment)])),
@@ -376,6 +413,7 @@ impl EnvironmentManager {
             user,
             key_path,
             host_fingerprint,
+            None,
         ));
         self.environments
             .write()
@@ -567,11 +605,10 @@ impl Environment {
     /// Builds an environment whose exec backend runs shell tools on a remote
     /// host over SSH (see [`crate::ssh_process::SshProcessBackend`]).
     ///
-    /// This is the "server mode" execution path: shell/exec tools run on the
-    /// SSH host, while the filesystem stays local for this pass (apply_patch /
-    /// remote files are a later pass). It is NOT a `remote_client` environment,
-    /// so [`Environment::is_remote`] stays `false` and the local shell is used
-    /// for snapshotting; only process execution is redirected over SSH.
+    /// This is the "server mode" execution path: shell/exec tools and filesystem
+    /// operations both run against the SSH host. It is NOT a `remote_client`
+    /// environment, so [`Environment::is_remote`] stays `false`; dispatch is
+    /// explicitly routed through the SSH process and SFTP backends.
     ///
     /// `host_fingerprint`, when `Some`, pins the server host key: the SSH
     /// connection is accepted only if the server's key fingerprint matches (in
@@ -583,30 +620,49 @@ impl Environment {
         user: impl Into<String>,
         key_path: impl Into<String>,
         host_fingerprint: Option<String>,
+        session_key: Option<String>,
     ) -> Self {
         let host = host.into();
         let user = user.into();
         let key_path = key_path.into();
+        let connection_key = format!("{user}@{host}:{port}");
+        let agent_key = session_key.unwrap_or_else(|| connection_key.clone());
+        Self::ssh_with_config(SshEnvironmentConfig {
+            connection_key,
+            agent_key,
+            host,
+            port,
+            user,
+            authentication: SshAuthentication::PrivateKeyPath(key_path),
+            host_fingerprint,
+            tmux_mode: SshTmuxMode::Disabled,
+        })
+    }
+
+    pub fn ssh_with_config(config: SshEnvironmentConfig) -> Self {
+        let transport = SshTransport::new(
+            config.connection_key,
+            config.host,
+            config.port,
+            config.user,
+            config.authentication,
+            config.host_fingerprint,
+        );
+        let process_backend = Arc::new(crate::ssh_process::SshProcessBackend::from_transport(
+            transport.clone(),
+            config.agent_key,
+            config.tmux_mode,
+        ));
         Self {
             exec_server_url: None,
             remote_client: None,
             startup_task: Arc::new(Mutex::new(None)),
-            exec_backend: Arc::new(crate::ssh_process::SshProcessBackend::with_fingerprint(
-                host.clone(),
-                port,
-                user.clone(),
-                key_path.clone(),
-                host_fingerprint.clone(),
-            )),
+            exec_backend: process_backend,
             // Server mode: file ops (apply_patch + read/write) must act on the
             // REMOTE host's disk, so back the filesystem with an SFTP session
             // over SSH to the same host instead of the phone's local disk.
-            filesystem: Arc::new(crate::ssh_file_system::SshFileSystem::with_fingerprint(
-                host,
-                port,
-                user,
-                key_path,
-                host_fingerprint,
+            filesystem: Arc::new(crate::ssh_file_system::SshFileSystem::with_transport(
+                transport,
             )),
             http_client: Arc::new(ReqwestHttpClient),
             local_runtime_paths: None,

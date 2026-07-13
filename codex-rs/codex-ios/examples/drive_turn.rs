@@ -45,23 +45,29 @@ fn run(token: &str, id: &str, account: &str, prompt: &str, history: &str, cap: &
     let c = |s: &str| CString::new(s).unwrap();
     let ws = std::env::temp_dir().join("codex_drive_turn_ws");
     let _ = std::fs::create_dir_all(&ws);
-    let (ct, ci, ca, cm, cp, ch, cw) = (
+    let (ct, ci, ca, cm, cr, cp, ch, cw, cd, cu) = (
         c(token),
         c(id),
         c(account),
         c("gpt-5.4"),
+        c("high"),
         c(prompt),
         c(history),
         c(ws.to_str().unwrap()),
+        c("[]"),
+        c("[]"),
     );
     codex_run_turn_streaming(
         ct.as_ptr(),
         ci.as_ptr(),
         ca.as_ptr(),
         cm.as_ptr(),
+        cr.as_ptr(),
         cp.as_ptr(),
         ch.as_ptr(),
         cw.as_ptr(),
+        cd.as_ptr(),
+        cu.as_ptr(),
         cap as *mut Capture as *mut c_void,
         on_event,
     );

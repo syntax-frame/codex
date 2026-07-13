@@ -30,6 +30,9 @@ use codex_core::config::ConfigOverrides;
 use codex_core::test_support::thread_manager_with_models_provider;
 use codex_core::test_support::thread_manager_with_models_provider_and_home;
 use codex_exec_server::EnvironmentManager;
+use codex_exec_server::SshAuthentication;
+use codex_exec_server::SshEnvironmentConfig;
+use codex_exec_server::SshTmuxMode;
 use codex_features::Feature;
 use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
@@ -39,6 +42,7 @@ use codex_login::TokenData;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
+use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
@@ -88,22 +92,26 @@ and report the command's actual output. To create or edit files on the server, p
 /// later pass); only process execution is redirected over SSH.
 #[derive(Clone, Debug)]
 pub struct ServerMode {
+    /// Stable saved-profile key used to pool physical SSH transports.
+    pub connection_key: String,
+    /// Stable per-agent key used for the node's independent tmux session.
+    pub session_key: String,
     pub host: String,
     pub port: u16,
     pub user: String,
-    /// Path to an OpenSSH private key authorized on the host.
-    pub key_path: String,
+    pub authentication: SshAuthentication,
     /// Expected host-key fingerprint in OpenSSH `SHA256:<base64nopad>` form.
     /// When `Some`, host-key pinning is enforced in `SshProcessBackend`: the
     /// SSH connection is rejected unless the server key fingerprint matches.
     /// When `None`, any host key is accepted (permissive).
     pub host_fingerprint: Option<String>,
+    pub tmux_mode: SshTmuxMode,
 }
 
 #[derive(Clone, Debug)]
-struct ServerFileUpload {
-    local_path: String,
-    relative_path: String,
+pub struct ServerFileUpload {
+    pub local_path: String,
+    pub relative_path: String,
 }
 
 /// Environment id under which the SSH server-mode environment is registered and
@@ -135,6 +143,18 @@ const POST_DYNAMIC_IMAGE_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
 const DYNAMIC_IMAGE_RESPONSE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_IMAGE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(45);
 const PROMPT_IMAGE_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn turn_runtime() -> &'static tokio::runtime::Runtime {
+    static TURN_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    TURN_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .thread_stack_size(16 * 1024 * 1024)
+            .build()
+            .expect("failed to build shared codex turn runtime")
+    })
+}
 
 /// Callback invoked for each streamed event. `text` is a NUL-terminated UTF-8
 /// C string that is ONLY valid for the duration of the call; the callee must
@@ -331,6 +351,21 @@ async fn build_auth(
     .ok_or_else(|| "ephemeral auth.json produced no auth".to_string())
 }
 
+/// Fetch the picker-ready model catalog for the supplied ChatGPT account using
+/// the same authenticated Codex ModelsManager that configures normal turns.
+pub(crate) async fn list_oauth_models_json(
+    access_token: String,
+    id_token: String,
+    account_id: String,
+) -> Result<String, String> {
+    let home_guard = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
+    let auth = build_auth(home_guard.path(), access_token, id_token, account_id).await?;
+    let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    let thread_manager = thread_manager_with_models_provider(auth, provider);
+    let models = thread_manager.list_models(RefreshStrategy::Online).await;
+    serde_json::to_string(&models).map_err(|e| format!("failed to serialize model catalog: {e}"))
+}
+
 fn toml_basic_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -360,6 +395,57 @@ fn parse_wire_api(value: &str) -> Result<WireApi, String> {
             "unsupported wire_api {other:?}; expected \"responses\" or \"chat_completions\""
         )),
     }
+}
+
+fn parse_ssh_authentication(
+    method: &str,
+    secret: String,
+) -> Result<(SshAuthentication, Option<tempfile::TempDir>), String> {
+    match method.trim().to_ascii_lowercase().as_str() {
+        "password" => Ok((SshAuthentication::Password(secret), None)),
+        "private_key" | "privatekey" | "key" => {
+            let key_dir = tempfile::tempdir()
+                .map_err(|e| format!("failed to create ssh key tempdir: {e}"))?;
+            let key_path = key_dir.path().join("id_ssh");
+            std::fs::write(&key_path, secret.as_bytes())
+                .map_err(|e| format!("failed to write ssh key file: {e}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("failed to chmod ssh key file: {e}"))?;
+            }
+            Ok((
+                SshAuthentication::PrivateKeyPath(key_path.to_string_lossy().into_owned()),
+                Some(key_dir),
+            ))
+        }
+        other => Err(format!(
+            "unsupported ssh authentication method `{other}`; expected private_key or password"
+        )),
+    }
+}
+
+fn parse_tmux_mode(value: &str) -> Result<SshTmuxMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "required" | "" => Ok(SshTmuxMode::Required),
+        "preferred" => Ok(SshTmuxMode::Preferred),
+        "disabled" | "off" => Ok(SshTmuxMode::Disabled),
+        other => Err(format!(
+            "unsupported ssh tmux mode `{other}`; expected required, preferred, or disabled"
+        )),
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Result<Option<ReasoningEffort>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<ReasoningEffort>()
+        .map(Some)
+        .map_err(|e| format!("invalid reasoning effort `{value}`: {e}"))
 }
 
 async fn write_api_key_provider_config(
@@ -417,6 +503,7 @@ pub(crate) enum ProviderAuthConfig {
 pub(crate) async fn run_turn_async(
     provider_config: ProviderAuthConfig,
     model: String,
+    reasoning_effort: String,
     prompt: String,
     history_json: String,
     workspace: String,
@@ -427,6 +514,7 @@ pub(crate) async fn run_turn_async(
     ctx: *mut c_void,
 ) -> Result<(), String> {
     emit_debug_stage(callback, ctx, "run_turn_async_entered");
+    let reasoning_effort = parse_reasoning_effort(&reasoning_effort)?;
     // Ephemeral codex_home: holds auth.json + any thread store artifacts. It is
     // deleted when `_home_guard` drops at the end of this function.
     let home_guard = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
@@ -482,13 +570,18 @@ pub(crate) async fn run_turn_async(
     // is true). Otherwise keep the default (local, shell-disabled) path intact.
     let thread_manager = match &server_mode {
         Some(server) => {
-            let environment_manager = std::sync::Arc::new(EnvironmentManager::ssh(
+            let environment_manager = std::sync::Arc::new(EnvironmentManager::ssh_with_config(
                 SERVER_MODE_ENVIRONMENT_ID,
-                server.host.clone(),
-                server.port,
-                server.user.clone(),
-                server.key_path.clone(),
-                server.host_fingerprint.clone(),
+                SshEnvironmentConfig {
+                    connection_key: server.connection_key.clone(),
+                    agent_key: server.session_key.clone(),
+                    host: server.host.clone(),
+                    port: server.port,
+                    user: server.user.clone(),
+                    authentication: server.authentication.clone(),
+                    host_fingerprint: server.host_fingerprint.clone(),
+                    tmux_mode: server.tmux_mode,
+                },
             ));
             thread_manager_with_models_provider_and_home(
                 auth,
@@ -504,7 +597,9 @@ pub(crate) async fn run_turn_async(
     let mut config = ConfigBuilder::default()
         .codex_home(codex_home.clone())
         .harness_overrides(ConfigOverrides {
-            model: Some(model.clone()),
+            // An empty model means "use the account's current catalog default".
+            // This keeps the iOS Provider Default option live as models evolve.
+            model: (!model.trim().is_empty()).then_some(model.clone()),
             // Root the turn in the node's workspace dir ("zone") so file tools
             // operate inside it.
             cwd: if workspace.is_empty() {
@@ -537,10 +632,9 @@ pub(crate) async fn run_turn_async(
         .map_err(|e| format!("failed to build config: {e}"))?;
     emit_debug_stage(callback, ctx, "config_ready");
 
-    // Enable reasoning so the model emits reasoning-summary deltas (rendered as
-    // "thinking" bubbles in the app). Without these the turn streams only the
-    // final answer.
-    config.model_reasoning_effort = Some(ReasoningEffort::High);
+    // An explicit effort comes from the node picker. None means the model
+    // manager applies the selected model's live default.
+    config.model_reasoning_effort = reasoning_effort.clone();
     config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
 
     // Shell tool gating:
@@ -636,10 +730,14 @@ pub(crate) async fn run_turn_async(
         text: prompt,
         text_elements: Vec::new(),
     }];
-    user_items.extend(image_uploads.into_iter().map(|upload| UserInput::LocalImage {
-        path: std::path::PathBuf::from(upload.local_path.clone()),
-        detail: Some(ImageDetail::Auto),
-    }));
+    user_items.extend(
+        image_uploads
+            .into_iter()
+            .map(|upload| UserInput::LocalImage {
+                path: std::path::PathBuf::from(upload.local_path.clone()),
+                detail: Some(ImageDetail::Auto),
+            }),
+    );
     let user_input_op = Op::UserInput {
         items: user_items,
         final_output_json_schema: None,
@@ -649,12 +747,12 @@ pub(crate) async fn run_turn_async(
             collaboration_mode: Some(CollaborationMode {
                 mode: ModeKind::Default,
                 settings: Settings {
-                    model: if model.is_empty() {
+                    model: if model.trim().is_empty() {
                         session_model
                     } else {
                         model
                     },
-                    reasoning_effort: Some(ReasoningEffort::High),
+                    reasoning_effort,
                     developer_instructions: Some(
                         if server_mode.is_some() {
                             SERVER_MODE_DEVELOPER_INSTRUCTIONS
@@ -786,10 +884,10 @@ pub(crate) async fn run_turn_async(
             // list_dir/update_plan/shell/…) surfaces generically here — the raw
             // response item carries the function name + arguments live.
             EventMsg::RawResponseItem(ev) => {
-                if let Some(key) = tool_call_replay_key(&ev.item) {
-                    if replayed_tool_calls.remove(&key) {
-                        continue;
-                    }
+                if let Some(key) = tool_call_replay_key(&ev.item)
+                    && replayed_tool_calls.remove(&key)
+                {
+                    continue;
                 }
 
                 match &ev.item {
@@ -876,7 +974,9 @@ pub(crate) async fn run_turn_async(
                                 KIND_TOOL_CALL,
                                 r#"{"tool":"dynamic_image_response_submit","args":{"phase":"begin"}}"#,
                             );
-                            match timeout(DYNAMIC_IMAGE_RESPONSE_SUBMIT_TIMEOUT, thread.submit(op)).await {
+                            match timeout(DYNAMIC_IMAGE_RESPONSE_SUBMIT_TIMEOUT, thread.submit(op))
+                                .await
+                            {
                                 Ok(result) => {
                                     result.map_err(|e| {
                                         format!("failed to submit dynamic image tool response: {e}")
@@ -899,12 +999,9 @@ pub(crate) async fn run_turn_async(
                                 }
                             }
                         } else {
-                            thread
-                                .submit(op)
-                                .await
-                                .map_err(|e| {
-                                    format!("failed to submit dynamic tool response: {e}")
-                                })?;
+                            thread.submit(op).await.map_err(|e| {
+                                format!("failed to submit dynamic tool response: {e}")
+                            })?;
                         }
                         awaiting_event_after_dynamic_image = response_contains_image;
                     }
@@ -985,6 +1082,7 @@ pub extern "C" fn codex_run_turn_streaming(
     id_token: *const c_char,
     account_id: *const c_char,
     model: *const c_char,
+    reasoning_effort: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
     workspace_path: *const c_char,
@@ -1001,6 +1099,11 @@ pub extern "C" fn codex_run_turn_streaming(
         let id_tok = c_str_to_string(id_token, "id_token")?;
         let account = c_str_to_string(account_id, "account_id")?;
         let model = c_str_to_string(model, "model")?;
+        let reasoning_effort = if reasoning_effort.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(reasoning_effort, "reasoning_effort")?
+        };
         let prompt = c_str_to_string(prompt, "prompt")?;
         // History is optional: NULL or empty means a fresh conversation.
         let history = if history_json.is_null() {
@@ -1037,19 +1140,14 @@ pub extern "C" fn codex_run_turn_streaming(
             .stack_size(32 * 1024 * 1024)
             .spawn(move || -> Result<(), String> {
                 let ctx = ctx_addr as *mut c_void;
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .thread_stack_size(16 * 1024 * 1024)
-                    .build()
-                    .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
-                runtime.block_on(run_turn_async(
+                turn_runtime().block_on(run_turn_async(
                     ProviderAuthConfig::ChatgptOAuth {
                         access_token: token,
                         id_token: id_tok,
                         account_id: account,
                     },
                     model,
+                    reasoning_effort,
                     prompt,
                     history,
                     workspace,
@@ -1095,6 +1193,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
     api_key: *const c_char,
     wire_api: *const c_char,
     model: *const c_char,
+    reasoning_effort: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
     workspace_path: *const c_char,
@@ -1115,6 +1214,11 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
             parse_wire_api(&c_str_to_string(wire_api, "wire_api")?)?
         };
         let model = c_str_to_string(model, "model")?;
+        let reasoning_effort = if reasoning_effort.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(reasoning_effort, "reasoning_effort")?
+        };
         let prompt = c_str_to_string(prompt, "prompt")?;
         // History is optional: NULL or empty means a fresh conversation.
         let history = if history_json.is_null() {
@@ -1146,19 +1250,14 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
             .stack_size(32 * 1024 * 1024)
             .spawn(move || -> Result<(), String> {
                 let ctx = ctx_addr as *mut c_void;
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .thread_stack_size(16 * 1024 * 1024)
-                    .build()
-                    .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
-                runtime.block_on(run_turn_async(
+                turn_runtime().block_on(run_turn_async(
                     ProviderAuthConfig::ApiKey {
                         base_url,
                         api_key,
                         wire_api,
                     },
                     model,
+                    reasoning_effort,
                     prompt,
                     history,
                     workspace,
@@ -1168,6 +1267,183 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
                     callback,
                     ctx,
                 ))
+            })
+            .map_err(|e| format!("failed to spawn worker thread: {e}"))?
+            .join()
+            .map_err(|_| "worker thread panicked".to_string())?
+    });
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => emit(callback, ctx, KIND_ERROR, &message),
+        Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
+    }
+}
+
+/// Generic API-key + server-mode counterpart: provider selection and SSH tool
+/// routing are independent. This drives ONE turn against an API-key provider
+/// while shell/exec tools run on the configured SSH host.
+///
+/// # Safety
+/// All string pointers must be either null or valid NUL-terminated C strings.
+/// `callback` must be a valid function pointer; `ctx` is passed through opaquely.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn codex_run_turn_streaming_apikey_server(
+    base_url: *const c_char,
+    api_key: *const c_char,
+    wire_api: *const c_char,
+    model: *const c_char,
+    reasoning_effort: *const c_char,
+    prompt: *const c_char,
+    history_json: *const c_char,
+    workspace_path: *const c_char,
+    dynamic_tools_json: *const c_char,
+    ssh_connection_key: *const c_char,
+    ssh_session_key: *const c_char,
+    ssh_host: *const c_char,
+    ssh_port: u16,
+    ssh_user: *const c_char,
+    ssh_auth_method: *const c_char,
+    ssh_secret: *const c_char,
+    ssh_fingerprint: *const c_char,
+    ssh_tmux_mode: *const c_char,
+    uploads_json: *const c_char,
+    ctx: *mut c_void,
+    callback: EventCallback,
+) {
+    let ctx_addr = ctx as usize;
+    let result = std::panic::catch_unwind(move || {
+        let base_url = c_str_to_string(base_url, "base_url")?;
+        let api_key = c_str_to_string(api_key, "api_key")?;
+        let wire_api = if wire_api.is_null() {
+            WireApi::Responses
+        } else {
+            parse_wire_api(&c_str_to_string(wire_api, "wire_api")?)?
+        };
+        let model = c_str_to_string(model, "model")?;
+        let reasoning_effort = if reasoning_effort.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(reasoning_effort, "reasoning_effort")?
+        };
+        let prompt = c_str_to_string(prompt, "prompt")?;
+        let history = if history_json.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(history_json, "history_json")?
+        };
+        let workspace = if workspace_path.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(workspace_path, "workspace_path")?
+        };
+        let dynamic_tools = if dynamic_tools_json.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
+        };
+        let uploads = if uploads_json.is_null() {
+            Vec::new()
+        } else {
+            parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
+        };
+
+        let host = c_str_to_string(ssh_host, "ssh_host")?;
+        let user = c_str_to_string(ssh_user, "ssh_user")?;
+        let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
+        let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
+        let connection_key = if ssh_connection_key.is_null() {
+            format!("{user}@{host}:{ssh_port}")
+        } else {
+            let value = c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
+            if value.trim().is_empty() {
+                format!("{user}@{host}:{ssh_port}")
+            } else {
+                value
+            }
+        };
+        let session_key = if ssh_session_key.is_null() {
+            format!("{user}@{host}:{ssh_port}:{workspace}")
+        } else {
+            let s = c_str_to_string(ssh_session_key, "ssh_session_key")?;
+            if s.trim().is_empty() {
+                format!("{user}@{host}:{ssh_port}:{workspace}")
+            } else {
+                s
+            }
+        };
+        let fingerprint = if ssh_fingerprint.is_null() {
+            None
+        } else {
+            let s = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
+            if s.trim().is_empty() { None } else { Some(s) }
+        };
+        let tmux_mode = if ssh_tmux_mode.is_null() {
+            SshTmuxMode::Required
+        } else {
+            parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
+        };
+        let (authentication, secret_guard) = parse_ssh_authentication(&auth_method, secret)?;
+
+        let server_mode = ServerMode {
+            connection_key,
+            session_key,
+            host,
+            port: ssh_port,
+            user,
+            authentication,
+            host_fingerprint: fingerprint,
+            tmux_mode,
+        };
+
+        std::thread::Builder::new()
+            .name("codex-turn".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || -> Result<(), String> {
+                let _secret_guard = secret_guard;
+                let ctx = ctx_addr as *mut c_void;
+                turn_runtime().block_on(async move {
+                    for upload in &uploads {
+                        let remote_path =
+                            join_remote_workspace_path(&workspace, &upload.relative_path);
+                        crate::ssh::ssh_upload_file(
+                            &server_mode.host,
+                            server_mode.port,
+                            &server_mode.user,
+                            &server_mode.authentication,
+                            server_mode.host_fingerprint.clone(),
+                            &upload.local_path,
+                            &remote_path,
+                        )
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "failed to upload {} to SSH workspace: {e}",
+                                upload.relative_path
+                            )
+                        })?;
+                    }
+
+                    run_turn_async(
+                        ProviderAuthConfig::ApiKey {
+                            base_url,
+                            api_key,
+                            wire_api,
+                        },
+                        model,
+                        reasoning_effort,
+                        prompt,
+                        history,
+                        workspace,
+                        dynamic_tools,
+                        uploads,
+                        Some(server_mode),
+                        callback,
+                        ctx,
+                    )
+                    .await
+                })
             })
             .map_err(|e| format!("failed to spawn worker thread: {e}"))?
             .join()
@@ -1208,15 +1484,20 @@ pub extern "C" fn codex_run_turn_streaming_server(
     id_token: *const c_char,
     account_id: *const c_char,
     model: *const c_char,
+    reasoning_effort: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
     workspace_path: *const c_char,
     dynamic_tools_json: *const c_char,
+    ssh_connection_key: *const c_char,
+    ssh_session_key: *const c_char,
     ssh_host: *const c_char,
     ssh_port: u16,
     ssh_user: *const c_char,
-    ssh_key_pem: *const c_char,
+    ssh_auth_method: *const c_char,
+    ssh_secret: *const c_char,
     ssh_fingerprint: *const c_char,
+    ssh_tmux_mode: *const c_char,
     uploads_json: *const c_char,
     ctx: *mut c_void,
     callback: EventCallback,
@@ -1229,6 +1510,11 @@ pub extern "C" fn codex_run_turn_streaming_server(
         let id_tok = c_str_to_string(id_token, "id_token")?;
         let account = c_str_to_string(account_id, "account_id")?;
         let model = c_str_to_string(model, "model")?;
+        let reasoning_effort = if reasoning_effort.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(reasoning_effort, "reasoning_effort")?
+        };
         let prompt = c_str_to_string(prompt, "prompt")?;
         // History is optional: NULL or empty means a fresh conversation.
         let history = if history_json.is_null() {
@@ -1257,7 +1543,28 @@ pub extern "C" fn codex_run_turn_streaming_server(
         // SSH connection settings.
         let host = c_str_to_string(ssh_host, "ssh_host")?;
         let user = c_str_to_string(ssh_user, "ssh_user")?;
-        let key_pem = c_str_to_string(ssh_key_pem, "ssh_key_pem")?;
+        let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
+        let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
+        let connection_key = if ssh_connection_key.is_null() {
+            format!("{user}@{host}:{ssh_port}")
+        } else {
+            let value = c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
+            if value.trim().is_empty() {
+                format!("{user}@{host}:{ssh_port}")
+            } else {
+                value
+            }
+        };
+        let session_key = if ssh_session_key.is_null() {
+            format!("{user}@{host}:{ssh_port}:{workspace}")
+        } else {
+            let s = c_str_to_string(ssh_session_key, "ssh_session_key")?;
+            if s.trim().is_empty() {
+                format!("{user}@{host}:{ssh_port}:{workspace}")
+            } else {
+                s
+            }
+        };
         // Fingerprint is optional: null/empty => no host-key pinning.
         let fingerprint = if ssh_fingerprint.is_null() {
             None
@@ -1265,29 +1572,22 @@ pub extern "C" fn codex_run_turn_streaming_server(
             let s = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
             if s.trim().is_empty() { None } else { Some(s) }
         };
-
-        // Persist the private key PEM to a chmod-600 file in an ephemeral temp
-        // dir. The dir (and key) live for the duration of the worker thread and
-        // are removed when `key_dir` drops after the turn completes.
-        let key_dir =
-            tempfile::tempdir().map_err(|e| format!("failed to create ssh key tempdir: {e}"))?;
-        let key_path = key_dir.path().join("id_ssh");
-        std::fs::write(&key_path, key_pem.as_bytes())
-            .map_err(|e| format!("failed to write ssh key file: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("failed to chmod ssh key file: {e}"))?;
-        }
-        let key_path_str = key_path.to_string_lossy().into_owned();
+        let tmux_mode = if ssh_tmux_mode.is_null() {
+            SshTmuxMode::Required
+        } else {
+            parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
+        };
+        let (authentication, secret_guard) = parse_ssh_authentication(&auth_method, secret)?;
 
         let server_mode = ServerMode {
+            connection_key,
+            session_key,
             host,
             port: ssh_port,
             user,
-            key_path: key_path_str,
+            authentication,
             host_fingerprint: fingerprint,
+            tmux_mode,
         };
 
         // Same big-stack worker + multi-thread runtime dance as the local FFI.
@@ -1295,16 +1595,10 @@ pub extern "C" fn codex_run_turn_streaming_server(
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
             .spawn(move || -> Result<(), String> {
-                // Hold the key dir alive until the turn finishes.
-                let _key_dir = key_dir;
+                // Hold a temporary key file alive when private-key auth is used.
+                let _secret_guard = secret_guard;
                 let ctx = ctx_addr as *mut c_void;
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .thread_stack_size(16 * 1024 * 1024)
-                    .build()
-                    .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
-                runtime.block_on(async move {
+                turn_runtime().block_on(async move {
                     for upload in &uploads {
                         let remote_path =
                             join_remote_workspace_path(&workspace, &upload.relative_path);
@@ -1312,7 +1606,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
                             &server_mode.host,
                             server_mode.port,
                             &server_mode.user,
-                            &server_mode.key_path,
+                            &server_mode.authentication,
                             server_mode.host_fingerprint.clone(),
                             &upload.local_path,
                             &remote_path,
@@ -1333,6 +1627,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
                             account_id: account,
                         },
                         model,
+                        reasoning_effort,
                         prompt,
                         history,
                         workspace,
@@ -1375,6 +1670,7 @@ pub unsafe fn run_turn_streaming(
     id_token: String,
     account_id: String,
     model: String,
+    reasoning_effort: String,
     prompt: String,
     history_json: String,
     workspace: String,
@@ -1391,19 +1687,14 @@ pub unsafe fn run_turn_streaming(
             .stack_size(32 * 1024 * 1024)
             .spawn(move || -> Result<(), String> {
                 let ctx = ctx_addr as *mut c_void;
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .thread_stack_size(16 * 1024 * 1024)
-                    .build()
-                    .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
-                runtime.block_on(run_turn_async(
+                turn_runtime().block_on(run_turn_async(
                     ProviderAuthConfig::ChatgptOAuth {
                         access_token,
                         id_token,
                         account_id,
                     },
                     model,
+                    reasoning_effort,
                     prompt,
                     history_json,
                     workspace,
@@ -1548,3 +1839,7 @@ fn parse_dynamic_tool_content_items(
     }
     Ok(Some(parsed))
 }
+
+#[cfg(test)]
+#[path = "turn_tests.rs"]
+mod tests;
