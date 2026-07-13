@@ -62,15 +62,70 @@ pub(crate) fn tool_user_shell_type(
 }
 
 fn effective_tool_mode(turn_context: &TurnContext) -> ToolMode {
-    turn_context.model_info.tool_mode.unwrap_or_else(|| {
-        if turn_context.config.features.enabled(Feature::CodeModeOnly) {
+    resolve_effective_tool_mode(
+        turn_context.model_info.tool_mode,
+        turn_context.config.features.enabled(Feature::CodeMode),
+        turn_context.config.features.enabled(Feature::CodeModeOnly),
+        cfg!(feature = "code-mode"),
+    )
+}
+
+fn resolve_effective_tool_mode(
+    model_tool_mode: Option<ToolMode>,
+    code_mode_enabled: bool,
+    code_mode_only_enabled: bool,
+    code_mode_runtime_available: bool,
+) -> ToolMode {
+    // Builds without the V8 code-mode runtime (notably iOS) cannot honor a
+    // model's code_mode/code_mode_only preference. Falling back to direct tools
+    // keeps shell and other client-executed tools usable instead of hiding them
+    // without providing the replacement `code` tool.
+    if !code_mode_runtime_available {
+        return ToolMode::Direct;
+    }
+
+    model_tool_mode.unwrap_or_else(|| {
+        if code_mode_only_enabled {
             ToolMode::CodeModeOnly
-        } else if turn_context.config.features.enabled(Feature::CodeMode) {
+        } else if code_mode_enabled {
             ToolMode::CodeMode
         } else {
             ToolMode::Direct
         }
     })
+}
+
+#[cfg(test)]
+mod effective_tool_mode_tests {
+    use super::resolve_effective_tool_mode;
+    use codex_protocol::openai_models::ToolMode;
+
+    #[test]
+    fn unavailable_code_mode_runtime_forces_direct_tools() {
+        for requested in [Some(ToolMode::CodeMode), Some(ToolMode::CodeModeOnly), None] {
+            assert_eq!(
+                resolve_effective_tool_mode(
+                    requested, /*code_mode_enabled*/ true,
+                    /*code_mode_only_enabled*/ true,
+                    /*code_mode_runtime_available*/ false,
+                ),
+                ToolMode::Direct
+            );
+        }
+    }
+
+    #[test]
+    fn available_code_mode_runtime_honors_model_selector() {
+        assert_eq!(
+            resolve_effective_tool_mode(
+                Some(ToolMode::CodeModeOnly),
+                /*code_mode_enabled*/ false,
+                /*code_mode_only_enabled*/ false,
+                /*code_mode_runtime_available*/ true,
+            ),
+            ToolMode::CodeModeOnly
+        );
+    }
 }
 
 /// Format the combined exec output for sending back to the model.
