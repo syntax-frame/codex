@@ -1,9 +1,11 @@
+use std::ffi::CString;
 use std::path::Path;
 
 use codex_exec_server::SshAuthentication;
 use codex_exec_server::SshTmuxMode;
 use codex_protocol::openai_models::ReasoningEffort;
 
+use super::codex_steer_turn;
 use super::parse_reasoning_effort;
 use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
@@ -79,4 +81,15 @@ fn reasoning_effort_supports_automatic_known_and_future_values() {
         parse_reasoning_effort("future-tier").unwrap(),
         Some(ReasoningEffort::Custom("future-tier".to_string()))
     );
+}
+
+#[test]
+fn steering_rejects_invalid_text_and_expired_handles() {
+    assert_eq!(codex_steer_turn(1, std::ptr::null()), 1);
+
+    let empty = CString::new("   ").unwrap();
+    assert_eq!(codex_steer_turn(1, empty.as_ptr()), 2);
+
+    let text = CString::new("Please change direction.").unwrap();
+    assert_eq!(codex_steer_turn(u64::MAX, text.as_ptr()), 6);
 }

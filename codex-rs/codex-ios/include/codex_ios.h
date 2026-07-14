@@ -53,7 +53,9 @@ void codex_free_string(char *s);
  *                   replies via codex_respond_dynamic_tool(). Payload is JSON
  *                   {"turn_handle": <uint64>, "call_id": <string>,
  *                    "tool": <string>, "namespace": <string|null>,
- *                    "arguments": <value>}.
+ *                    "arguments": <value>},
+ *               8 = turn ready for steering; text is the decimal uint64 handle
+ *                   to pass to codex_steer_turn().
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */
@@ -238,6 +240,17 @@ void codex_run_turn_streaming_server(const char *access_token,
                                      const char *uploads_json,
                                      void *ctx,
                                      codex_event_callback callback);
+
+/*
+ * Inject a user-authored text message into the active regular turn identified
+ * by turn_handle. The handle arrives in event_kind 8 and expires when that turn
+ * ends. This is same-turn steering, not a new queued turn.
+ *
+ * Returns 0 when accepted. Non-zero: 1 = bad text pointer, 2 = empty text,
+ * 4 = registry lock poisoned, 6 = unknown/finished turn_handle,
+ * 7 = the active turn rejected steering.
+ */
+int codex_steer_turn(uint64_t turn_handle, const char *text);
 
 /*
  * Resolve an in-flight dynamic tool call (event_kind 7): deliver the client's

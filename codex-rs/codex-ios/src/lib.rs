@@ -32,6 +32,7 @@ pub use turn::EventCallback;
 pub use turn::ServerFileUpload;
 pub use turn::ServerMode;
 pub use turn::codex_run_turn_streaming;
+pub use turn::codex_steer_turn;
 pub use turn::run_turn_streaming;
 
 /// Header-only auth provider that injects the OAuth bearer token and the

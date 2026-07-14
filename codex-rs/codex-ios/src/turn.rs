@@ -19,12 +19,14 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use codex_core::CodexThread;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::test_support::thread_manager_with_models_provider;
@@ -137,6 +139,9 @@ const KIND_REASONING_BREAK: c_int = 6;
 ///   "namespace": <str|null>, "arguments": <value>}`. The turn resumes once the
 /// matching response is submitted.
 const KIND_DYNAMIC_TOOL_CALL: c_int = 7;
+/// Announces the numeric handle for a live, steerable regular turn. The client
+/// can pass it to `codex_steer_turn` while this turn remains active.
+const KIND_TURN_READY: c_int = 8;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
 const POST_DYNAMIC_IMAGE_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -254,15 +259,20 @@ fn emit_debug_stage(callback: EventCallback, ctx: *mut c_void, stage: &str) {
 /// correct in-flight turn.
 static NEXT_TURN_HANDLE: AtomicU64 = AtomicU64::new(1);
 
-/// Sender half used to deliver a client-provided dynamic tool response into the
-/// event loop of the turn identified by a turn handle.
 type ResponseSender = tokio::sync::mpsc::UnboundedSender<(String, DynamicToolResponse)>;
 
-/// Global registry mapping a turn handle to the channel its event loop is
-/// awaiting a dynamic tool response on. Populated for the duration of each turn
-/// and removed when the turn ends (via a drop guard on every return path).
-fn dynamic_tool_registry() -> &'static Mutex<HashMap<u64, ResponseSender>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<u64, ResponseSender>>> = OnceLock::new();
+/// Everything the C ABI may address on an active turn. Dynamic-tool responses
+/// use the sender while user steering calls directly into the same CodexThread.
+#[derive(Clone)]
+struct ActiveTurnBridge {
+    dynamic_response_sender: ResponseSender,
+    thread: Arc<CodexThread>,
+}
+
+/// Global registry mapping a short-lived numeric handle to an active turn.
+/// Entries exist only for the duration of `run_turn_async`.
+fn active_turn_registry() -> &'static Mutex<HashMap<u64, ActiveTurnBridge>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u64, ActiveTurnBridge>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -273,7 +283,7 @@ struct RegistryGuard(u64);
 
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
-        if let Ok(mut map) = dynamic_tool_registry().lock() {
+        if let Ok(mut map) = active_turn_registry().lock() {
             map.remove(&self.0);
         }
     }
@@ -694,10 +704,16 @@ pub(crate) async fn run_turn_async(
     let turn_handle = NEXT_TURN_HANDLE.fetch_add(1, Ordering::Relaxed);
     let (resp_tx, mut resp_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, DynamicToolResponse)>();
-    dynamic_tool_registry()
+    active_turn_registry()
         .lock()
-        .map_err(|_| "dynamic tool registry poisoned".to_string())?
-        .insert(turn_handle, resp_tx);
+        .map_err(|_| "active turn registry poisoned".to_string())?
+        .insert(
+            turn_handle,
+            ActiveTurnBridge {
+                dynamic_response_sender: resp_tx,
+                thread: Arc::clone(&thread),
+            },
+        );
     let _registry_guard = RegistryGuard(turn_handle);
 
     // Seed the node's prior conversation (the full rollout persisted by the app)
@@ -795,6 +811,7 @@ pub(crate) async fn run_turn_async(
             .map_err(|e| format!("failed to submit user input: {e}"))?;
         emit_debug_stage(callback, ctx, "prompt_submit_end");
     }
+    emit(callback, ctx, KIND_TURN_READY, &turn_handle.to_string());
 
     // Drain events until the turn completes (or errors).
     // Track the reasoning summary section so we can signal bubble boundaries:
@@ -1781,11 +1798,12 @@ pub extern "C" fn codex_respond_dynamic_tool(
     };
 
     let sender = {
-        let map = match dynamic_tool_registry().lock() {
+        let map = match active_turn_registry().lock() {
             Ok(m) => m,
             Err(_) => return 4,
         };
-        map.get(&turn_handle).cloned()
+        map.get(&turn_handle)
+            .map(|bridge| bridge.dynamic_response_sender.clone())
     };
     match sender {
         Some(tx) => match tx.send((call_id, response)) {
@@ -1793,6 +1811,55 @@ pub extern "C" fn codex_respond_dynamic_tool(
             Err(_) => 5,
         },
         None => 6,
+    }
+}
+
+/// Inject a user-authored text message into an active regular turn.
+///
+/// Returns 0 when Codex accepted the steering input. Non-zero codes:
+/// 1 = bad text pointer, 2 = empty text, 4 = registry lock poisoned,
+/// 6 = unknown/finished turn handle, 7 = the active turn rejected steering.
+///
+/// # Safety
+/// `text` must be a valid NUL-terminated UTF-8 C string.
+#[unsafe(no_mangle)]
+pub extern "C" fn codex_steer_turn(turn_handle: u64, text: *const c_char) -> c_int {
+    let text = match c_str_to_string(text, "text") {
+        Ok(text) => text,
+        Err(_) => return 1,
+    };
+    if text.trim().is_empty() {
+        return 2;
+    }
+
+    let thread = {
+        let map = match active_turn_registry().lock() {
+            Ok(map) => map,
+            Err(_) => return 4,
+        };
+        map.get(&turn_handle)
+            .map(|bridge| Arc::clone(&bridge.thread))
+    };
+    let Some(thread) = thread else {
+        return 6;
+    };
+
+    let input = vec![UserInput::Text {
+        text,
+        text_elements: Vec::new(),
+    }];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        turn_runtime().block_on(thread.steer_input(
+            input,
+            Default::default(),
+            /*expected_turn_id*/ None,
+            /*client_user_message_id*/ None,
+            /*responsesapi_client_metadata*/ None,
+        ))
+    }));
+    match result {
+        Ok(Ok(_)) => 0,
+        Ok(Err(_)) | Err(_) => 7,
     }
 }
 
