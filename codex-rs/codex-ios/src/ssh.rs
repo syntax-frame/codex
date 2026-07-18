@@ -133,9 +133,9 @@ pub async fn ssh_upload_file(
     local_path: &str,
     remote_path: &str,
 ) -> Result<(), String> {
-    let bytes = tokio::fs::read(local_path)
+    let mut local_file = tokio::fs::File::open(local_path)
         .await
-        .map_err(|e| format!("read local file: {e}"))?;
+        .map_err(|e| format!("open local file: {e}"))?;
 
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(60)),
@@ -200,9 +200,12 @@ pub async fn ssh_upload_file(
         .await
         .map_err(|e| format!("open remote file: {e}"))?;
     use tokio::io::AsyncWriteExt;
-    file.write_all(&bytes)
+    tokio::io::copy(&mut local_file, &mut file)
         .await
-        .map_err(|e| format!("write remote file: {e}"))?;
+        .map_err(|e| format!("stream remote file: {e}"))?;
+    file.sync_all()
+        .await
+        .map_err(|e| format!("sync remote file: {e}"))?;
     file.shutdown()
         .await
         .map_err(|e| format!("finish remote file: {e}"))?;
@@ -309,22 +312,58 @@ pub async fn ssh_download_workspace_file(
         ));
     }
 
-    let bytes = sftp
-        .read(canonical_file)
+    let remote_file = sftp
+        .open(canonical_file)
         .await
-        .map_err(|e| format!("read remote file: {e}"))?;
-    if bytes.len() as u64 > max_bytes {
+        .map_err(|e| format!("open remote file: {e}"))?;
+    let partial_path = format!("{local_path}.partial");
+    let _ = tokio::fs::remove_file(&partial_path).await;
+    let mut local_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&partial_path)
+        .await
+        .map_err(|e| format!("create partial download: {e}"))?;
+
+    // Bound memory use and also enforce the limit if the server omitted or
+    // changed the file size after the metadata check.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut bounded_remote = remote_file.take(max_bytes.saturating_add(1));
+    let copied = match tokio::io::copy(&mut bounded_remote, &mut local_file).await {
+        Ok(copied) => copied,
+        Err(error) => {
+            drop(local_file);
+            let _ = tokio::fs::remove_file(&partial_path).await;
+            return Err(format!("stream remote file: {error}"));
+        }
+    };
+    if copied > max_bytes {
+        drop(local_file);
+        let _ = tokio::fs::remove_file(&partial_path).await;
         return Err(format!(
-            "remote file is too large ({} bytes; limit is {max_bytes})",
-            bytes.len()
+            "remote file is too large ({copied} bytes read; limit is {max_bytes})"
         ));
     }
-    tokio::fs::write(local_path, &bytes)
-        .await
-        .map_err(|e| format!("write downloaded file: {e}"))?;
+    if let Err(error) = local_file.flush().await {
+        drop(local_file);
+        let _ = tokio::fs::remove_file(&partial_path).await;
+        return Err(format!("flush downloaded file: {error}"));
+    }
+    if let Err(error) = local_file.sync_all().await {
+        drop(local_file);
+        let _ = tokio::fs::remove_file(&partial_path).await;
+        return Err(format!("sync downloaded file: {error}"));
+    }
+    drop(local_file);
+    if let Err(error) = tokio::fs::rename(&partial_path, local_path).await {
+        let _ = tokio::fs::remove_file(&partial_path).await;
+        return Err(format!("finalize downloaded file: {error}"));
+    }
 
     let _ = session
         .disconnect(Disconnect::ByApplication, "", "English")
-        .await;
-    Ok(bytes.len() as u64)
+        .await
+        .map_err(|e| format!("disconnect after download: {e}"));
+    Ok(copied)
 }
