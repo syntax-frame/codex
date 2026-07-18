@@ -242,6 +242,27 @@ void codex_run_turn_streaming_server(const char *access_token,
                                      codex_event_callback callback);
 
 /*
+ * Download one regular file from a server-mode agent's SSH workspace to a
+ * caller-provided local path. `remote_path` may be workspace-relative or an
+ * absolute path that resolves inside `workspace_path`. Canonicalization on the
+ * server rejects traversal and symlink escapes. Files larger than `max_bytes`
+ * are rejected.
+ *
+ * Returns an allocated empty string on success or "ERROR: ..." on failure.
+ * Release the result with codex_free_string().
+ */
+char *codex_download_ssh_workspace_file(const char *ssh_host,
+                                        uint16_t ssh_port,
+                                        const char *ssh_user,
+                                        const char *ssh_auth_method,
+                                        const char *ssh_secret,
+                                        const char *ssh_fingerprint,
+                                        const char *workspace_path,
+                                        const char *remote_path,
+                                        const char *local_path,
+                                        uint64_t max_bytes);
+
+/*
  * Inject a user-authored text message into the active regular turn identified
  * by turn_handle. The handle arrives in event_kind 8 and expires when that turn
  * ends. This is same-turn steering, not a new queued turn.

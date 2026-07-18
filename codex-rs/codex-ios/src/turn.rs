@@ -436,6 +436,73 @@ fn parse_ssh_authentication(
     }
 }
 
+/// Copy one file from a configured SSH workspace to an app-provided local
+/// destination. Returns an allocated empty string on success or `ERROR: ...`;
+/// release it with `codex_free_string`.
+///
+/// # Safety
+/// Every pointer must address a valid NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn codex_download_ssh_workspace_file(
+    ssh_host: *const c_char,
+    ssh_port: u16,
+    ssh_user: *const c_char,
+    ssh_auth_method: *const c_char,
+    ssh_secret: *const c_char,
+    ssh_fingerprint: *const c_char,
+    workspace_path: *const c_char,
+    remote_path: *const c_char,
+    local_path: *const c_char,
+    max_bytes: u64,
+) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| -> Result<(), String> {
+        let host = c_str_to_string(ssh_host, "ssh_host")?;
+        let user = c_str_to_string(ssh_user, "ssh_user")?;
+        let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
+        let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
+        let fingerprint = if ssh_fingerprint.is_null() {
+            None
+        } else {
+            let value = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
+            if value.trim().is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        };
+        let workspace = c_str_to_string(workspace_path, "workspace_path")?;
+        let remote = c_str_to_string(remote_path, "remote_path")?;
+        let local = c_str_to_string(local_path, "local_path")?;
+        let (authentication, secret_guard) = parse_ssh_authentication(&auth_method, secret)?;
+
+        let result = turn_runtime().block_on(crate::ssh::ssh_download_workspace_file(
+            &host,
+            ssh_port,
+            &user,
+            &authentication,
+            fingerprint,
+            &workspace,
+            &remote,
+            &local,
+            max_bytes,
+        ));
+        drop(secret_guard);
+        result.map(|_| ())
+    });
+
+    let message = match result {
+        Ok(Ok(())) => String::new(),
+        Ok(Err(error)) => format!("ERROR: {error}"),
+        Err(_) => "ERROR: panic while downloading SSH workspace file".to_string(),
+    };
+    CString::new(message)
+        .unwrap_or_else(|_| {
+            CString::new("ERROR: invalid download result").expect("literal CString")
+        })
+        .into_raw()
+}
+
 fn parse_tmux_mode(value: &str) -> Result<SshTmuxMode, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "required" | "" => Ok(SshTmuxMode::Required),

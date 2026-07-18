@@ -212,3 +212,119 @@ pub async fn ssh_upload_file(
         .await;
     Ok(())
 }
+
+/// Download one regular file from a server-mode workspace over SFTP.
+///
+/// Both the configured workspace and requested file are canonicalized by the
+/// server before the containment check. This prevents `..` and symlink escapes
+/// from turning the chat attachment tool into an arbitrary remote-file reader.
+pub async fn ssh_download_workspace_file(
+    host: &str,
+    port: u16,
+    user: &str,
+    authentication: &SshAuthentication,
+    host_fingerprint: Option<String>,
+    workspace_path: &str,
+    requested_path: &str,
+    local_path: &str,
+    max_bytes: u64,
+) -> Result<u64, String> {
+    if workspace_path.trim().is_empty() {
+        return Err("remote workspace path is empty".to_string());
+    }
+    if requested_path.trim().is_empty() {
+        return Err("remote file path is empty".to_string());
+    }
+
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
+    let handler = PinnedHandler {
+        expected_fingerprint: host_fingerprint,
+    };
+    let mut session = client::connect(config, (host, port), handler)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+
+    let authed = match authentication {
+        SshAuthentication::PrivateKeyPath(key_path) => {
+            let key_pair = load_secret_key(key_path, None).map_err(|e| format!("load key: {e}"))?;
+            session
+                .authenticate_publickey(user, Arc::new(key_pair))
+                .await
+        }
+        SshAuthentication::Password(password) => {
+            session.authenticate_password(user, password).await
+        }
+    }
+    .map_err(|e| format!("auth: {e}"))?;
+    if !authed {
+        return Err("authentication failed (credential rejected)".to_string());
+    }
+
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("open channel: {e}"))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| format!("request sftp subsystem: {e}"))?;
+    let sftp = SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| format!("sftp handshake: {e}"))?;
+
+    let requested = std::path::Path::new(requested_path);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::path::Path::new(workspace_path).join(requested)
+    };
+    let canonical_workspace = sftp
+        .canonicalize(workspace_path.to_string())
+        .await
+        .map_err(|e| format!("resolve remote workspace: {e}"))?;
+    let canonical_file = sftp
+        .canonicalize(candidate.to_string_lossy().into_owned())
+        .await
+        .map_err(|e| format!("resolve remote file: {e}"))?;
+    if !std::path::Path::new(&canonical_file)
+        .starts_with(std::path::Path::new(&canonical_workspace))
+    {
+        return Err("remote file resolves outside this agent's workspace".to_string());
+    }
+
+    let metadata = sftp
+        .metadata(canonical_file.clone())
+        .await
+        .map_err(|e| format!("inspect remote file: {e}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("remote path is not a regular file".to_string());
+    }
+    let size = metadata.size.unwrap_or(0);
+    if size > max_bytes {
+        return Err(format!(
+            "remote file is too large ({size} bytes; limit is {max_bytes})"
+        ));
+    }
+
+    let bytes = sftp
+        .read(canonical_file)
+        .await
+        .map_err(|e| format!("read remote file: {e}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "remote file is too large ({} bytes; limit is {max_bytes})",
+            bytes.len()
+        ));
+    }
+    tokio::fs::write(local_path, &bytes)
+        .await
+        .map_err(|e| format!("write downloaded file: {e}"))?;
+
+    let _ = session
+        .disconnect(Disconnect::ByApplication, "", "English")
+        .await;
+    Ok(bytes.len() as u64)
+}
