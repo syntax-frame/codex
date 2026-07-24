@@ -23,8 +23,10 @@ tempfile = { workspace = true }
 http = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

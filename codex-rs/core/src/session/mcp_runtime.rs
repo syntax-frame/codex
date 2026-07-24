@@ -4,32 +4,40 @@ use std::sync::Arc;
 use codex_mcp::McpConfig;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::McpRuntimeContext;
+use codex_protocol::capabilities::SelectedCapabilityRoot;
 
-/// MCP config, exact environment bindings, and manager used by one model request.
+/// MCP config, plugin availability, exact environment bindings, and manager for one request.
 pub struct McpRuntimeSnapshot {
     config: Arc<McpConfig>,
+    plugins_available: bool,
     manager: Arc<McpConnectionManager>,
     runtime_context: McpRuntimeContext,
-    available_environment_ids: Vec<String>,
+    ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
 }
 
 impl McpRuntimeSnapshot {
     pub(crate) fn new(
         config: Arc<McpConfig>,
+        plugins_available: bool,
         manager: Arc<McpConnectionManager>,
         runtime_context: McpRuntimeContext,
-        available_environment_ids: Vec<String>,
+        ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
     ) -> Self {
         Self {
             config,
+            plugins_available,
             manager,
             runtime_context,
-            available_environment_ids,
+            ready_selected_capability_roots,
         }
     }
 
     pub fn config(&self) -> &McpConfig {
         self.config.as_ref()
+    }
+
+    pub(crate) fn plugins_available(&self) -> bool {
+        self.plugins_available
     }
 
     pub fn manager(&self) -> &McpConnectionManager {
@@ -44,8 +52,8 @@ impl McpRuntimeSnapshot {
         &self.runtime_context
     }
 
-    pub(crate) fn available_environment_ids(&self) -> &[String] {
-        &self.available_environment_ids
+    pub(crate) fn ready_selected_capability_roots(&self) -> &[SelectedCapabilityRoot] {
+        &self.ready_selected_capability_roots
     }
 
     #[cfg(test)]
@@ -86,6 +94,7 @@ impl McpRuntimeSnapshot {
         );
         Arc::new(Self::new(
             Arc::new(mcp_config),
+            /*plugins_available*/ false,
             Arc::new(manager),
             runtime_context,
             Vec::new(),

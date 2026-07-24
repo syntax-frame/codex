@@ -16,6 +16,8 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::RolloutItem;
 use core_test_support::responses;
+use core_test_support::responses::strip_response_item_id;
+use core_test_support::responses::strip_response_item_ids_from_json;
 use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
@@ -36,7 +38,10 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = TestAppServer::new_with_auto_env(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_req = mcp
@@ -86,7 +91,7 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
         resumed_history
             .history
             .iter()
-            .any(|item| matches!(item, RolloutItem::ResponseItem(response_item) if responses::strip_metadata(response_item.clone()) == injected_item)),
+            .any(|item| matches!(item, RolloutItem::ResponseItem(response_item) if strip_response_item_id(responses::strip_metadata(response_item.clone())) == injected_item)),
         "injected item should be persisted in rollout history"
     );
 
@@ -113,7 +118,12 @@ async fn thread_inject_items_adds_raw_response_items_to_thread_history() -> Resu
     .await??;
 
     let injected_value = serde_json::to_value(&injected_item)?;
-    let model_input = response_mock.single_request().input();
+    let model_input: Vec<Value> = response_mock
+        .single_request()
+        .input()
+        .into_iter()
+        .map(strip_response_item_ids_from_json)
+        .collect();
     let environment_context_index =
         response_item_text_position(&model_input, "<environment_context>")
             .expect("environment context should be injected before the first user turn");
@@ -153,7 +163,10 @@ async fn thread_inject_items_adds_raw_response_items_after_a_turn() -> Result<()
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
 
-    let mut mcp = TestAppServer::new_with_auto_env(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_req = mcp
@@ -241,11 +254,19 @@ async fn thread_inject_items_adds_raw_response_items_after_a_turn() -> Result<()
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
     assert!(
-        !requests[0].input().contains(&injected_value),
+        !requests[0]
+            .input()
+            .into_iter()
+            .map(strip_response_item_ids_from_json)
+            .any(|item| item == injected_value),
         "injected item should not be sent before it is injected"
     );
     assert!(
-        requests[1].input().contains(&injected_value),
+        requests[1]
+            .input()
+            .into_iter()
+            .map(strip_response_item_ids_from_json)
+            .any(|item| item == injected_value),
         "injected item should be sent after being injected into existing history"
     );
 

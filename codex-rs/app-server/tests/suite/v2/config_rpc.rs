@@ -17,6 +17,7 @@ use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::ConfigRequirementsReadResponse;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteResponse;
+use codex_app_server_protocol::ConfiguredHookHandler;
 use codex_app_server_protocol::ForcedChatgptWorkspaceIds;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
@@ -49,13 +50,27 @@ fn write_config(codex_home: &TempDir, contents: &str) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn config_requirements_read_includes_allow_remote_control() -> Result<()> {
+async fn config_requirements_read_includes_remote_control_and_managed_hooks() -> Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join("requirements.toml"),
-        "allow_remote_control = false\n",
+        r#"allow_remote_control = false
+
+[hooks]
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "echo managed"
+additionalContextLimit = 4096
+"#,
     )?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp.send_config_requirements_read_request().await?;
@@ -65,12 +80,24 @@ async fn config_requirements_read_includes_allow_remote_control() -> Result<()> 
     )
     .await??;
     let response: ConfigRequirementsReadResponse = to_response(response)?;
+    let requirements = response
+        .requirements
+        .expect("managed requirements should be returned");
+    assert_eq!(requirements.allow_remote_control, Some(false));
     assert_eq!(
-        response
-            .requirements
-            .expect("managed requirements should be returned")
-            .allow_remote_control,
-        Some(false)
+        requirements
+            .hooks
+            .expect("managed hooks should be returned")
+            .session_start[0]
+            .hooks,
+        vec![ConfiguredHookHandler::Command {
+            command: "echo managed".to_string(),
+            command_windows: None,
+            timeout_sec: None,
+            r#async: false,
+            status_message: None,
+            additional_context_limit: Some(4_096),
+        }]
     );
     Ok(())
 }
@@ -87,7 +114,11 @@ model_reasoning_effort = "medium"
 service_tier = "fast"
 "#,
     )?;
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp.send_config_requirements_read_request().await?;
@@ -125,7 +156,11 @@ sandbox_mode = "workspace-write"
     let codex_home_path = codex_home.path().canonicalize()?;
     let user_file = AbsolutePathBuf::try_from(codex_home_path.join("config.toml"))?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -175,7 +210,11 @@ allowed_domains = ["example.com"]
     let codex_home_path = codex_home.path().canonicalize()?;
     let user_file = AbsolutePathBuf::try_from(codex_home_path.join("config.toml"))?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -246,7 +285,11 @@ forced_chatgpt_workspace_id = "{WORKSPACE_ID}"
         ),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -285,7 +328,11 @@ forced_chatgpt_workspace_id = ["{WORKSPACE_ID_A}", "{WORKSPACE_ID_B}"]
         ),
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -327,7 +374,11 @@ location = { country = "US", city = "New York", timezone = "America/New_York" }
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -371,7 +422,11 @@ web_search = true
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -400,7 +455,7 @@ async fn config_read_includes_apps() -> Result<()> {
         r#"
 [apps._default]
 approvals_reviewer = "auto_review"
-default_tools_approval_mode = "approve"
+default_tools_approval_mode = "writes"
 
 [apps.app1]
 enabled = false
@@ -412,7 +467,11 @@ default_tools_approval_mode = "prompt"
     let codex_home_path = codex_home.path().canonicalize()?;
     let user_file = AbsolutePathBuf::try_from(codex_home_path.join("config.toml"))?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -440,7 +499,7 @@ default_tools_approval_mode = "prompt"
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 destructive_enabled: true,
                 open_world_enabled: true,
-                default_tools_approval_mode: Some(AppToolApproval::Approve),
+                default_tools_approval_mode: Some(AppToolApproval::Writes),
             }),
             apps: std::collections::HashMap::from([(
                 "app1".to_string(),
@@ -536,7 +595,11 @@ width = 320
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -583,7 +646,11 @@ model_reasoning_effort = "high"
     set_project_trust_level(codex_home.path(), workspace.path(), TrustLevel::Trusted)?;
     let project_config = AbsolutePathBuf::try_from(project_config_dir)?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -653,14 +720,15 @@ writable_roots = [{}]
 
     let managed_path_str = managed_path.display().to_string();
 
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[(
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[(
             "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
             Some(&managed_path_str),
-        )],
-    )
-    .await?;
+        )])
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
@@ -749,7 +817,11 @@ model = "gpt-old"
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let read_id = mcp
@@ -810,7 +882,11 @@ async fn config_value_write_updates_desktop_settings() -> Result<()> {
     let codex_home = temp_dir.path().canonicalize()?;
     write_config(&temp_dir, "")?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let write_id = mcp
@@ -859,7 +935,11 @@ model = "gpt-old"
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let write_id = mcp
@@ -907,7 +987,11 @@ model = "gpt-old"
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let write_id = mcp
@@ -942,7 +1026,11 @@ async fn config_batch_write_applies_multiple_edits() -> Result<()> {
     let codex_home = tmp_dir.path().canonicalize()?;
     write_config(&tmp_dir, "")?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let writable_root = test_tmp_path_buf();
@@ -1014,7 +1102,11 @@ model = "gpt-5.3-spark"
 "#,
     )?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let batch_id = mcp
@@ -1070,7 +1162,11 @@ async fn config_batch_write_updates_multiple_desktop_settings() -> Result<()> {
     let codex_home = tmp_dir.path().canonicalize()?;
     write_config(&tmp_dir, "")?;
 
-    let mut mcp = TestAppServer::new(&codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let batch_id = mcp

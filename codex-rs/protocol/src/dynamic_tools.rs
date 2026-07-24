@@ -75,6 +75,8 @@ pub enum DynamicToolCallOutputContentItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<ImageDetail>,
     },
+    #[serde(rename_all = "camelCase")]
+    InputAudio { audio_url: String },
 }
 
 /// Former flat `SessionMeta` shape, including the old `exposeToContext` flag.

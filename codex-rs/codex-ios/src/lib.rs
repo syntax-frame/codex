@@ -137,6 +137,7 @@ fn build_request(model: String, prompt: String) -> ResponsesApiRequest {
         reasoning: None,
         store: false,
         stream: true,
+        stream_options: None,
         include: vec![],
         service_tier: None,
         prompt_cache_key: None,
