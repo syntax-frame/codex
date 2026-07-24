@@ -7,9 +7,7 @@ the process manager to spawn PTYs once an ExecRequest is prepared.
 use crate::command_canonicalization::canonicalize_command_for_approval;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
-use crate::guardian::GuardianApprovalRequest;
 use crate::guardian::GuardianNetworkAccessTrigger;
-use crate::guardian::review_approval_request;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecServerEnvConfig;
 use crate::sandboxing::SandboxPermissions;
@@ -26,6 +24,7 @@ use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
 use crate::tools::runtimes::shell::zsh_fork_backend;
 use crate::tools::sandboxing::Approvable;
+use crate::tools::sandboxing::ApprovalAction;
 use crate::tools::sandboxing::ApprovalCtx;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use crate::tools::sandboxing::PermissionRequestPayload;
@@ -179,9 +178,10 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
         let call_id = ctx.call_id.to_string();
         let command = req.command.clone();
         let environment_id = Some(req.turn_environment.environment_id.clone());
-        let retry_reason = ctx.retry_reason.clone();
-        let reason = retry_reason.clone().or_else(|| req.justification.clone());
-        let guardian_review_id = ctx.guardian_review_id.clone();
+        let reason = ctx
+            .retry_reason
+            .clone()
+            .or_else(|| req.justification.clone());
         Box::pin(async move {
             let native_cwd = match req.cwd.to_abs_path() {
                 Ok(c) => c,
@@ -192,24 +192,6 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
                     return ReviewDecision::Abort;
                 }
             };
-            if let Some(review_id) = guardian_review_id {
-                return review_approval_request(
-                    session,
-                    turn,
-                    review_id,
-                    GuardianApprovalRequest::ExecCommand {
-                        id: call_id,
-                        command,
-                        cwd: native_cwd.clone(),
-                        sandbox_permissions: req.sandbox_permissions,
-                        additional_permissions: req.additional_permissions.clone(),
-                        justification: req.justification.clone(),
-                        tty: req.tty,
-                    },
-                    retry_reason,
-                )
-                .await;
-            }
             with_cached_approval(&session.services, "unified_exec", keys, || async move {
                 let available_decisions = None;
                 session
@@ -231,6 +213,23 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
                     .await
             })
             .await
+        })
+    }
+
+    fn approval_action(
+        &self,
+        req: &UnifiedExecRequest,
+        ctx: &ApprovalCtx<'_>,
+    ) -> std::io::Result<ApprovalAction> {
+        Ok(ApprovalAction::ExecCommand {
+            id: ctx.call_id.to_string(),
+            environment_id: req.turn_environment.environment_id.clone(),
+            command: req.command.clone(),
+            cwd: req.cwd.clone(),
+            sandbox_permissions: req.sandbox_permissions,
+            additional_permissions: req.additional_permissions.clone(),
+            justification: req.justification.clone(),
+            tty: req.tty,
         })
     }
 
@@ -257,6 +256,10 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
 }
 
 impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRuntime<'a> {
+    fn workspace_roots<'b>(&self, req: &'b UnifiedExecRequest) -> &'b [PathUri] {
+        req.turn_environment.workspace_roots()
+    }
+
     fn sandbox_cwd<'b>(&self, req: &'b UnifiedExecRequest) -> Option<&'b PathUri> {
         Some(&req.sandbox_cwd)
     }
@@ -320,12 +323,38 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
             req.sandbox_permissions,
             &file_system_sandbox_policy,
         );
-        let managed_network = managed_network_for_sandbox_permissions(
+        let managed_network = attempt.network_proxy(managed_network_for_sandbox_permissions(
             req.network.as_ref(),
             launch_sandbox_permissions,
-        );
+        ));
         let env = exec_env_for_sandbox_permissions(&req.env, launch_sandbox_permissions);
-        let (env, managed_network_context) = match managed_network {
+        let (env, managed_network_context, network_proxy_launch) = match managed_network {
+            Some(network) if environment_is_remote => {
+                let launch = network.remote_launch_config().await.map_err(|err| {
+                    ToolError::Codex(CodexErr::Io(io::Error::other(err.to_string())))
+                })?;
+                if !launch.proxy.enabled {
+                    (env, None, None)
+                } else {
+                    let environment_info =
+                        req.turn_environment
+                            .environment
+                            .info()
+                            .await
+                            .map_err(|err| {
+                                ToolError::Codex(CodexErr::Io(io::Error::other(format!(
+                                    "failed to query exec-server capabilities: {err}"
+                                ))))
+                            })?;
+                    if !environment_info.capabilities.network_proxy_launch {
+                        return Err(ToolError::Rejected(
+                            "selected exec-server does not support executor-local network proxy launches"
+                                .to_string(),
+                        ));
+                    }
+                    (env, None, Some(launch))
+                }
+            }
             Some(network) => {
                 let prepared = network
                     .prepare_for_optional_environment(
@@ -338,9 +367,9 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                             req.turn_environment.environment_id
                         ))))
                     })?;
-                (prepared.env, Some(prepared.sandbox_context))
+                (prepared.env, Some(prepared.sandbox_context), None)
             }
-            None => (env, None),
+            None => (env, None, None),
         };
         let explicit_env_overrides = req.explicit_env_overrides.clone();
         #[cfg(unix)]
@@ -477,6 +506,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                 options,
                 attempt,
                 managed_network,
+                network_proxy_launch,
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
                 req.exec_server_env_config.clone(),
                 req.tty,
@@ -506,6 +536,7 @@ mod tests {
             LOCAL_ENVIRONMENT_ID.to_string(),
             Arc::new(Environment::default_for_tests()),
             cwd,
+            Vec::new(),
             /*shell*/ None,
         )
     }

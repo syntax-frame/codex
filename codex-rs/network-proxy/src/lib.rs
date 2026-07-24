@@ -1,5 +1,6 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+mod attribution;
 mod certs;
 mod config;
 mod connect_policy;
@@ -12,12 +13,15 @@ mod network_policy;
 mod policy;
 mod proxy;
 mod reasons;
+mod remote_config;
 mod responses;
 mod runtime;
 mod socks5;
 mod state;
 mod upstream;
 
+pub use attribution::PROXY_ATTRIBUTION_TOKEN_ENV_KEY;
+pub use attribution::write_attribution_frame;
 pub use certs::CUSTOM_CA_ENV_KEYS;
 pub use certs::is_managed_mitm_ca_trust_bundle_path;
 pub use config::NetworkDomainPermission;
@@ -64,6 +68,8 @@ pub use proxy::PROXY_URL_ENV_KEYS;
 pub use proxy::PreparedManagedNetwork;
 pub use proxy::has_proxy_url_env_vars;
 pub use proxy::proxy_url_env_value;
+pub use remote_config::RemoteNetworkProxyConfig;
+pub use remote_config::RemoteNetworkProxyLaunchConfig;
 pub use runtime::BlockedRequest;
 pub use runtime::BlockedRequestArgs;
 pub use runtime::BlockedRequestObserver;
@@ -75,7 +81,6 @@ pub use runtime::NetworkProxyState;
 pub use state::NetworkProxyAuditMetadata;
 pub use state::NetworkProxyConstraintError;
 pub use state::NetworkProxyConstraints;
-pub use state::PartialNetworkConfig;
 pub use state::PartialNetworkProxyConfig;
 pub use state::build_config_state;
 pub use state::validate_policy_against_constraints;

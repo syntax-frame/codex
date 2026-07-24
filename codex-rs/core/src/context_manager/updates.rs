@@ -1,78 +1,15 @@
-use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
 use crate::context::ModelSwitchInstructions;
 use crate::context::MultiAgentModeInstructions;
-use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
-use crate::context::RealtimeEndInstructions;
-use crate::context::RealtimeStartInstructions;
-use crate::context::RealtimeStartWithInstructions;
 use crate::session::PreviousTurnSettings;
 use crate::session::turn_context::TurnContext;
-use codex_execpolicy::Policy;
-use codex_features::Feature;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::TurnContextItem;
-
-fn build_permissions_update_item(
-    previous: Option<&TurnContextItem>,
-    next: &TurnContext,
-    exec_policy: &Policy,
-) -> Option<String> {
-    if !next.config.include_permissions_instructions {
-        return None;
-    }
-
-    let prev = previous?;
-    if prev.permission_profile() == next.permission_profile()
-        && prev.approval_policy == next.approval_policy.value()
-    {
-        return None;
-    }
-
-    Some(
-        PermissionsInstructions::from_permission_profile(
-            &next.permission_profile,
-            next.approval_policy.value(),
-            next.config.approvals_reviewer,
-            exec_policy,
-            #[allow(deprecated)]
-            &next.cwd,
-            next.config
-                .features
-                .enabled(Feature::ExecPermissionApprovals),
-            next.config
-                .features
-                .enabled(Feature::RequestPermissionsTool),
-        )
-        .render(),
-    )
-}
-
-fn build_collaboration_mode_update_item(
-    previous: Option<&TurnContextItem>,
-    next: &TurnContext,
-) -> Option<String> {
-    if !next.config.include_collaboration_mode_instructions {
-        return None;
-    }
-
-    let prev = previous?;
-    if prev.collaboration_mode.as_ref() != Some(&next.collaboration_mode) {
-        // If the next mode has empty developer instructions, this returns None and we emit no
-        // update, so prior collaboration instructions remain in the prompt history.
-        Some(
-            CollaborationModeInstructions::from_collaboration_mode(&next.collaboration_mode)?
-                .render(),
-        )
-    } else {
-        None
-    }
-}
 
 fn build_multi_agent_mode_update_item(
     previous: Option<&TurnContextItem>,
@@ -85,52 +22,14 @@ fn build_multi_agent_mode_update_item(
     }
 
     match effective_multi_agent_mode {
-        Some(MultiAgentMode::None) => {
-            Some(MultiAgentModeInstructions::new(MultiAgentMode::None).render())
-        }
-        Some(multi_agent_mode) => Some(MultiAgentModeInstructions::new(multi_agent_mode).render()),
+        Some(multi_agent_mode) => MultiAgentModeInstructions::from_mode(multi_agent_mode)
+            .map(|instructions| instructions.render()),
         None if previous.multi_agent_mode == Some(MultiAgentMode::Proactive) => {
-            Some(MultiAgentModeInstructions::new(MultiAgentMode::ExplicitRequestOnly).render())
+            MultiAgentModeInstructions::from_mode(MultiAgentMode::ExplicitRequestOnly)
+                .map(|instructions| instructions.render())
         }
         None => None,
     }
-}
-
-pub(crate) fn build_realtime_update_item(
-    previous: Option<&TurnContextItem>,
-    previous_turn_settings: Option<&PreviousTurnSettings>,
-    next: &TurnContext,
-) -> Option<String> {
-    match (
-        previous.and_then(|item| item.realtime_active),
-        next.realtime_active,
-    ) {
-        (Some(true), false) => Some(RealtimeEndInstructions::new("inactive").render()),
-        (Some(false), true) | (None, true) => Some(
-            if let Some(instructions) = next
-                .config
-                .experimental_realtime_start_instructions
-                .as_deref()
-            {
-                RealtimeStartWithInstructions::new(instructions).render()
-            } else {
-                RealtimeStartInstructions.render()
-            },
-        ),
-        (Some(true), true) | (Some(false), false) => None,
-        (None, false) => previous_turn_settings
-            .and_then(|settings| settings.realtime_active)
-            .filter(|realtime_active| *realtime_active)
-            .map(|_| RealtimeEndInstructions::new("inactive").render()),
-    }
-}
-
-pub(crate) fn build_initial_realtime_item(
-    previous: Option<&TurnContextItem>,
-    previous_turn_settings: Option<&PreviousTurnSettings>,
-    next: &TurnContext,
-) -> Option<String> {
-    build_realtime_update_item(previous, previous_turn_settings, next)
 }
 
 fn build_personality_update_item(
@@ -236,7 +135,6 @@ pub(crate) fn build_settings_update_items(
     previous: Option<&TurnContextItem>,
     previous_turn_settings: Option<&PreviousTurnSettings>,
     next: &TurnContext,
-    exec_policy: &Policy,
     personality_feature_enabled: bool,
 ) -> Vec<ResponseItem> {
     // TODO(ccunningham): build_settings_update_items still does not cover every
@@ -247,10 +145,7 @@ pub(crate) fn build_settings_update_items(
         // Keep model-switch instructions first so model-specific guidance is read before
         // any other context diffs on this turn.
         build_model_instructions_update_item(previous_turn_settings, next),
-        build_permissions_update_item(previous, next, exec_policy),
-        build_collaboration_mode_update_item(previous, next),
         build_multi_agent_mode_update_item(previous, next),
-        build_realtime_update_item(previous, previous_turn_settings, next),
         build_personality_update_item(previous, next, personality_feature_enabled),
     ]
     .into_iter()

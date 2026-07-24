@@ -11,6 +11,8 @@ use codex_exec_server::EnvironmentManager;
 use codex_extension_api::LoadUserInstructionsFuture;
 use codex_extension_api::LoadedUserInstructions;
 use codex_extension_api::UserInstructionsProvider;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
@@ -71,6 +73,14 @@ pub fn auth_manager_from_auth_with_home(auth: CodexAuth, codex_home: PathBuf) ->
     AuthManager::from_auth_for_testing_with_home(auth, codex_home)
 }
 
+#[cfg(feature = "code-mode")]
+pub fn with_code_mode_host_program(
+    thread_manager: ThreadManager,
+    host_program: PathBuf,
+) -> ThreadManager {
+    thread_manager.with_code_mode_host_program_for_tests(host_program)
+}
+
 pub fn thread_manager_with_models_provider(
     auth: CodexAuth,
     provider: ModelProviderInfo,
@@ -89,22 +99,6 @@ pub fn thread_manager_with_models_provider_and_home(
         provider,
         codex_home,
         environment_manager,
-    )
-}
-
-pub fn thread_manager_with_models_provider_home_and_state(
-    auth: CodexAuth,
-    provider: ModelProviderInfo,
-    codex_home: PathBuf,
-    environment_manager: Arc<EnvironmentManager>,
-    state_db: Option<crate::StateDbHandle>,
-) -> ThreadManager {
-    ThreadManager::with_models_provider_home_and_state_for_tests(
-        auth,
-        provider,
-        codex_home,
-        environment_manager,
-        state_db,
     )
 }
 
@@ -149,6 +143,10 @@ pub fn models_manager_with_provider(
 ) -> SharedModelsManager {
     let provider = create_model_provider(provider, Some(auth_manager));
     provider.models_manager(codex_home, /*config_model_catalog*/ None)
+}
+
+pub fn default_http_client_factory() -> HttpClientFactory {
+    HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
 }
 
 pub fn get_model_offline(model: Option<&str>) -> String {

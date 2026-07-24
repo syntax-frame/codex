@@ -29,6 +29,7 @@ use std::time::Duration;
 use codex_core::CodexThread;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::test_support::default_http_client_factory;
 use codex_core::test_support::thread_manager_with_models_provider;
 use codex_core::test_support::thread_manager_with_models_provider_and_home;
 use codex_exec_server::EnvironmentManager;
@@ -372,7 +373,9 @@ pub(crate) async fn list_oauth_models_json(
     let auth = build_auth(home_guard.path(), access_token, id_token, account_id).await?;
     let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
     let thread_manager = thread_manager_with_models_provider(auth, provider);
-    let models = thread_manager.list_models(RefreshStrategy::Online).await;
+    let models = thread_manager
+        .list_models(RefreshStrategy::Online, default_http_client_factory())
+        .await;
     serde_json::to_string(&models).map_err(|e| format!("failed to serialize model catalog: {e}"))
 }
 

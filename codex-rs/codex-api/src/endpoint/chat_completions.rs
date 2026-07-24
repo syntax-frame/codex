@@ -267,6 +267,9 @@ fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
             ContentItem::InputImage { image_url, .. } => {
                 parts.push(image_url.as_str());
             }
+            ContentItem::InputAudio { audio_url } => {
+                parts.push(audio_url.as_str());
+            }
         }
     }
     (!parts.is_empty()).then(|| parts.join("\n"))

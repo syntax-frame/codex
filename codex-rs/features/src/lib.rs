@@ -92,6 +92,8 @@ pub enum Feature {
     // Experimental
     /// Enable JavaScript code mode backed by the in-process V8 runtime.
     CodeMode,
+    /// Use a 30-second default yield timeout for code mode exec calls.
+    CodeModeBufferedExec,
     /// Run JavaScript code mode in the standalone host process.
     CodeModeHost,
     /// Restrict model-visible tools to code mode entrypoints (`exec`, `wait`).
@@ -134,6 +136,8 @@ pub enum Feature {
     RuntimeMetrics,
     /// Enable startup memory extraction and file-backed memory consolidation.
     MemoryTool,
+    /// Enable importing project-scoped memory from external agents.
+    ExternalAgentMemoryImport,
     /// Compress cold local thread-store rollout files.
     LocalThreadStoreCompression,
     /// Enable the Chronicle sidecar for passive screen-context memories.
@@ -150,7 +154,7 @@ pub enum Feature {
     MultiAgentV2,
     /// Removed compatibility flag retained as a no-op.
     MultiAgentMode,
-    /// Enable CSV-backed agent job tools.
+    /// Removed compatibility flag for the deleted agent-job tools.
     SpawnCsv,
     /// Enable apps.
     Apps,
@@ -168,6 +172,8 @@ pub enum Feature {
     ToolSuggest,
     /// Enable plugins.
     Plugins,
+    /// Discover selected-root plugin and skill manifests through one high-level exec-server RPC.
+    ExecutorCapabilityDiscovery,
     /// Removed compatibility flag for plugin-bundled lifecycle hooks.
     PluginHooks,
     /// Allow the in-app browser pane in desktop apps.
@@ -196,16 +202,18 @@ pub enum Feature {
     PluginSharing,
     /// Removed compatibility flag retained as a no-op.
     ExternalMigration,
-    /// Allow the model to invoke the built-in image generation tool.
+    /// Enable extension-backed image generation.
     ImageGeneration,
-    /// Replace hosted image generation with the standalone image-generation extension.
-    ImageGenExt,
     /// Removed compatibility flag for always-on centralized image preparation.
     ResizeAllImages,
     /// Generate Responses API item IDs for client-created history items.
     ItemIds,
+    /// Request sequential cutoff reasoning summary delivery.
+    ConcurrentReasoningSummaries,
     /// Allow prompting and installing missing MCP dependencies.
     SkillMcpDependencyInstall,
+    /// Run cheap skill-search methods in shadow mode and emit experiment metrics.
+    SkillSearch,
     /// Removed compatibility flag for deleted skill env var dependency prompting.
     SkillEnvVarDependencyPrompt,
     /// Enable the unified mention popup used by default in the TUI.
@@ -495,6 +503,10 @@ impl Features {
                 }
                 _ => {}
             }
+            if k == "imagegenext" && m.contains_key(Feature::ImageGeneration.key()) {
+                self.record_legacy_usage(k, Feature::ImageGeneration);
+                continue;
+            }
             match feature_for_key(k) {
                 Some(feat) => {
                     if matches!(feat, Feature::TuiAppServer) {
@@ -545,9 +557,6 @@ impl Features {
     }
 
     pub fn normalize_dependencies(&mut self) {
-        if self.enabled(Feature::SpawnCsv) && !self.enabled(Feature::Collab) {
-            self.enable(Feature::Collab);
-        }
         if self.enabled(Feature::CodeModeOnly) && !self.enabled(Feature::CodeMode) {
             self.enable(Feature::CodeMode);
         }
@@ -853,10 +862,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
-        id: Feature::CodeModeHost,
-        key: "code_mode_host",
+        id: Feature::CodeModeBufferedExec,
+        key: "code_mode_buffered_exec",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::CodeModeHost,
+        key: "code_mode_host",
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::CodeModeOnly,
@@ -921,11 +936,13 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::MemoryTool,
         key: "memories",
-        stage: Stage::Experimental {
-            name: "Memories",
-            menu_description: "Allow Codex to create new memories from conversations and bring relevant memories into new conversations.",
-            announcement: "NEW: Codex can now generate and use memories. Try it now with `/memories`",
-        },
+        stage: Stage::Stable,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ExternalAgentMemoryImport,
+        key: "external_agent_memory_import",
+        stage: Stage::UnderDevelopment,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1037,7 +1054,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::MultiAgentV2,
         key: "multi_agent_v2",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Stable,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1049,7 +1066,7 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::SpawnCsv,
         key: "enable_fanout",
-        stage: Stage::UnderDevelopment,
+        stage: Stage::Removed,
         default_enabled: false,
     },
     FeatureSpec {
@@ -1105,6 +1122,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "plugins",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::ExecutorCapabilityDiscovery,
+        key: "executor_capability_discovery",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::PluginHooks,
@@ -1167,12 +1190,6 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
-        id: Feature::ImageGenExt,
-        key: "imagegenext",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
         id: Feature::ResizeAllImages,
         key: "resize_all_images",
         stage: Stage::Removed,
@@ -1185,8 +1202,20 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: false,
     },
     FeatureSpec {
+        id: Feature::ConcurrentReasoningSummaries,
+        key: "concurrent_reasoning_summaries",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::SkillMcpDependencyInstall,
         key: "skill_mcp_dependency_install",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::SkillSearch,
+        key: "skill_search",
         stage: Stage::Stable,
         default_enabled: true,
     },
@@ -1265,8 +1294,8 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::AuthElicitation,
         key: "auth_elicitation",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::Personality,

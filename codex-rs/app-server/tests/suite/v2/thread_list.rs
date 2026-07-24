@@ -50,7 +50,10 @@ use uuid::Uuid;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn init_mcp(codex_home: &Path) -> Result<TestAppServer> {
-    let mut mcp = TestAppServer::new(codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home)
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
     Ok(mcp)
 }
@@ -257,7 +260,7 @@ async fn thread_list_reports_system_error_idle_flag_after_failed_turn() -> Resul
     let mut mcp = init_mcp(codex_home.path()).await?;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
             ..Default::default()
         })
@@ -1014,7 +1017,7 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
         (
             older_child_id,
             "2025-02-01T10:00:00Z",
-            CoreSessionSource::SubAgent(SubAgentSource::Other("agent_job:job-1".to_string())),
+            CoreSessionSource::SubAgent(SubAgentSource::Other("custom:worker-1".to_string())),
             "other_provider",
         ),
         (
@@ -1026,7 +1029,7 @@ async fn thread_list_relation_filters_read_spawn_graph_from_state_db() -> Result
         (
             grandchild_id,
             "2025-02-01T12:00:00Z",
-            CoreSessionSource::SubAgent(SubAgentSource::Other("agent_job:job-2".to_string())),
+            CoreSessionSource::SubAgent(SubAgentSource::Other("custom:worker-2".to_string())),
             "mock_provider",
         ),
     ] {

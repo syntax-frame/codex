@@ -60,6 +60,9 @@ pub fn item_event_to_server_notification(
                                 image_url,
                                 detail: _,
                             } => DynamicToolCallOutputContentItem::InputImage { image_url },
+                            CoreDynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                                DynamicToolCallOutputContentItem::InputAudio { audio_url }
+                            }
                         })
                         .collect(),
                 ),
