@@ -1543,9 +1543,8 @@ impl ModelClientSession {
                 service_tier.clone(),
                 responses_metadata,
             )?;
-            let store = request.store;
             self.client
-                .prepare_response_items_for_request(&mut request.input, store);
+                .prepare_response_items_for_request(&mut request.input);
             let request_session_telemetry =
                 session_telemetry_for_request(session_telemetry, &request);
             let inference_trace_attempt = inference_trace.start_attempt();
