@@ -45,8 +45,8 @@ void codex_free_string(char *s);
  * Streaming event callback for codex_run_turn_streaming().
  *   ctx         opaque pointer passed through verbatim from the call site.
  *   event_kind  0 = reasoning delta, 1 = text delta, 2 = done, 3 = error,
- *               4 = history (full updated rollout as a JSON array of ResponseItems,
- *                   emitted once just before done; persist it per node),
+ *               4 = compatibility history projection containing only the
+ *                   latest completed assistant message,
  *               5 = tool call, as JSON {"tool": <name>, "args": <value>},
  *               6 = reasoning section break (start a new thinking bubble),
  *               7 = dynamic tool call — the turn is PAUSED until the client
@@ -55,7 +55,10 @@ void codex_free_string(char *s);
  *                    "tool": <string>, "namespace": <string|null>,
  *                    "arguments": <value>},
  *               8 = turn ready for steering; text is the decimal uint64 handle
- *                   to pass to codex_steer_turn().
+ *                   to pass to codex_steer_turn(),
+ *               9 = the persistent context was compacted,
+ *              10 = accumulated thread token/context-window data as JSON,
+ *              11 = exact token usage for one completed model response as JSON.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */
@@ -68,15 +71,18 @@ typedef void (*codex_event_callback)(void *ctx, int event_kind, const char *text
  *
  * All string args are NUL-terminated UTF-8 C strings:
  *   access_token  OAuth bearer access token.
- *   id_token      OAuth id token (JWT) — required to load ChatGPT auth.
+ *   id_token      OAuth id token retained for ABI compatibility. Authentication
+ *                 uses the externally refreshed access token in memory.
  *   account_id    ChatGPT account id.
  *   model         Model slug, e.g. "gpt-5.4".
  *   reasoning_effort  Exact effort advertised by the model catalog, or
  *                 NULL/empty to use that model's live default.
  *   prompt        The user prompt.
- *   history_json  Prior conversation rollout as a JSON array of ResponseItems
- *                 (from a previous turn's history event), or NULL/empty for a
- *                 fresh conversation. Gives the model memory across turns.
+ *   history_json  Bootstrap conversation as a JSON array of ResponseItems.
+ *                 It is injected only when context_home_path has no resumable
+ *                 rollout; resumed contexts ignore it.
+ *   context_home_path  Absolute private directory dedicated to this node's
+ *                 model context. Codex persists and compacts its rollout here.
  *   workspace_path  Absolute path to the node's working directory; the turn is
  *                 rooted here so file tools operate inside it. NULL/empty = none.
  *   dynamic_tools_json  JSON array of dynamic tool specs the client executes
@@ -98,6 +104,7 @@ void codex_run_turn_streaming(const char *access_token,
                               const char *reasoning_effort,
                               const char *prompt,
                               const char *history_json,
+                              const char *context_home_path,
                               const char *workspace_path,
                               const char *dynamic_tools_json,
                               const char *uploads_json,
@@ -121,8 +128,9 @@ void codex_run_turn_streaming(const char *access_token,
  *   model           Model slug, e.g. "granite4.1:8b" or "gpt-5.4".
  *   reasoning_effort Exact effort value, or NULL/empty for model default.
  *   prompt          The user prompt.
- *   history_json    Prior conversation rollout as a JSON array of ResponseItems,
- *                   or NULL/empty for a fresh conversation.
+ *   history_json    Bootstrap conversation used only for a new/recovered context.
+ *   context_home_path Absolute private directory dedicated to this node's model
+ *                   context. Codex persists and compacts its rollout here.
  *   workspace_path  Absolute path to the node's working directory; the turn is
  *                   rooted here so file tools operate inside it. NULL/empty = none.
  *   uploads_json    Optional JSON array of local files attached to the turn:
@@ -139,6 +147,7 @@ void codex_run_turn_streaming_apikey(const char *base_url,
                                      const char *reasoning_effort,
                                      const char *prompt,
                                      const char *history_json,
+                                     const char *context_home_path,
                                      const char *workspace_path,
                                      const char *dynamic_tools_json,
                                      const char *uploads_json,
@@ -159,6 +168,7 @@ void codex_run_turn_streaming_apikey_server(const char *base_url,
                                             const char *reasoning_effort,
                                             const char *prompt,
                                             const char *history_json,
+                                            const char *context_home_path,
                                             const char *workspace_path,
                                             const char *dynamic_tools_json,
                                             const char *ssh_connection_key,
@@ -184,14 +194,15 @@ void codex_run_turn_streaming_apikey_server(const char *base_url,
  * All string args are NUL-terminated UTF-8 C strings (null/empty handled as
  * noted):
  *   access_token    OAuth bearer access token.
- *   id_token        OAuth id token (JWT) — required to load ChatGPT auth.
+ *   id_token        OAuth id token retained for ABI compatibility.
  *   account_id      ChatGPT account id.
  *   model           Model slug, e.g. "gpt-5.4".
  *   reasoning_effort Exact effort advertised by the model catalog, or
  *                   NULL/empty to use that model's live default.
  *   prompt          The user prompt.
- *   history_json    Prior conversation rollout as a JSON array of ResponseItems,
- *                   or NULL/empty for a fresh conversation.
+ *   history_json    Bootstrap conversation used only for a new/recovered context.
+ *   context_home_path Absolute private directory dedicated to this node's model
+ *                   context. It is local app storage even when tools use SSH.
  *   workspace_path  Absolute path to the working directory ON THE SERVER; the
  *                   turn is rooted here (must exist on the remote host).
  *                   NULL/empty = none.
@@ -226,6 +237,7 @@ void codex_run_turn_streaming_server(const char *access_token,
                                      const char *reasoning_effort,
                                      const char *prompt,
                                      const char *history_json,
+                                     const char *context_home_path,
                                      const char *workspace_path,
                                      const char *dynamic_tools_json,
                                      const char *ssh_connection_key,

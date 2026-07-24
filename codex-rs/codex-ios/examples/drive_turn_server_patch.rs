@@ -111,6 +111,7 @@ fn main() {
          the change."
     );
     print!("answer: ");
+    let context_home = tempfile::tempdir().expect("model context home");
 
     // 2. Run the turn with workspace/cwd = /tmp (exists on the Mac).
     unsafe {
@@ -122,6 +123,7 @@ fn main() {
             "high".to_string(),
             prompt,
             String::new(),
+            context_home.path().to_string_lossy().into_owned(),
             "/tmp".to_string(),
             String::new(),
             Vec::new(),

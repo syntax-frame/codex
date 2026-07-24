@@ -9,6 +9,9 @@ use super::codex_steer_turn;
 use super::parse_reasoning_effort;
 use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
+use super::read_thread_pointer;
+use super::validate_relative_rollout_path;
+use super::write_thread_pointer;
 
 #[test]
 fn password_authentication_preserves_secret_without_temp_file() {
@@ -92,4 +95,44 @@ fn steering_rejects_invalid_text_and_expired_handles() {
 
     let text = CString::new("Please change direction.").unwrap();
     assert_eq!(codex_steer_turn(u64::MAX, text.as_ptr()), 6);
+}
+
+#[test]
+fn model_context_pointer_rejects_absolute_and_parent_paths() {
+    assert!(validate_relative_rollout_path(Path::new("sessions/thread.jsonl")).is_ok());
+    assert!(validate_relative_rollout_path(Path::new("")).is_err());
+    assert!(validate_relative_rollout_path(Path::new("/tmp/thread.jsonl")).is_err());
+    assert!(validate_relative_rollout_path(Path::new("../thread.jsonl")).is_err());
+}
+
+#[tokio::test]
+async fn model_context_pointer_round_trips_inside_context_home() {
+    let home = tempfile::tempdir().expect("context home");
+    let rollout = home.path().join("sessions/2026/thread.jsonl");
+    std::fs::create_dir_all(rollout.parent().expect("rollout parent")).expect("sessions");
+    std::fs::write(&rollout, b"").expect("rollout");
+    let thread_id = codex_protocol::ThreadId::new();
+
+    write_thread_pointer(home.path(), thread_id, &rollout)
+        .await
+        .expect("write pointer");
+
+    assert_eq!(
+        read_thread_pointer(home.path())
+            .await
+            .expect("read pointer"),
+        Some(rollout)
+    );
+}
+
+#[tokio::test]
+async fn model_context_pointer_refuses_rollouts_outside_context_home() {
+    let home = tempfile::tempdir().expect("context home");
+    let outside = tempfile::NamedTempFile::new().expect("outside rollout");
+
+    let error = write_thread_pointer(home.path(), codex_protocol::ThreadId::new(), outside.path())
+        .await
+        .expect_err("outside rollout must fail");
+
+    assert!(error.contains("outside model-context home"));
 }

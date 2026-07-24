@@ -3307,9 +3307,11 @@ dependencies = [
  "reqwest 0.12.28",
  "russh",
  "russh-sftp",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

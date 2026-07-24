@@ -44,8 +44,10 @@ fn run(token: &str, id: &str, account: &str, prompt: &str, history: &str, cap: &
     cap.answer.clear();
     let c = |s: &str| CString::new(s).unwrap();
     let ws = std::env::temp_dir().join("codex_drive_turn_ws");
+    let context = std::env::temp_dir().join("codex_drive_turn_context");
     let _ = std::fs::create_dir_all(&ws);
-    let (ct, ci, ca, cm, cr, cp, ch, cw, cd, cu) = (
+    let _ = std::fs::create_dir_all(&context);
+    let (ct, ci, ca, cm, cr, cp, ch, cc, cw, cd, cu) = (
         c(token),
         c(id),
         c(account),
@@ -53,6 +55,7 @@ fn run(token: &str, id: &str, account: &str, prompt: &str, history: &str, cap: &
         c("high"),
         c(prompt),
         c(history),
+        c(context.to_str().unwrap()),
         c(ws.to_str().unwrap()),
         c("[]"),
         c("[]"),
@@ -65,6 +68,7 @@ fn run(token: &str, id: &str, account: &str, prompt: &str, history: &str, cap: &
         cr.as_ptr(),
         cp.as_ptr(),
         ch.as_ptr(),
+        cc.as_ptr(),
         cw.as_ptr(),
         cd.as_ptr(),
         cu.as_ptr(),

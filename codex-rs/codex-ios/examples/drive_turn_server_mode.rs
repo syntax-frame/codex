@@ -115,6 +115,7 @@ fn main() {
 
     let workspace = std::env::temp_dir().join("codex_server_mode_ws");
     let _ = std::fs::create_dir_all(&workspace);
+    let context_home = tempfile::tempdir().expect("model context home");
 
     unsafe {
         run_turn_streaming(
@@ -125,6 +126,7 @@ fn main() {
             "high".to_string(),
             prompt.to_string(),
             String::new(),
+            context_home.path().to_string_lossy().into_owned(),
             workspace.to_string_lossy().into_owned(),
             String::new(),
             Vec::new(),

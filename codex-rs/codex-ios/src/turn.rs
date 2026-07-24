@@ -7,10 +7,9 @@
 //! forwards each streamed event (reasoning deltas, assistant text deltas, turn
 //! completion, errors) to the supplied callback.
 //!
-//! The OAuth bearer token + ChatGPT account id are supplied as *runtime*
-//! arguments. They are written only to an ephemeral `auth.json` inside a
-//! freshly-created temp dir that is deleted when the call returns; nothing is
-//! logged or persisted beyond the lifetime of the call.
+//! OAuth credentials are supplied as runtime arguments and remain in memory.
+//! Model context is persisted separately in a caller-provided, per-node Codex
+//! home so Codex can resume and compact its own rollout across app launches.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -19,6 +18,9 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -37,11 +39,7 @@ use codex_exec_server::SshAuthentication;
 use codex_exec_server::SshEnvironmentConfig;
 use codex_exec_server::SshTmuxMode;
 use codex_features::Feature;
-use codex_login::AuthCredentialsStoreMode;
-use codex_login::AuthDotJson;
-use codex_login::AuthKeyringBackendKind;
 use codex_login::CodexAuth;
-use codex_login::TokenData;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
@@ -61,7 +59,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use tokio::time::timeout;
@@ -125,9 +122,8 @@ const SERVER_MODE_ENVIRONMENT_ID: &str = "ssh-server";
 const KIND_REASONING_DELTA: c_int = 0;
 const KIND_TEXT_DELTA: c_int = 1;
 const KIND_DONE: c_int = 2;
-/// Emitted once just before KIND_DONE: the full updated conversation rollout as
-/// a JSON array of Codex `ResponseItem`s (messages + tool calls/outputs +
-/// reasoning). The app persists this per node and passes it back next turn.
+/// Compatibility projection containing only the latest completed assistant
+/// message. Codex's actual model context stays in its persistent rollout.
 const KIND_HISTORY: c_int = 4;
 /// A tool call the model made, as JSON `{"tool": <name>, "args": <value>}`.
 const KIND_TOOL_CALL: c_int = 5;
@@ -143,8 +139,15 @@ const KIND_DYNAMIC_TOOL_CALL: c_int = 7;
 /// Announces the numeric handle for a live, steerable regular turn. The client
 /// can pass it to `codex_steer_turn` while this turn remains active.
 const KIND_TURN_READY: c_int = 8;
+/// Codex compacted the persistent model context.
+const KIND_CONTEXT_COMPACTED: c_int = 9;
+/// Accumulated token/context-window information for the current thread.
+const KIND_TOKEN_COUNT: c_int = 10;
+/// Exact token usage reported by one upstream response completion.
+const KIND_RAW_RESPONSE_COMPLETED: c_int = 11;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
+const CONTEXT_POINTER_FILE: &str = "agentapp-thread.json";
 const POST_DYNAMIC_IMAGE_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
 const DYNAMIC_IMAGE_RESPONSE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_IMAGE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -160,6 +163,98 @@ fn turn_runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("failed to build shared codex turn runtime")
     })
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedThreadPointer {
+    version: u32,
+    thread_id: String,
+    rollout_path: String,
+}
+
+fn context_turn_locks() -> &'static Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn context_turn_lock(codex_home: &Path) -> Result<Arc<tokio::sync::Mutex<()>>, String> {
+    let mut locks = context_turn_locks()
+        .lock()
+        .map_err(|_| "model-context lock registry poisoned".to_string())?;
+    Ok(Arc::clone(
+        locks
+            .entry(codex_home.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    ))
+}
+
+fn validate_relative_rollout_path(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err("rollout pointer must be a non-empty relative path".to_string());
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err("rollout pointer contains an unsafe path component".to_string());
+    }
+    Ok(())
+}
+
+async fn read_thread_pointer(codex_home: &Path) -> Result<Option<PathBuf>, String> {
+    let pointer_path = codex_home.join(CONTEXT_POINTER_FILE);
+    let bytes = match tokio::fs::read(&pointer_path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read model-context pointer {}: {error}",
+                pointer_path.display()
+            ));
+        }
+    };
+    let pointer: PersistedThreadPointer = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid model-context pointer: {error}"))?;
+    let relative_path = PathBuf::from(pointer.rollout_path);
+    validate_relative_rollout_path(&relative_path)?;
+    Ok(Some(codex_home.join(relative_path)))
+}
+
+async fn write_thread_pointer(
+    codex_home: &Path,
+    thread_id: codex_protocol::ThreadId,
+    rollout_path: &Path,
+) -> Result<(), String> {
+    let relative_path = rollout_path.strip_prefix(codex_home).map_err(|_| {
+        format!(
+            "rollout path {} is outside model-context home {}",
+            rollout_path.display(),
+            codex_home.display()
+        )
+    })?;
+    validate_relative_rollout_path(relative_path)?;
+    let pointer = PersistedThreadPointer {
+        version: 1,
+        thread_id: thread_id.to_string(),
+        rollout_path: relative_path.to_string_lossy().into_owned(),
+    };
+    let bytes = serde_json::to_vec(&pointer)
+        .map_err(|error| format!("failed to encode model-context pointer: {error}"))?;
+    let pointer_path = codex_home.join(CONTEXT_POINTER_FILE);
+    let temporary_path = codex_home.join(format!("{CONTEXT_POINTER_FILE}.tmp"));
+    tokio::fs::write(&temporary_path, bytes)
+        .await
+        .map_err(|error| format!("failed to write model-context pointer: {error}"))?;
+    tokio::fs::rename(&temporary_path, &pointer_path)
+        .await
+        .map_err(|error| format!("failed to commit model-context pointer: {error}"))
+}
+
+async fn clear_thread_pointer(codex_home: &Path) {
+    let _ = tokio::fs::remove_file(codex_home.join(CONTEXT_POINTER_FILE)).await;
 }
 
 /// Callback invoked for each streamed event. `text` is a NUL-terminated UTF-8
@@ -316,50 +411,19 @@ fn tool_call_replay_key(item: &ResponseItem) -> Option<String> {
     }
 }
 
-/// Build a `CodexAuth` for the ChatGPT/codex backend from a raw OAuth token by
-/// writing an ephemeral `auth.json` and loading it through the normal storage
-/// path. `codex_home` must be a freshly created (temp) directory.
+/// Build in-memory ChatGPT auth from caller-managed OAuth credentials.
+///
+/// AgentApp refreshes the access token outside Rust and supplies a current
+/// token for each call. Using Codex's external-token representation prevents a
+/// persistent model-context home from ever containing credentials or an empty
+/// refresh token that Codex might later try to refresh itself.
 async fn build_auth(
-    codex_home: &std::path::Path,
     access_token: String,
-    id_token: String,
+    _id_token: String,
     account_id: String,
 ) -> Result<CodexAuth, String> {
-    let id_token_info = codex_login::token_data::parse_chatgpt_jwt_claims(&id_token)
-        .map_err(|e| format!("failed to parse id_token: {e}"))?;
-    let auth_dot_json = AuthDotJson {
-        auth_mode: Some(codex_protocol::auth::AuthMode::Chatgpt),
-        openai_api_key: None,
-        tokens: Some(TokenData {
-            id_token: id_token_info,
-            access_token,
-            // A refresh token is required by the schema; we never use it
-            // because the access token is supplied fresh per call.
-            refresh_token: String::new(),
-            account_id: Some(account_id),
-        }),
-        last_refresh: Some(chrono::Utc::now()),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-
-    let json = serde_json::to_string(&auth_dot_json)
-        .map_err(|e| format!("failed to serialize auth.json: {e}"))?;
-    tokio::fs::write(codex_home.join("auth.json"), json)
-        .await
-        .map_err(|e| format!("failed to write ephemeral auth.json: {e}"))?;
-
-    CodexAuth::from_auth_storage(
-        codex_home,
-        AuthCredentialsStoreMode::File,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
-    )
-    .await
-    .map_err(|e| format!("failed to load ephemeral auth: {e}"))?
-    .ok_or_else(|| "ephemeral auth.json produced no auth".to_string())
+    CodexAuth::from_external_chatgpt_tokens(&access_token, &account_id, /*plan_type*/ None)
+        .map_err(|error| format!("failed to construct external ChatGPT auth: {error}"))
 }
 
 /// Fetch the picker-ready model catalog for the supplied ChatGPT account using
@@ -369,8 +433,7 @@ pub(crate) async fn list_oauth_models_json(
     id_token: String,
     account_id: String,
 ) -> Result<String, String> {
-    let home_guard = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
-    let auth = build_auth(home_guard.path(), access_token, id_token, account_id).await?;
+    let auth = build_auth(access_token, id_token, account_id).await?;
     let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
     let thread_manager = thread_manager_with_models_provider(auth, provider);
     let models = thread_manager
@@ -586,6 +649,7 @@ pub(crate) async fn run_turn_async(
     reasoning_effort: String,
     prompt: String,
     history_json: String,
+    context_home: String,
     workspace: String,
     dynamic_tools_json: String,
     uploads: Vec<ServerFileUpload>,
@@ -595,23 +659,31 @@ pub(crate) async fn run_turn_async(
 ) -> Result<(), String> {
     emit_debug_stage(callback, ctx, "run_turn_async_entered");
     let reasoning_effort = parse_reasoning_effort(&reasoning_effort)?;
-    // Ephemeral codex_home: holds auth.json + any thread store artifacts. It is
-    // deleted when `_home_guard` drops at the end of this function.
-    let home_guard = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
-    let codex_home = home_guard.path().to_path_buf();
+    let temporary_home = if context_home.trim().is_empty() {
+        Some(tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?)
+    } else {
+        None
+    };
+    let codex_home = temporary_home
+        .as_ref()
+        .map(|home| home.path().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(&context_home));
+    tokio::fs::create_dir_all(&codex_home)
+        .await
+        .map_err(|error| format!("failed to create model-context home: {error}"))?;
+    let turn_lock = context_turn_lock(&codex_home)?;
+    let _turn_guard = turn_lock.lock().await;
 
-    // Build (auth, provider) from the selected config. The OAuth branch is
-    // byte-for-byte the original behavior; the ApiKey branch resolves auth via
-    // the provider's bearer-token path (see codex-model-provider's
-    // `resolve_provider_auth`, which honors a bearer API key BEFORE any OAuth
-    // logic), so no ChatGPT machinery is touched.
+    // Build auth and provider independently from the persistent context home.
+    // Credentials remain in memory and are never written beside the rollout.
     let (auth, provider, model_provider_override) = match provider_config {
         ProviderAuthConfig::ChatgptOAuth {
             access_token,
             id_token,
             account_id,
         } => {
-            let auth = build_auth(&codex_home, access_token, id_token, account_id).await?;
+            let auth = build_auth(access_token, id_token, account_id).await?;
+            let _ = tokio::fs::remove_file(codex_home.join("config.toml")).await;
             // The built-in OpenAI provider with ChatGPT auth resolves its
             // base_url to `https://chatgpt.com/backend-api/codex` automatically
             // (see ModelProviderInfo::to_api_provider).
@@ -639,11 +711,6 @@ pub(crate) async fn run_turn_async(
     };
     emit_debug_stage(callback, ctx, "auth_ready");
 
-    // Minimal ThreadManager: a dummy AuthManager wrapping our CodexAuth plus the
-    // codex provider. This is the smallest public construction path; it manages
-    // its own ephemeral codex_home (separate from the Config's) for its thread
-    // store, which is fine for a one-shot turn.
-    //
     // In server mode, build a ThreadManager whose EnvironmentManager has the
     // SSH environment registered AND selected as the default, so the turn's
     // shell/exec tools route through the SSH backend (and `has_environment()`
@@ -670,7 +737,12 @@ pub(crate) async fn run_turn_async(
                 environment_manager,
             )
         }
-        None => thread_manager_with_models_provider(auth, provider),
+        None => thread_manager_with_models_provider_and_home(
+            auth,
+            provider,
+            codex_home.clone(),
+            Arc::new(EnvironmentManager::default_for_tests()),
+        ),
     };
 
     // Minimal Config rooted at the temp home (no on-disk config => defaults).
@@ -760,11 +832,57 @@ pub(crate) async fn run_turn_async(
             .map_err(|e| format!("failed to parse dynamic_tools_json: {e}"))?
     };
 
-    let new_thread = thread_manager
-        .start_thread_with_tools(config, dynamic_tools)
-        .await
-        .map_err(|e| format!("failed to start thread: {e}"))?;
-    emit_debug_stage(callback, ctx, "thread_started");
+    let resume_path = match read_thread_pointer(&codex_home).await {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "discarding invalid AgentApp model-context pointer");
+            clear_thread_pointer(&codex_home).await;
+            None
+        }
+    };
+    let mut resumed = false;
+    let new_thread = if let Some(rollout_path) = resume_path {
+        match thread_manager
+            .resume_thread_from_rollout_with_tools(
+                config.clone(),
+                rollout_path.clone(),
+                thread_manager.auth_manager(),
+                /*parent_trace*/ None,
+                /*supports_openai_form_elicitation*/ false,
+                dynamic_tools.clone(),
+            )
+            .await
+        {
+            Ok(thread) => {
+                resumed = true;
+                emit_debug_stage(callback, ctx, "thread_resumed");
+                thread
+            }
+            Err(error) => {
+                tracing::warn!(
+                    rollout_path = %rollout_path.display(),
+                    %error,
+                    "failed to resume AgentApp model context; starting a seeded replacement"
+                );
+                clear_thread_pointer(&codex_home).await;
+                thread_manager
+                    .start_thread_with_tools(config, dynamic_tools)
+                    .await
+                    .map_err(|start_error| {
+                        format!(
+                            "failed to resume model context ({error}); \
+                             failed to start replacement thread: {start_error}"
+                        )
+                    })?
+            }
+        }
+    } else {
+        thread_manager
+            .start_thread_with_tools(config, dynamic_tools)
+            .await
+            .map_err(|e| format!("failed to start thread: {e}"))?
+    };
+    emit_debug_stage(callback, ctx, "thread_ready");
     let thread = new_thread.thread;
     let session_model = new_thread.session_configured.model.clone();
 
@@ -786,10 +904,10 @@ pub(crate) async fn run_turn_async(
         );
     let _registry_guard = RegistryGuard(turn_handle);
 
-    // Seed the node's prior conversation (the full rollout persisted by the app)
-    // so the model has memory. This mirrors exactly what Codex keeps across
-    // turns: messages, tool calls/outputs, and reasoning items.
-    let prior: Vec<ResponseItem> = if history_json.trim().is_empty() {
+    // Legacy transcript replay is only a bootstrap seed for a new context.
+    // Resumed threads load their bounded/compacted model context from Codex's
+    // own rollout and must never receive the transcript a second time.
+    let prior: Vec<ResponseItem> = if resumed || history_json.trim().is_empty() {
         Vec::new()
     } else {
         serde_json::from_str(&history_json)
@@ -804,6 +922,12 @@ pub(crate) async fn run_turn_async(
             .await
             .map_err(|e| format!("failed to seed history: {e}"))?;
         emit_debug_stage(callback, ctx, "history_inject_end");
+    }
+    if !context_home.trim().is_empty() {
+        let rollout_path = thread.rollout_path().ok_or_else(|| {
+            "persistent model-context thread did not provide a rollout path".to_string()
+        })?;
+        write_thread_pointer(&codex_home, new_thread.thread_id, &rollout_path).await?;
     }
 
     // Submit a single user turn through the real loop, pinning the model.
@@ -894,6 +1018,7 @@ pub(crate) async fn run_turn_async(
     // happens we surface the final text as one text-delta so the app renders +
     // persists it. Responses streams deltas, so this stays true → no double-emit.
     let mut saw_message_delta = false;
+    let mut latest_agent_message: Option<String> = None;
     // A dynamic tool may return images back into the model. If the provider
     // wedges after accepting that output, the app otherwise waits forever with
     // no additional stream event. Keep the timeout scoped to image outputs so
@@ -1026,10 +1151,24 @@ pub(crate) async fn run_turn_async(
             // (Chat Completions), emit the full text once so the reply isn't
             // lost from the transcript / live view. Reset for the next message.
             EventMsg::AgentMessage(ev) => {
+                latest_agent_message = Some(ev.message.clone());
                 if !saw_message_delta && !ev.message.is_empty() {
                     emit(callback, ctx, KIND_TEXT_DELTA, &ev.message);
                 }
                 saw_message_delta = false;
+            }
+            EventMsg::ContextCompacted(_) => {
+                emit(callback, ctx, KIND_CONTEXT_COMPACTED, "{}");
+            }
+            EventMsg::TokenCount(ev) => {
+                if let Ok(json) = serde_json::to_string(&ev) {
+                    emit(callback, ctx, KIND_TOKEN_COUNT, &json);
+                }
+            }
+            EventMsg::RawResponseCompleted(ev) => {
+                if let Ok(json) = serde_json::to_string(&ev) {
+                    emit(callback, ctx, KIND_RAW_RESPONSE_COMPLETED, &json);
+                }
             }
             // A dynamic tool call: the turn is now PAUSED. Surface it to the
             // client with the turn handle + call id, then block THIS loop
@@ -1112,28 +1251,21 @@ pub(crate) async fn run_turn_async(
                 return Ok(());
             }
             EventMsg::TurnComplete(_) => {
-                // Emit the updated rollout (ResponseItems only) so the app can
-                // persist it per node and replay it on the next turn.
-                match thread.load_history(false).await {
-                    Ok(stored) => {
-                        let items: Vec<ResponseItem> = stored
-                            .items
-                            .into_iter()
-                            .filter_map(|ri| match ri {
-                                RolloutItem::ResponseItem(item) => Some(item),
-                                _ => None,
-                            })
-                            .collect();
-                        if let Ok(json) = serde_json::to_string(&items) {
-                            emit(callback, ctx, KIND_HISTORY, &json);
-                        }
+                // Keep the legacy history event small. The durable model context
+                // is Codex's rollout; this projection exists only for consumers
+                // that recover a non-streamed final assistant message.
+                if let Some(message) = latest_agent_message.as_deref() {
+                    let projection = serde_json::json!([{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": message,
+                        }],
+                    }]);
+                    if let Ok(json) = serde_json::to_string(&projection) {
+                        emit(callback, ctx, KIND_HISTORY, &json);
                     }
-                    Err(e) => emit(
-                        callback,
-                        ctx,
-                        KIND_ERROR,
-                        &format!("load_history failed: {e}"),
-                    ),
                 }
                 emit(callback, ctx, KIND_DONE, "");
                 return Ok(());
@@ -1176,6 +1308,7 @@ pub extern "C" fn codex_run_turn_streaming(
     reasoning_effort: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
+    context_home_path: *const c_char,
     workspace_path: *const c_char,
     dynamic_tools_json: *const c_char,
     uploads_json: *const c_char,
@@ -1202,6 +1335,7 @@ pub extern "C" fn codex_run_turn_streaming(
         } else {
             c_str_to_string(history_json, "history_json")?
         };
+        let context_home = c_str_to_string(context_home_path, "context_home_path")?;
         // Workspace dir to root the turn at (where file tools operate). Optional.
         let workspace = if workspace_path.is_null() {
             String::new()
@@ -1241,6 +1375,7 @@ pub extern "C" fn codex_run_turn_streaming(
                     reasoning_effort,
                     prompt,
                     history,
+                    context_home,
                     workspace,
                     dynamic_tools,
                     uploads,
@@ -1287,6 +1422,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
     reasoning_effort: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
+    context_home_path: *const c_char,
     workspace_path: *const c_char,
     dynamic_tools_json: *const c_char,
     uploads_json: *const c_char,
@@ -1317,6 +1453,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
         } else {
             c_str_to_string(history_json, "history_json")?
         };
+        let context_home = c_str_to_string(context_home_path, "context_home_path")?;
         // Workspace dir to root the turn at (where file tools operate). Optional.
         let workspace = if workspace_path.is_null() {
             String::new()
@@ -1351,6 +1488,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
                     reasoning_effort,
                     prompt,
                     history,
+                    context_home,
                     workspace,
                     dynamic_tools,
                     uploads,
@@ -1388,6 +1526,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
     reasoning_effort: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
+    context_home_path: *const c_char,
     workspace_path: *const c_char,
     dynamic_tools_json: *const c_char,
     ssh_connection_key: *const c_char,
@@ -1424,6 +1563,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
         } else {
             c_str_to_string(history_json, "history_json")?
         };
+        let context_home = c_str_to_string(context_home_path, "context_home_path")?;
         let workspace = if workspace_path.is_null() {
             String::new()
         } else {
@@ -1526,6 +1666,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
                         reasoning_effort,
                         prompt,
                         history,
+                        context_home,
                         workspace,
                         dynamic_tools,
                         uploads,
@@ -1578,6 +1719,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
     reasoning_effort: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
+    context_home_path: *const c_char,
     workspace_path: *const c_char,
     dynamic_tools_json: *const c_char,
     ssh_connection_key: *const c_char,
@@ -1613,6 +1755,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
         } else {
             c_str_to_string(history_json, "history_json")?
         };
+        let context_home = c_str_to_string(context_home_path, "context_home_path")?;
         // Workspace dir to root the turn at (on the SERVER). Optional.
         let workspace = if workspace_path.is_null() {
             String::new()
@@ -1721,6 +1864,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
                         reasoning_effort,
                         prompt,
                         history,
+                        context_home,
                         workspace,
                         dynamic_tools,
                         uploads,
@@ -1764,6 +1908,7 @@ pub unsafe fn run_turn_streaming(
     reasoning_effort: String,
     prompt: String,
     history_json: String,
+    context_home: String,
     workspace: String,
     dynamic_tools_json: String,
     uploads: Vec<ServerFileUpload>,
@@ -1788,6 +1933,7 @@ pub unsafe fn run_turn_streaming(
                     reasoning_effort,
                     prompt,
                     history_json,
+                    context_home,
                     workspace,
                     dynamic_tools_json,
                     uploads,

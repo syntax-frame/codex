@@ -790,13 +790,38 @@ impl ThreadManager {
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
     ) -> CodexResult<NewThread> {
+        self.resume_thread_from_rollout_with_tools(
+            config,
+            rollout_path,
+            auth_manager,
+            parent_trace,
+            supports_openai_form_elicitation,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Resume a persisted thread while installing the caller's current dynamic
+    /// tool catalog. Dynamic tools are supplied by the host and are not part of
+    /// rollout history, so mobile and embedded hosts must re-register them on
+    /// every process-level resume.
+    pub async fn resume_thread_from_rollout_with_tools(
+        &self,
+        config: Config,
+        rollout_path: PathBuf,
+        auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
+        supports_openai_form_elicitation: bool,
+        dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+    ) -> CodexResult<NewThread> {
         let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
-        Box::pin(self.resume_thread_with_history(
+        Box::pin(self.resume_thread_with_history_and_tools(
             config,
             initial_history,
             auth_manager,
             parent_trace,
             supports_openai_form_elicitation,
+            dynamic_tools,
         ))
         .await
     }
@@ -809,6 +834,27 @@ impl ThreadManager {
         auth_manager: Arc<AuthManager>,
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
+    ) -> CodexResult<NewThread> {
+        self.resume_thread_with_history_and_tools(
+            config,
+            initial_history,
+            auth_manager,
+            parent_trace,
+            supports_openai_form_elicitation,
+            Vec::new(),
+        )
+        .await
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    pub async fn resume_thread_with_history_and_tools(
+        &self,
+        config: Config,
+        initial_history: InitialHistory,
+        auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
+        supports_openai_form_elicitation: bool,
+        dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&config);
         let environments = default_thread_environment_selections(
@@ -838,7 +884,7 @@ impl ThreadManager {
             /*parent_thread_id*/ None,
             /*forked_from_thread_id*/ None,
             thread_source,
-            Vec::new(),
+            dynamic_tools,
             /*metrics_service_name*/ None,
             /*inherited_environments*/ None,
             /*inherited_exec_policy*/ None,
