@@ -47,12 +47,13 @@ fn run(token: &str, id: &str, account: &str, prompt: &str, history: &str, cap: &
     let context = std::env::temp_dir().join("codex_drive_turn_context");
     let _ = std::fs::create_dir_all(&ws);
     let _ = std::fs::create_dir_all(&context);
-    let (ct, ci, ca, cm, cr, cp, ch, cc, cw, cd, cu) = (
+    let (ct, ci, ca, cm, cr, cs, cp, ch, cc, cw, cd, cu) = (
         c(token),
         c(id),
         c(account),
         c("gpt-5.4"),
         c("high"),
+        c("default"),
         c(prompt),
         c(history),
         c(context.to_str().unwrap()),
@@ -66,6 +67,7 @@ fn run(token: &str, id: &str, account: &str, prompt: &str, history: &str, cap: &
         ca.as_ptr(),
         cm.as_ptr(),
         cr.as_ptr(),
+        cs.as_ptr(),
         cp.as_ptr(),
         ch.as_ptr(),
         cc.as_ptr(),

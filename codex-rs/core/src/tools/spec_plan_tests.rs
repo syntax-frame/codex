@@ -464,6 +464,22 @@ async fn request_user_input_tool_respects_experimental_config_gate() {
 }
 
 #[tokio::test]
+async fn update_plan_tool_respects_config_gate() {
+    let enabled = probe(|_| {}).await;
+    enabled.assert_visible_contains(&["update_plan"]);
+    enabled.assert_registered_contains(&["update_plan"]);
+
+    let disabled = probe(|turn| {
+        update_config(turn, |config| {
+            config.update_plan_enabled = false;
+        });
+    })
+    .await;
+    disabled.assert_visible_lacks(&["update_plan"]);
+    disabled.assert_registered_lacks(&["update_plan"]);
+}
+
+#[tokio::test]
 async fn request_user_input_stays_direct_in_code_mode_only() {
     let plan = probe(|turn| {
         set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
@@ -805,6 +821,51 @@ async fn mcp_and_tool_search_follow_direct_and_deferred_tool_exposure() {
         "tool_search",
         &ToolName::namespaced("mcp__searchable", "lookup").to_string(),
     ]);
+}
+
+#[tokio::test]
+async fn deferred_dynamic_tools_fall_back_to_direct_without_tool_search() {
+    let inputs = || ToolPlanInputs {
+        dynamic_tools: vec![dynamic_tool(
+            Some("agentapp"),
+            "lookup",
+            /*defer_loading*/ true,
+        )],
+        ..ToolPlanInputs::default()
+    };
+
+    let fallback = probe_with(
+        |turn| {
+            set_feature(turn, Feature::Collab, /*enabled*/ false);
+            turn.model_info.supports_search_tool = false;
+        },
+        inputs(),
+    )
+    .await;
+    assert_eq!(
+        fallback.namespace_function_names("agentapp"),
+        &["lookup".to_string()]
+    );
+    fallback.assert_visible_lacks(&["tool_search"]);
+    assert_eq!(
+        fallback.exposure(&ToolName::namespaced("agentapp", "lookup").to_string()),
+        ToolExposure::Direct
+    );
+
+    let deferred = probe_with(
+        |turn| {
+            set_feature(turn, Feature::Collab, /*enabled*/ false);
+            turn.model_info.supports_search_tool = true;
+        },
+        inputs(),
+    )
+    .await;
+    deferred.assert_visible_contains(&["tool_search"]);
+    deferred.assert_visible_lacks(&["agentapp"]);
+    assert_eq!(
+        deferred.exposure(&ToolName::namespaced("agentapp", "lookup").to_string()),
+        ToolExposure::Deferred
+    );
 }
 
 #[tokio::test]

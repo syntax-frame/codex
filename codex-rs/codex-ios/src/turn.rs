@@ -145,6 +145,9 @@ const KIND_CONTEXT_COMPACTED: c_int = 9;
 const KIND_TOKEN_COUNT: c_int = 10;
 /// Exact token usage reported by one upstream response completion.
 const KIND_RAW_RESPONSE_COMPLETED: c_int = 11;
+/// Canonical Codex turn-item lifecycle events.
+const KIND_ITEM_STARTED: c_int = 12;
+const KIND_ITEM_COMPLETED: c_int = 13;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
 const CONTEXT_POINTER_FILE: &str = "agentapp-thread.json";
@@ -647,6 +650,7 @@ pub(crate) async fn run_turn_async(
     provider_config: ProviderAuthConfig,
     model: String,
     reasoning_effort: String,
+    service_tier: String,
     prompt: String,
     history_json: String,
     context_home: String,
@@ -659,6 +663,11 @@ pub(crate) async fn run_turn_async(
 ) -> Result<(), String> {
     emit_debug_stage(callback, ctx, "run_turn_async_entered");
     let reasoning_effort = parse_reasoning_effort(&reasoning_effort)?;
+    let service_tier = match service_tier.trim() {
+        "" => None,
+        "fast" => Some("priority".to_string()),
+        value => Some(value.to_string()),
+    };
     let temporary_home = if context_home.trim().is_empty() {
         Some(tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?)
     } else {
@@ -777,6 +786,7 @@ pub(crate) async fn run_turn_async(
                 SandboxMode::WorkspaceWrite
             }),
             model_provider: model_provider_override,
+            service_tier: service_tier.map(Some),
             ..Default::default()
         })
         .build()
@@ -788,6 +798,11 @@ pub(crate) async fn run_turn_async(
     // manager applies the selected model's live default.
     config.model_reasoning_effort = reasoning_effort.clone();
     config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
+    // AgentApp has its own durable plan surface and no bridge for the upstream
+    // blocking question request yet. Do not advertise tools this host cannot
+    // service correctly.
+    config.update_plan_enabled = false;
+    config.experimental_request_user_input_enabled = false;
 
     // Shell tool gating:
     // - Local (no server mode): iOS has no shell — there is no `/bin/zsh` to
@@ -1062,6 +1077,16 @@ pub(crate) async fn run_turn_async(
         awaiting_first_event_after_prompt_image = false;
         awaiting_event_after_dynamic_image = false;
         match event.msg {
+            EventMsg::ItemStarted(ev) => {
+                if let Ok(json) = serde_json::to_string(&ev) {
+                    emit(callback, ctx, KIND_ITEM_STARTED, &json);
+                }
+            }
+            EventMsg::ItemCompleted(ev) => {
+                if let Ok(json) = serde_json::to_string(&ev) {
+                    emit(callback, ctx, KIND_ITEM_COMPLETED, &json);
+                }
+            }
             // Safety net: with approval_policy=Never these should not fire, but
             // if any approval-gated tool ever requests a decision there is no UI
             // to answer it — auto-approve so the turn can never deadlock.
@@ -1306,6 +1331,7 @@ pub extern "C" fn codex_run_turn_streaming(
     account_id: *const c_char,
     model: *const c_char,
     reasoning_effort: *const c_char,
+    service_tier: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
     context_home_path: *const c_char,
@@ -1327,6 +1353,11 @@ pub extern "C" fn codex_run_turn_streaming(
             String::new()
         } else {
             c_str_to_string(reasoning_effort, "reasoning_effort")?
+        };
+        let service_tier = if service_tier.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(service_tier, "service_tier")?
         };
         let prompt = c_str_to_string(prompt, "prompt")?;
         // History is optional: NULL or empty means a fresh conversation.
@@ -1373,6 +1404,7 @@ pub extern "C" fn codex_run_turn_streaming(
                     },
                     model,
                     reasoning_effort,
+                    service_tier,
                     prompt,
                     history,
                     context_home,
@@ -1420,6 +1452,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
     wire_api: *const c_char,
     model: *const c_char,
     reasoning_effort: *const c_char,
+    service_tier: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
     context_home_path: *const c_char,
@@ -1445,6 +1478,11 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
             String::new()
         } else {
             c_str_to_string(reasoning_effort, "reasoning_effort")?
+        };
+        let service_tier = if service_tier.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(service_tier, "service_tier")?
         };
         let prompt = c_str_to_string(prompt, "prompt")?;
         // History is optional: NULL or empty means a fresh conversation.
@@ -1486,6 +1524,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
                     },
                     model,
                     reasoning_effort,
+                    service_tier,
                     prompt,
                     history,
                     context_home,
@@ -1524,6 +1563,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
     wire_api: *const c_char,
     model: *const c_char,
     reasoning_effort: *const c_char,
+    service_tier: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
     context_home_path: *const c_char,
@@ -1556,6 +1596,11 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
             String::new()
         } else {
             c_str_to_string(reasoning_effort, "reasoning_effort")?
+        };
+        let service_tier = if service_tier.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(service_tier, "service_tier")?
         };
         let prompt = c_str_to_string(prompt, "prompt")?;
         let history = if history_json.is_null() {
@@ -1664,6 +1709,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
                         },
                         model,
                         reasoning_effort,
+                        service_tier,
                         prompt,
                         history,
                         context_home,
@@ -1717,6 +1763,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
     account_id: *const c_char,
     model: *const c_char,
     reasoning_effort: *const c_char,
+    service_tier: *const c_char,
     prompt: *const c_char,
     history_json: *const c_char,
     context_home_path: *const c_char,
@@ -1747,6 +1794,11 @@ pub extern "C" fn codex_run_turn_streaming_server(
             String::new()
         } else {
             c_str_to_string(reasoning_effort, "reasoning_effort")?
+        };
+        let service_tier = if service_tier.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(service_tier, "service_tier")?
         };
         let prompt = c_str_to_string(prompt, "prompt")?;
         // History is optional: NULL or empty means a fresh conversation.
@@ -1862,6 +1914,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
                         },
                         model,
                         reasoning_effort,
+                        service_tier,
                         prompt,
                         history,
                         context_home,
@@ -1906,6 +1959,7 @@ pub unsafe fn run_turn_streaming(
     account_id: String,
     model: String,
     reasoning_effort: String,
+    service_tier: String,
     prompt: String,
     history_json: String,
     context_home: String,
@@ -1931,6 +1985,7 @@ pub unsafe fn run_turn_streaming(
                     },
                     model,
                     reasoning_effort,
+                    service_tier,
                     prompt,
                     history_json,
                     context_home,

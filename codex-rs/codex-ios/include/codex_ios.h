@@ -58,7 +58,9 @@ void codex_free_string(char *s);
  *                   to pass to codex_steer_turn(),
  *               9 = the persistent context was compacted,
  *              10 = accumulated thread token/context-window data as JSON,
- *              11 = exact token usage for one completed model response as JSON.
+ *              11 = exact token usage for one completed model response as JSON,
+ *              12 = canonical ItemStartedEvent as JSON,
+ *              13 = canonical ItemCompletedEvent as JSON.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */
@@ -77,6 +79,8 @@ typedef void (*codex_event_callback)(void *ctx, int event_kind, const char *text
  *   model         Model slug, e.g. "gpt-5.4".
  *   reasoning_effort  Exact effort advertised by the model catalog, or
  *                 NULL/empty to use that model's live default.
+ *   service_tier  "priority" for Fast Mode, "default" for standard service,
+ *                 or NULL/empty to leave the service tier unspecified.
  *   prompt        The user prompt.
  *   history_json  Bootstrap conversation as a JSON array of ResponseItems.
  *                 It is injected only when context_home_path has no resumable
@@ -102,6 +106,7 @@ void codex_run_turn_streaming(const char *access_token,
                               const char *account_id,
                               const char *model,
                               const char *reasoning_effort,
+                              const char *service_tier,
                               const char *prompt,
                               const char *history_json,
                               const char *context_home_path,
@@ -127,6 +132,8 @@ void codex_run_turn_streaming(const char *access_token,
  *                   "chat_completions" for "<base_url>/chat/completions".
  *   model           Model slug, e.g. "granite4.1:8b" or "gpt-5.4".
  *   reasoning_effort Exact effort value, or NULL/empty for model default.
+ *   service_tier    "priority" for Fast Mode, "default" for standard service,
+ *                   or NULL/empty to leave the service tier unspecified.
  *   prompt          The user prompt.
  *   history_json    Bootstrap conversation used only for a new/recovered context.
  *   context_home_path Absolute private directory dedicated to this node's model
@@ -145,6 +152,7 @@ void codex_run_turn_streaming_apikey(const char *base_url,
                                      const char *wire_api,
                                      const char *model,
                                      const char *reasoning_effort,
+                                     const char *service_tier,
                                      const char *prompt,
                                      const char *history_json,
                                      const char *context_home_path,
@@ -166,6 +174,7 @@ void codex_run_turn_streaming_apikey_server(const char *base_url,
                                             const char *wire_api,
                                             const char *model,
                                             const char *reasoning_effort,
+                                            const char *service_tier,
                                             const char *prompt,
                                             const char *history_json,
                                             const char *context_home_path,
@@ -235,6 +244,7 @@ void codex_run_turn_streaming_server(const char *access_token,
                                      const char *account_id,
                                      const char *model,
                                      const char *reasoning_effort,
+                                     const char *service_tier,
                                      const char *prompt,
                                      const char *history_json,
                                      const char *context_home_path,

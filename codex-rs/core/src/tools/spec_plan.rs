@@ -701,7 +701,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
 
-    planned_tools.add(PlanHandler);
+    if turn_context.config.update_plan_enabled {
+        planned_tools.add(PlanHandler);
+    }
 
     // On-device tools for LOCAL (Type-A) nodes only: read/write/list within the
     // turn's workspace + http_request for API access. Gated on the shell tool
@@ -879,6 +881,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
 
 #[instrument(level = "trace", skip_all, fields(dynamic_tool_count = context.dynamic_tools.len()))]
 fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
+    let deferred_loading_available = search_tool_enabled(context.step_context.turn.as_ref());
     for spec in context.dynamic_tools {
         match spec {
             DynamicToolSpec::Function(tool) => {
@@ -889,7 +892,11 @@ fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plan
                     );
                     continue;
                 };
-                planned_tools.add(handler);
+                if tool.defer_loading && !deferred_loading_available {
+                    planned_tools.add_with_exposure(handler, ToolExposure::Direct);
+                } else {
+                    planned_tools.add(handler);
+                }
             }
             DynamicToolSpec::Namespace(namespace) => {
                 for tool in &namespace.tools {
@@ -903,7 +910,11 @@ fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plan
                         );
                         continue;
                     };
-                    planned_tools.add(handler);
+                    if tool.defer_loading && !deferred_loading_available {
+                        planned_tools.add_with_exposure(handler, ToolExposure::Direct);
+                    } else {
+                        planned_tools.add(handler);
+                    }
                 }
             }
         }

@@ -121,6 +121,7 @@ fn main() {
             account,
             "gpt-5.4".to_string(),
             "high".to_string(),
+            "default".to_string(),
             prompt,
             String::new(),
             context_home.path().to_string_lossy().into_owned(),
