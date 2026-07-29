@@ -60,7 +60,9 @@ void codex_free_string(char *s);
  *              10 = accumulated thread token/context-window data as JSON,
  *              11 = exact token usage for one completed model response as JSON,
  *              12 = canonical ItemStartedEvent as JSON,
- *              13 = canonical ItemCompletedEvent as JSON.
+ *              13 = canonical ItemCompletedEvent as JSON,
+ *              14 = context compaction started; text is the same canonical
+ *                   ItemStartedEvent JSON also emitted through event kind 12.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */
@@ -135,7 +137,7 @@ void codex_run_turn_streaming(const char *access_token,
  *   service_tier    "priority" for Fast Mode, "default" for standard service,
  *                   or NULL/empty to leave the service tier unspecified.
  *   prompt          The user prompt.
- *   history_json    Bootstrap conversation used only for a new/recovered context.
+ *   history_json    Bootstrap conversation used only for a genuinely new context.
  *   context_home_path Absolute private directory dedicated to this node's model
  *                   context. Codex persists and compacts its rollout here.
  *   workspace_path  Absolute path to the node's working directory; the turn is
@@ -209,7 +211,7 @@ void codex_run_turn_streaming_apikey_server(const char *base_url,
  *   reasoning_effort Exact effort advertised by the model catalog, or
  *                   NULL/empty to use that model's live default.
  *   prompt          The user prompt.
- *   history_json    Bootstrap conversation used only for a new/recovered context.
+ *   history_json    Bootstrap conversation used only for a genuinely new context.
  *   context_home_path Absolute private directory dedicated to this node's model
  *                   context. It is local app storage even when tools use SSH.
  *   workspace_path  Absolute path to the working directory ON THE SERVER; the

@@ -52,11 +52,13 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ThreadSettingsOverrides;
@@ -148,6 +150,8 @@ const KIND_RAW_RESPONSE_COMPLETED: c_int = 11;
 /// Canonical Codex turn-item lifecycle events.
 const KIND_ITEM_STARTED: c_int = 12;
 const KIND_ITEM_COMPLETED: c_int = 13;
+/// Codex started compacting the persistent model context.
+const KIND_CONTEXT_COMPACTION_STARTED: c_int = 14;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
 const CONTEXT_POINTER_FILE: &str = "agentapp-thread.json";
@@ -256,10 +260,6 @@ async fn write_thread_pointer(
         .map_err(|error| format!("failed to commit model-context pointer: {error}"))
 }
 
-async fn clear_thread_pointer(codex_home: &Path) {
-    let _ = tokio::fs::remove_file(codex_home.join(CONTEXT_POINTER_FILE)).await;
-}
-
 /// Callback invoked for each streamed event. `text` is a NUL-terminated UTF-8
 /// C string that is ONLY valid for the duration of the call; the callee must
 /// copy it if it needs to outlive the invocation. `ctx` is passed through
@@ -345,6 +345,15 @@ fn emit(callback: EventCallback, ctx: *mut c_void, kind: c_int, text: &str) {
     let sanitized: String = text.chars().filter(|&c| c != '\0').collect();
     if let Ok(cstr) = CString::new(sanitized) {
         callback(ctx, kind, cstr.as_ptr());
+    }
+}
+
+fn emit_item_started_events(callback: EventCallback, ctx: *mut c_void, event: &ItemStartedEvent) {
+    if let Ok(json) = serde_json::to_string(event) {
+        emit(callback, ctx, KIND_ITEM_STARTED, &json);
+        if matches!(&event.item, TurnItem::ContextCompaction(_)) {
+            emit(callback, ctx, KIND_CONTEXT_COMPACTION_STARTED, &json);
+        }
     }
 }
 
@@ -847,17 +856,10 @@ pub(crate) async fn run_turn_async(
             .map_err(|e| format!("failed to parse dynamic_tools_json: {e}"))?
     };
 
-    let resume_path = match read_thread_pointer(&codex_home).await {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::warn!(%error, "discarding invalid AgentApp model-context pointer");
-            clear_thread_pointer(&codex_home).await;
-            None
-        }
-    };
+    let resume_path = read_thread_pointer(&codex_home).await?;
     let mut resumed = false;
     let new_thread = if let Some(rollout_path) = resume_path {
-        match thread_manager
+        let thread = thread_manager
             .resume_thread_from_rollout_with_tools(
                 config.clone(),
                 rollout_path.clone(),
@@ -867,30 +869,15 @@ pub(crate) async fn run_turn_async(
                 dynamic_tools.clone(),
             )
             .await
-        {
-            Ok(thread) => {
-                resumed = true;
-                emit_debug_stage(callback, ctx, "thread_resumed");
-                thread
-            }
-            Err(error) => {
-                tracing::warn!(
-                    rollout_path = %rollout_path.display(),
-                    %error,
-                    "failed to resume AgentApp model context; starting a seeded replacement"
-                );
-                clear_thread_pointer(&codex_home).await;
-                thread_manager
-                    .start_thread_with_tools(config, dynamic_tools)
-                    .await
-                    .map_err(|start_error| {
-                        format!(
-                            "failed to resume model context ({error}); \
-                             failed to start replacement thread: {start_error}"
-                        )
-                    })?
-            }
-        }
+            .map_err(|error| {
+                format!(
+                    "failed to resume model context from {}: {error}",
+                    rollout_path.display()
+                )
+            })?;
+        resumed = true;
+        emit_debug_stage(callback, ctx, "thread_resumed");
+        thread
     } else {
         thread_manager
             .start_thread_with_tools(config, dynamic_tools)
@@ -919,9 +906,10 @@ pub(crate) async fn run_turn_async(
         );
     let _registry_guard = RegistryGuard(turn_handle);
 
-    // Legacy transcript replay is only a bootstrap seed for a new context.
-    // Resumed threads load their bounded/compacted model context from Codex's
-    // own rollout and must never receive the transcript a second time.
+    // `history_json` is retained for legacy bridge callers that still need to
+    // bootstrap a genuinely new context. AgentApp passes it empty: resumed
+    // threads load Codex's own native rollout and are never reconstructed from
+    // the visible transcript.
     let prior: Vec<ResponseItem> = if resumed || history_json.trim().is_empty() {
         Vec::new()
     } else {
@@ -1078,9 +1066,7 @@ pub(crate) async fn run_turn_async(
         awaiting_event_after_dynamic_image = false;
         match event.msg {
             EventMsg::ItemStarted(ev) => {
-                if let Ok(json) = serde_json::to_string(&ev) {
-                    emit(callback, ctx, KIND_ITEM_STARTED, &json);
-                }
+                emit_item_started_events(callback, ctx, &ev);
             }
             EventMsg::ItemCompleted(ev) => {
                 if let Ok(json) = serde_json::to_string(&ev) {
