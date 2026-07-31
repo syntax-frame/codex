@@ -25,6 +25,7 @@ use super::parse_reasoning_effort;
 use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
 use super::read_thread_pointer;
+use super::tool_discovery_event_json;
 use super::validate_relative_rollout_path;
 use super::write_thread_pointer;
 
@@ -281,4 +282,30 @@ fn context_compaction_start_emits_dedicated_and_generic_events() {
             (KIND_ITEM_STARTED, regular_json),
         ]
     );
+}
+
+#[test]
+fn tool_discovery_event_is_versioned_and_content_free() {
+    let payload = tool_discovery_event_json("search_loaded");
+    let value: serde_json::Value = serde_json::from_str(&payload).expect("discovery JSON");
+    let object = value.as_object().expect("discovery object");
+
+    assert_eq!(object.len(), 2);
+    assert_eq!(object["contract_version"], 1);
+    assert_eq!(object["event"], "search_loaded");
+    for forbidden in [
+        "prompt",
+        "query",
+        "arguments",
+        "url",
+        "credentials",
+        "filename",
+        "output",
+        "conversation",
+        "call_id",
+        "turn_id",
+        "node_id",
+    ] {
+        assert!(!object.contains_key(forbidden));
+    }
 }

@@ -65,7 +65,10 @@ void codex_free_string(char *s);
  *                   ItemStartedEvent JSON also emitted through event kind 12,
  *              15 = content-free dynamic-tool discovery lifecycle JSON. It
  *                   never includes search text, schemas, IDs, arguments, or
- *                   tool output.
+ *                   tool output. Payload contract version 1 is
+ *                   {"contract_version":1,"event":"search_requested"|
+ *                   "search_loaded"}. Consumers must ignore unsupported
+ *                   versions; older libraries simply never emit kind 15.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */

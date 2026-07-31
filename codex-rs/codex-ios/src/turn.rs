@@ -156,6 +156,7 @@ const KIND_CONTEXT_COMPACTION_STARTED: c_int = 14;
 /// Search queries, matching schemas, call IDs, and tool arguments deliberately
 /// never cross this boundary.
 const KIND_TOOL_DISCOVERY: c_int = 15;
+const TOOL_DISCOVERY_CONTRACT_VERSION: u32 = 1;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
 const CONTEXT_POINTER_FILE: &str = "agentapp-thread.json";
@@ -174,6 +175,14 @@ fn turn_runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("failed to build shared codex turn runtime")
     })
+}
+
+fn tool_discovery_event_json(event: &str) -> String {
+    serde_json::json!({
+        "contract_version": TOOL_DISCOVERY_CONTRACT_VERSION,
+        "event": event,
+    })
+    .to_string()
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -1147,20 +1156,12 @@ pub(crate) async fn run_turn_async(
                         }
                     }
                     ResponseItem::ToolSearchCall { .. } => {
-                        emit(
-                            callback,
-                            ctx,
-                            KIND_TOOL_DISCOVERY,
-                            r#"{"event":"search_requested"}"#,
-                        );
+                        let payload = tool_discovery_event_json("search_requested");
+                        emit(callback, ctx, KIND_TOOL_DISCOVERY, &payload);
                     }
                     ResponseItem::ToolSearchOutput { .. } => {
-                        emit(
-                            callback,
-                            ctx,
-                            KIND_TOOL_DISCOVERY,
-                            r#"{"event":"search_loaded"}"#,
-                        );
+                        let payload = tool_discovery_event_json("search_loaded");
+                        emit(callback, ctx, KIND_TOOL_DISCOVERY, &payload);
                     }
                     _ => {}
                 }
