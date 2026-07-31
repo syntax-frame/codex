@@ -62,7 +62,10 @@ void codex_free_string(char *s);
  *              12 = canonical ItemStartedEvent as JSON,
  *              13 = canonical ItemCompletedEvent as JSON,
  *              14 = context compaction started; text is the same canonical
- *                   ItemStartedEvent JSON also emitted through event kind 12.
+ *                   ItemStartedEvent JSON also emitted through event kind 12,
+ *              15 = content-free dynamic-tool discovery lifecycle JSON. It
+ *                   never includes search text, schemas, IDs, arguments, or
+ *                   tool output.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */

@@ -152,6 +152,10 @@ const KIND_ITEM_STARTED: c_int = 12;
 const KIND_ITEM_COMPLETED: c_int = 13;
 /// Codex started compacting the persistent model context.
 const KIND_CONTEXT_COMPACTION_STARTED: c_int = 14;
+/// Content-free lifecycle telemetry for Core-internal deferred tool discovery.
+/// Search queries, matching schemas, call IDs, and tool arguments deliberately
+/// never cross this boundary.
+const KIND_TOOL_DISCOVERY: c_int = 15;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
 const CONTEXT_POINTER_FILE: &str = "agentapp-thread.json";
@@ -1141,6 +1145,22 @@ pub(crate) async fn run_turn_async(
                         if let Ok(json) = serde_json::to_string(&payload) {
                             emit(callback, ctx, KIND_TOOL_CALL, &json);
                         }
+                    }
+                    ResponseItem::ToolSearchCall { .. } => {
+                        emit(
+                            callback,
+                            ctx,
+                            KIND_TOOL_DISCOVERY,
+                            r#"{"event":"search_requested"}"#,
+                        );
+                    }
+                    ResponseItem::ToolSearchOutput { .. } => {
+                        emit(
+                            callback,
+                            ctx,
+                            KIND_TOOL_DISCOVERY,
+                            r#"{"event":"search_loaded"}"#,
+                        );
                     }
                     _ => {}
                 }
