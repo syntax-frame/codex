@@ -18,6 +18,7 @@ use super::KIND_CONTEXT_COMPACTION_STARTED;
 use super::KIND_ERROR;
 use super::KIND_ITEM_STARTED;
 use super::PersistedThreadPointer;
+use super::codex_ios_tool_discovery_contract_version;
 use super::codex_run_turn_streaming_apikey;
 use super::codex_steer_turn;
 use super::emit_item_started_events;
@@ -286,6 +287,7 @@ fn context_compaction_start_emits_dedicated_and_generic_events() {
 
 #[test]
 fn tool_discovery_event_is_versioned_and_content_free() {
+    assert_eq!(codex_ios_tool_discovery_contract_version(), 1);
     let payload = tool_discovery_event_json("search_loaded");
     let value: serde_json::Value = serde_json::from_str(&payload).expect("discovery JSON");
     let object = value.as_object().expect("discovery object");

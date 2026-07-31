@@ -75,6 +75,13 @@ void codex_free_string(char *s);
 typedef void (*codex_event_callback)(void *ctx, int event_kind, const char *text);
 
 /*
+ * Highest payload contract supported for event kind 15. This query is
+ * additive: a consumer paired with an older library should treat an absent
+ * symbol exactly like version 0 (discovery telemetry unavailable).
+ */
+uint32_t codex_ios_tool_discovery_contract_version(void);
+
+/*
  * Drive ONE user turn through the REAL Codex turn loop (run_turn) and stream
  * events to `callback`. Blocks until the turn completes. Talks to the ChatGPT
  * OAuth backend.

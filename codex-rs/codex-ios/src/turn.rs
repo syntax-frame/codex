@@ -165,6 +165,14 @@ const DYNAMIC_IMAGE_RESPONSE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_IMAGE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(45);
 const PROMPT_IMAGE_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Highest content-free discovery-event payload contract this library emits.
+/// Additive ABI query: older libraries simply lack the symbol and never emit
+/// event kind 15.
+#[unsafe(no_mangle)]
+pub extern "C" fn codex_ios_tool_discovery_contract_version() -> u32 {
+    TOOL_DISCOVERY_CONTRACT_VERSION
+}
+
 fn turn_runtime() -> &'static tokio::runtime::Runtime {
     static TURN_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     TURN_RUNTIME.get_or_init(|| {
