@@ -17,6 +17,7 @@ codex-login = { workspace = true }
 codex-model-provider-info = { workspace = true }
 codex-models-manager = { workspace = true }
 codex-protocol = { workspace = true }
+codex-rollout = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }

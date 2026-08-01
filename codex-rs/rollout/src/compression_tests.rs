@@ -47,6 +47,44 @@ async fn load_rollout_items_reads_compressed_rollout() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn concurrent_plain_and_compressed_line_readers_share_one_fixed_worker() -> anyhow::Result<()>
+{
+    let home = TempDir::new()?;
+    let mut tasks = Vec::new();
+    for index in 0..32u128 {
+        let uuid = Uuid::from_u128(1000 + index);
+        let thread_id = ThreadId::from_string(&uuid.to_string())?;
+        let rollout_path = rollout_path(
+            home.path(),
+            format!("2025-01-03T12-00-{:02}", index % 60).as_str(),
+            uuid,
+        );
+        write_rollout(&rollout_path, thread_id, "generated worker fixture")?;
+        if index % 2 == 0 {
+            compress_now(&rollout_path)?;
+        }
+        tasks.push(tokio::spawn(async move {
+            let mut reader = open_rollout_line_reader(&rollout_path).await?;
+            let mut lines = 0usize;
+            while reader.next_line().await?.is_some() {
+                lines += 1;
+            }
+            Ok::<_, std::io::Error>(lines)
+        }));
+    }
+
+    for task in tasks {
+        assert_eq!(task.await??, 2);
+    }
+    assert_eq!(
+        reader::ROLLOUT_READER_WORKER_STARTS.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "all plain and compressed readers must share the single fixed worker"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn read_session_meta_line_stops_before_invalid_utf8_tail() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let uuid = Uuid::from_u128(16);

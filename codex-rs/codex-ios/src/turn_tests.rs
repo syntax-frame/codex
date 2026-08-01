@@ -4,6 +4,11 @@ use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use codex_exec_server::SshAuthentication;
 use codex_exec_server::SshTmuxMode;
@@ -18,10 +23,13 @@ use super::KIND_CONTEXT_COMPACTION_STARTED;
 use super::KIND_ERROR;
 use super::KIND_ITEM_STARTED;
 use super::PersistedThreadPointer;
+use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
+use super::build_turn_runtime;
 use super::codex_ios_tool_discovery_contract_version;
 use super::codex_run_turn_streaming_apikey;
 use super::codex_steer_turn;
 use super::emit_item_started_events;
+use super::model_context_resume_error_class;
 use super::parse_reasoning_effort;
 use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
@@ -71,6 +79,118 @@ fn run_apikey_turn(context_home: &Path) -> Vec<(c_int, String)> {
     );
 
     events
+}
+
+#[test]
+fn turn_runtime_enforces_blocking_pool_ceiling() {
+    let runtime = build_turn_runtime();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (started_tx, started_rx) = mpsc::channel();
+    let mut tasks = Vec::new();
+    for _ in 0..(TURN_RUNTIME_MAX_BLOCKING_THREADS * 4) {
+        let gate = Arc::clone(&gate);
+        let started_tx = started_tx.clone();
+        tasks.push(runtime.spawn_blocking(move || {
+            started_tx.send(()).expect("started receiver");
+            let (released, wake) = &*gate;
+            let mut released = released.lock().expect("gate lock");
+            while !*released {
+                released = wake.wait(released).expect("gate wait");
+            }
+        }));
+    }
+    drop(started_tx);
+
+    let mut started_before_release = 0usize;
+    let mut start_observation_error = None;
+    for _ in 0..TURN_RUNTIME_MAX_BLOCKING_THREADS {
+        match started_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(()) => started_before_release += 1,
+            Err(error) => {
+                start_observation_error = Some(error);
+                break;
+            }
+        }
+    }
+    let seventeenth_started = matches!(started_rx.recv_timeout(Duration::from_millis(250)), Ok(()));
+
+    {
+        let (released, wake) = &*gate;
+        *released.lock().expect("gate lock") = true;
+        wake.notify_all();
+    }
+    runtime.block_on(async {
+        for task in tasks {
+            task.await.expect("blocking task should finish");
+        }
+    });
+    assert!(
+        start_observation_error.is_none(),
+        "not all configured blocking workers started: {start_observation_error:?}"
+    );
+    assert_eq!(
+        started_before_release, TURN_RUNTIME_MAX_BLOCKING_THREADS,
+        "unexpected configured blocking-worker count"
+    );
+    assert!(
+        !seventeenth_started,
+        "a seventeenth blocking worker started before capacity was released"
+    );
+    eprintln!(
+        "turn_runtime_blocking_ceiling_evidence started_before_release={started_before_release}"
+    );
+}
+
+#[test]
+fn model_context_resume_errors_are_content_free_stable_classes() {
+    use codex_protocol::error::CodexErr;
+    use codex_rollout::RolloutReadError;
+    use codex_rollout::RolloutReadResource;
+
+    for (error, expected) in [
+        (
+            RolloutReadError::ResourceExhausted {
+                resource: RolloutReadResource::ItemList,
+                record: 7,
+            },
+            "resource_exhausted",
+        ),
+        (
+            RolloutReadError::DecodedBytesTooLarge { limit: 268_435_456 },
+            "decoded_bytes_limit",
+        ),
+        (
+            RolloutReadError::RecordTooLarge {
+                record: 9,
+                limit: 100_663_296,
+            },
+            "record_size_limit",
+        ),
+        (
+            RolloutReadError::TooManyRecords { limit: 100_000 },
+            "record_count_limit",
+        ),
+        (
+            RolloutReadError::TruncatedRecord { record: 11 },
+            "truncated_record",
+        ),
+        (RolloutReadError::InvalidUtf8 { record: 5 }, "invalid_utf8"),
+        (
+            RolloutReadError::MalformedJson { record: 4 },
+            "malformed_json",
+        ),
+        (
+            RolloutReadError::CompressedData { record: 8 },
+            "compressed_data",
+        ),
+    ] {
+        let error = CodexErr::Io(std::io::Error::other(error));
+        assert_eq!(model_context_resume_error_class(&error), expected);
+    }
+    assert_eq!(
+        model_context_resume_error_class(&CodexErr::Fatal("private structural detail".to_string())),
+        "invalid_or_unavailable"
+    );
 }
 
 #[test]
@@ -241,7 +361,19 @@ fn failed_model_context_resume_preserves_pointer_and_rollout() {
         events.iter().map(|event| event.0).collect::<Vec<_>>(),
         vec![KIND_ERROR]
     );
-    assert!(events[0].1.contains("failed to resume model context from"));
+    assert!(
+        events[0]
+            .1
+            .contains("failed to resume persistent model context")
+    );
+    assert!(
+        !events[0].1.contains(relative_rollout),
+        "public resume errors must not expose the rollout path"
+    );
+    assert!(
+        !events[0].1.contains("not a valid rollout"),
+        "public resume errors must not expose record content"
+    );
     assert_eq!(
         std::fs::read(pointer_path).expect("preserved pointer"),
         pointer_bytes
