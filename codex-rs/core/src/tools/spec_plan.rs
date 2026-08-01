@@ -248,7 +248,13 @@ fn build_model_visible_specs_and_registry(
             continue;
         }
         let exposure = runtime.exposure();
-        if exposure.is_direct() && !is_hidden_by_code_mode_only(turn_context, &tool_name, exposure)
+        if exposure.is_direct()
+            && !is_hidden_by_code_mode_only(
+                turn_context,
+                &tool_name,
+                exposure,
+                runtime.allows_transient_arguments(),
+            )
         {
             let spec = runtime.spec();
             specs.push(spec_for_model_request(
@@ -417,10 +423,14 @@ fn is_hidden_by_code_mode_only(
     turn_context: &TurnContext,
     tool_name: &ToolName,
     exposure: ToolExposure,
+    allows_transient_arguments: bool,
 ) -> bool {
     let tool_mode = effective_tool_mode(turn_context);
     tool_mode == ToolMode::CodeModeOnly
         && exposure != ToolExposure::DirectModelOnly
+        && (!allows_transient_arguments
+            || crate::tools::argument_privacy::handling_for(turn_context, tool_name)
+                .is_persistent())
         && codex_code_mode_protocol::is_code_mode_nested_tool(
             &codex_tools::code_mode_name_for_tool_name(tool_name),
         )
@@ -451,6 +461,12 @@ fn build_code_mode_executors(
     let mut deferred_exec_prompt_tool_specs = Vec::new();
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
     for executor in executors {
+        if executor.allows_transient_arguments()
+            && crate::tools::argument_privacy::handling_for(turn_context, &executor.tool_name())
+                .redacts_arguments()
+        {
+            continue;
+        }
         let exposure = executor.exposure();
         if exposure == ToolExposure::DirectModelOnly {
             continue;
@@ -917,6 +933,7 @@ fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plan
                     }
                 }
             }
+            DynamicToolSpec::ArgumentPolicy(_) => {}
         }
     }
 }

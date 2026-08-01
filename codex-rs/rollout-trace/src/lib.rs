@@ -30,6 +30,8 @@ pub use compaction::CompactionCheckpointTracePayload;
 pub use compaction::CompactionTraceAttempt;
 /// Shared recorder context for a compaction checkpoint.
 pub use compaction::CompactionTraceContext;
+/// Dynamic-tool argument projection applied to inference trace payloads.
+pub use inference::InferenceTraceArgumentPolicy;
 /// No-op-capable handle for recording one upstream inference attempt.
 pub use inference::InferenceTraceAttempt;
 /// Shared recorder context for inference attempts within one Codex turn.

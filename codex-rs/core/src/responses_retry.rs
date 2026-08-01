@@ -28,6 +28,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
 ) -> Result<(), CodexErr> {
+    let protect_arguments = crate::tools::argument_privacy::protects_arguments(turn_context);
     if *retries >= max_retries
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,
@@ -37,7 +38,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         sess.send_event(
             turn_context,
             EventMsg::Warning(WarningEvent {
-                message: format!("Falling back from WebSockets to HTTPS transport. {err:#}"),
+                message: fallback_warning_message(&err, protect_arguments),
             }),
         )
         .await;
@@ -54,7 +55,15 @@ pub(crate) async fn handle_retryable_response_stream_error(
             }
             _ => backoff(retry_count),
         };
-        log_retry(request, turn_context, &err, retry_count, max_retries, delay);
+        log_retry(
+            request,
+            turn_context,
+            &err,
+            retry_count,
+            max_retries,
+            delay,
+            protect_arguments,
+        );
 
         // In release builds, hide the first websocket retry notification to reduce noisy
         // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
@@ -78,6 +87,14 @@ pub(crate) async fn handle_retryable_response_stream_error(
     Err(err)
 }
 
+fn fallback_warning_message(err: &CodexErr, protect_arguments: bool) -> String {
+    if protect_arguments {
+        "Falling back from WebSockets to HTTPS transport for a protected turn.".to_string()
+    } else {
+        format!("Falling back from WebSockets to HTTPS transport. {err:#}")
+    }
+}
+
 fn log_retry(
     request: ResponsesStreamRequest,
     turn_context: &TurnContext,
@@ -85,25 +102,46 @@ fn log_retry(
     retries: u64,
     max_retries: u64,
     delay: Duration,
+    protect_arguments: bool,
 ) {
     match request {
         ResponsesStreamRequest::Sampling => {
-            warn!(
-                turn_id = %turn_context.sub_id,
-                retries,
-                max_retries,
-                sampling_error = %err,
-                "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
-            );
+            if protect_arguments {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    retries,
+                    max_retries,
+                    error_type = std::any::type_name_of_val(err),
+                    "protected stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
+                );
+            } else {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    retries,
+                    max_retries,
+                    sampling_error = %err,
+                    "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
+                );
+            }
         }
         ResponsesStreamRequest::RemoteCompactionV2 => {
-            warn!(
-                turn_id = %turn_context.sub_id,
-                retries,
-                max_retries,
-                compact_error = %err,
-                "remote compaction v2 stream failed; retrying request after delay"
-            );
+            if protect_arguments {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    retries,
+                    max_retries,
+                    error_type = std::any::type_name_of_val(err),
+                    "protected remote compaction v2 stream failed; retrying request after delay"
+                );
+            } else {
+                warn!(
+                    turn_id = %turn_context.sub_id,
+                    retries,
+                    max_retries,
+                    compact_error = %err,
+                    "remote compaction v2 stream failed; retrying request after delay"
+                );
+            }
         }
     }
 }

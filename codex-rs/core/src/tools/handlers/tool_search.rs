@@ -237,6 +237,7 @@ mod tests {
                 "additionalProperties": false,
             }),
             defer_loading: true,
+            argument_handling: Default::default(),
         }];
         let mcp_tools = [
             tool_info("calendar", "create_event", "Create events"),

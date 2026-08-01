@@ -206,12 +206,18 @@ async fn run_remote_compact_task_inner_impl(
     let turn_context = &step_context.turn;
     let context_compaction_item = ContextCompactionItem::new();
     let compaction_id = context_compaction_item.id.clone();
-    let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
-        turn_context.sub_id.as_str(),
-        compaction_id.as_str(),
-        turn_context.model_info.slug.as_str(),
-        turn_context.provider.info().name.as_str(),
-    );
+    let compaction_trace = sess
+        .services
+        .rollout_thread_trace
+        .compaction_trace_context_with_argument_policy(
+            turn_context.sub_id.as_str(),
+            compaction_id.as_str(),
+            turn_context.model_info.slug.as_str(),
+            turn_context.provider.info().name.as_str(),
+            codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+                &turn_context.dynamic_tools,
+            ),
+        );
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
@@ -235,12 +241,17 @@ async fn run_remote_compact_task_inner_impl(
                 return Err(error);
             }
             let fallback_turn_context = &fallback_step_context.turn;
-            let fallback_compaction_trace =
-                sess.services.rollout_thread_trace.compaction_trace_context(
+            let fallback_compaction_trace = sess
+                .services
+                .rollout_thread_trace
+                .compaction_trace_context_with_argument_policy(
                     fallback_turn_context.sub_id.as_str(),
                     compaction_id.as_str(),
                     fallback_turn_context.model_info.slug.as_str(),
                     fallback_turn_context.provider.info().name.as_str(),
+                    codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+                        &fallback_turn_context.dynamic_tools,
+                    ),
                 );
             let fallback_result = run_remote_compact_v2_attempt(
                 sess,
@@ -344,6 +355,11 @@ async fn run_remote_compaction_request_v2(
         .stream_max_retries()
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
     let mut retries = 0;
+    let inference_trace = InferenceTraceContext::disabled_with_argument_policy(
+        codex_rollout_trace::InferenceTraceArgumentPolicy::from_dynamic_tools(
+            &turn_context.dynamic_tools,
+        ),
+    );
     loop {
         let result = match client_session
             .stream(
@@ -354,7 +370,7 @@ async fn run_remote_compaction_request_v2(
                 turn_context.reasoning_summary,
                 turn_context.config.service_tier.clone(),
                 responses_metadata,
-                &InferenceTraceContext::disabled(),
+                &inference_trace,
             )
             .await
         {

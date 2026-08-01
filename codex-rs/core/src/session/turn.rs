@@ -448,7 +448,15 @@ pub(crate) async fn run_turn(
                 break;
             }
             Err(e) => {
-                info!("Turn error: {e:#}");
+                if crate::tools::argument_privacy::protects_arguments(&turn_context) {
+                    info!(
+                        error_type = std::any::type_name_of_val(&e),
+                        http_status = e.http_status_code_value(),
+                        "protected turn failed"
+                    );
+                } else {
+                    info!("Turn error: {e:#}");
+                }
                 let error = e.to_codex_protocol_error();
                 sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                     .await;
@@ -1091,6 +1099,14 @@ pub(crate) fn build_prompt(
     turn_context: &TurnContext,
     base_instructions: BaseInstructions,
 ) -> Prompt {
+    let argument_policy =
+        codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+            &turn_context.dynamic_tools,
+        );
+    let input = input
+        .iter()
+        .map(|item| argument_policy.redact_response_item(item))
+        .collect();
     Prompt {
         input,
         tools: router.model_visible_specs(),
@@ -1960,11 +1976,17 @@ async fn try_run_sampling_request(
         auth_mode = sess.services.auth_manager.auth_mode(),
         features = sess.features.enabled_features(),
     );
-    let inference_trace = sess.services.rollout_thread_trace.inference_trace_context(
-        turn_context.sub_id.as_str(),
-        turn_context.model_info.slug.as_str(),
-        turn_context.provider.info().name.as_str(),
-    );
+    let inference_trace = sess
+        .services
+        .rollout_thread_trace
+        .inference_trace_context_with_argument_policy(
+            turn_context.sub_id.as_str(),
+            turn_context.model_info.slug.as_str(),
+            turn_context.provider.info().name.as_str(),
+            codex_rollout_trace::InferenceTraceArgumentPolicy::from_dynamic_tools(
+                &turn_context.dynamic_tools,
+            ),
+        );
     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
     let uses_sequential_cutoff_reasoning_summaries = turn_context
         .config

@@ -1,8 +1,10 @@
+use super::ApiTelemetry;
 use super::AuthRequestTelemetryContext;
 use super::CompactConversationRequestSettings;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
+use super::RequestRouteTelemetry;
 use super::UnauthorizedRecoveryExecution;
 use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -17,8 +19,11 @@ use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
+use codex_api::RequestTelemetry;
 use codex_api::ResponseEvent;
+use codex_api::SseTelemetry;
 use codex_api::TransportError;
+use codex_api::WebsocketTelemetry;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::AuthCredentialsStoreMode;
@@ -36,6 +41,10 @@ use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
+use codex_protocol::dynamic_tools::DynamicToolArgumentIdentity;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicy;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicySpec;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -75,6 +84,7 @@ use tracing_subscriber::layer::Context as LayerContext;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_test::internal::MockWriter;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -358,6 +368,38 @@ impl Visit for TagCollectorVisitor {
 #[derive(Clone)]
 struct TagCollectorLayer {
     tags: Arc<Mutex<BTreeMap<String, String>>>,
+}
+
+#[derive(Clone)]
+struct AllEventCollectorLayer {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl<S> Layer<S> for AllEventCollectorLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
+        let mut visitor = TagCollectorVisitor::default();
+        event.record(&mut visitor);
+        self.events.lock().unwrap().push(format!(
+            "{} {:?}",
+            event.metadata().target(),
+            visitor.tags
+        ));
+    }
+}
+
+fn protected_browser_argument_policy() -> DynamicToolArgumentPolicy {
+    DynamicToolArgumentPolicy::from_dynamic_tools(&[DynamicToolSpec::ArgumentPolicy(
+        DynamicToolArgumentPolicySpec::trusted_transient(vec![DynamicToolArgumentIdentity {
+            namespace: None,
+            name: "agentapp_browser_act".to_string(),
+            match_any_namespace: true,
+            match_case_insensitive: true,
+        }])
+        .expect("trusted browser policy"),
+    )])
 }
 
 impl<S> Layer<S> for TagCollectorLayer
@@ -654,6 +696,203 @@ async fn response_stream_records_last_model_feedback_ids() {
 }
 
 #[tokio::test]
+async fn protected_response_stream_suppresses_provider_ids_and_error_telemetry() {
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing_subscriber::registry()
+        .with(AllEventCollectorLayer {
+            events: Arc::clone(&events),
+        })
+        .set_default();
+
+    let completed_stream = futures::stream::iter([
+        Ok(ResponseEvent::Created),
+        Ok(ResponseEvent::Completed {
+            response_id: SENTINEL.to_string(),
+            token_usage: None,
+            end_turn: Some(true),
+        }),
+    ]);
+    let protected_attempt =
+        InferenceTraceAttempt::disabled_with_argument_policy(protected_browser_argument_policy());
+    let (mut stream, _) = super::map_response_events(
+        Some(SENTINEL.to_string()),
+        completed_stream,
+        test_session_telemetry(),
+        protected_attempt,
+        test_model_provider(),
+    );
+    let mut emitted_response_id = None;
+    while let Some(event) = stream.next().await {
+        if let Ok(ResponseEvent::Completed { response_id, .. }) = event {
+            emitted_response_id = Some(response_id);
+        }
+    }
+    assert_eq!(emitted_response_id.as_deref(), Some("protected-response"));
+
+    let failed_stream = futures::stream::iter([Err(ApiError::Stream(format!(
+        "provider reflected {SENTINEL}"
+    )))]);
+    let protected_attempt =
+        InferenceTraceAttempt::disabled_with_argument_policy(protected_browser_argument_policy());
+    let (mut stream, _) = super::map_response_events(
+        Some(SENTINEL.to_string()),
+        failed_stream,
+        test_session_telemetry(),
+        protected_attempt,
+        test_model_provider(),
+    );
+    assert!(stream.next().await.expect("mapped failure").is_err());
+
+    let durable_events = events.lock().unwrap().join("\n");
+    assert!(!durable_events.contains(SENTINEL));
+    assert!(!durable_events.contains("last_model_request_id"));
+    assert!(!durable_events.contains("last_model_response_id"));
+}
+
+#[test]
+fn protected_api_telemetry_never_logs_transport_or_stream_payloads() {
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+    let buffer: &'static std::sync::Mutex<Vec<u8>> =
+        Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(MockWriter::new(buffer))
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+    let telemetry = ApiTelemetry::new(
+        test_session_telemetry(),
+        AuthRequestTelemetryContext::default(),
+        RequestRouteTelemetry::for_endpoint("/responses"),
+        Default::default(),
+        /*protect_arguments*/ true,
+    );
+    let transport_error = TransportError::Http {
+        status: http::StatusCode::BAD_REQUEST,
+        url: None,
+        headers: None,
+        body: Some(format!("provider reflected {SENTINEL}")),
+    };
+    RequestTelemetry::on_request(
+        &telemetry,
+        /*attempt*/ 1,
+        Some(http::StatusCode::BAD_REQUEST),
+        Some(&transport_error),
+        Duration::from_millis(1),
+    );
+    let sse = Ok(Some(Ok(eventsource_stream::Event {
+        event: "response.failed".to_string(),
+        data: json!({"error": {"message": SENTINEL}}).to_string(),
+        id: String::new(),
+        retry: None,
+    })));
+    SseTelemetry::on_sse_poll(&telemetry, &sse, Duration::from_millis(1));
+    let ws_error = ApiError::Stream(format!("provider reflected {SENTINEL}"));
+    WebsocketTelemetry::on_ws_request(
+        &telemetry,
+        Duration::from_millis(1),
+        Some(&ws_error),
+        /*connection_reused*/ false,
+    );
+    let ws_event = Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(
+        json!({"type": SENTINEL}).to_string().into(),
+    ))));
+    WebsocketTelemetry::on_ws_event(&telemetry, &ws_event, Duration::from_millis(1));
+
+    let logs = String::from_utf8(
+        buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )
+    .expect("telemetry log should be valid utf-8");
+    assert!(!logs.contains(SENTINEL));
+    assert!(logs.contains("protected transport error"));
+    assert!(logs.contains("protected websocket error"));
+}
+
+#[tokio::test]
+async fn protected_websocket_handshake_diagnostics_omit_provider_headers_and_body() {
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .insert_header("x-request-id", SENTINEL)
+                .set_body_string(format!("provider reflected {SENTINEL}")),
+        )
+        .mount(&server)
+        .await;
+    let mut provider =
+        create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+    provider.supports_websockets = true;
+    let client = ModelClient::new(
+        /*auth_manager*/ None,
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test-originator".to_string(),
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let prompt = Prompt {
+        input: Vec::new(),
+        base_instructions: BaseInstructions {
+            text: "base instructions".to_string(),
+        },
+        ..Default::default()
+    };
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Prewarm,
+    );
+    let buffer: &'static std::sync::Mutex<Vec<u8>> =
+        Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(MockWriter::new(buffer))
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    let result = client
+        .new_session()
+        .prewarm_websocket_with_argument_policy(
+            &prompt,
+            &test_model_info(),
+            &test_session_telemetry(),
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &responses_metadata,
+            protected_browser_argument_policy(),
+        )
+        .await;
+    assert!(result.is_err());
+
+    let logs = String::from_utf8(
+        buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )
+    .expect("handshake log should be valid utf-8");
+    assert!(!logs.contains(SENTINEL));
+    assert!(logs.contains("protected websocket connection error"));
+}
+
+#[tokio::test]
 async fn bedrock_unauthorized_error_uses_provider_mapping() {
     let provider = create_model_provider(
         ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None),
@@ -674,6 +913,7 @@ async fn bedrock_unauthorized_error_uses_provider_mapping() {
         &mut auth_recovery,
         &test_session_telemetry(),
         &provider,
+        /*protect_arguments*/ false,
     )
     .await
     .expect_err("expired Bedrock signature should fail");

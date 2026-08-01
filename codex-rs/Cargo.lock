@@ -1961,6 +1961,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "tungstenite",
  "url",
  "uuid",
@@ -3245,6 +3246,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "tracing-test",
  "windows-sys 0.52.0",
  "zstd",
 ]

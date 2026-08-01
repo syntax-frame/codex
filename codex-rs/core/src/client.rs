@@ -559,6 +559,7 @@ impl ModelClient {
             ),
             RequestRouteTelemetry::for_endpoint(RESPONSES_COMPACT_ENDPOINT),
             self.state.auth_env_telemetry.clone(),
+            /*protect_arguments*/ false,
         );
         let request = self.build_responses_request(
             &client_setup.api_provider,
@@ -693,6 +694,7 @@ impl ModelClient {
             ),
             RequestRouteTelemetry::for_endpoint(MEMORIES_SUMMARIZE_ENDPOINT),
             self.state.auth_env_telemetry.clone(),
+            /*protect_arguments*/ false,
         );
         let client =
             ApiMemoriesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
@@ -788,12 +790,14 @@ impl ModelClient {
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
         auth_env_telemetry: AuthEnvTelemetry,
+        protect_arguments: bool,
     ) -> Arc<dyn RequestTelemetry> {
         let telemetry = Arc::new(ApiTelemetry::new(
             session_telemetry.clone(),
             auth_context,
             request_route_telemetry,
             auth_env_telemetry,
+            protect_arguments,
         ));
         let request_telemetry: Arc<dyn RequestTelemetry> = telemetry;
         request_telemetry
@@ -983,6 +987,7 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
+        protect_arguments: bool,
     ) -> std::result::Result<ApiWebSocketConnection, ApiError> {
         let headers = self.build_websocket_headers(responses_metadata).await;
         let websocket_telemetry = ModelClientSession::build_websocket_telemetry(
@@ -990,6 +995,7 @@ impl ModelClient {
             auth_context.clone(),
             request_route_telemetry,
             self.state.auth_env_telemetry.clone(),
+            protect_arguments,
         );
         let websocket_connect_timeout = self.state.provider.info().websocket_connect_timeout();
         let start = Instant::now();
@@ -1008,12 +1014,23 @@ impl ModelClient {
             Ok(result) => result,
             Err(_) => Err(ApiError::Transport(TransportError::Timeout)),
         };
-        let error_message = result.as_ref().err().map(telemetry_api_error_message);
-        let response_debug = result
-            .as_ref()
-            .err()
-            .map(extract_response_debug_context_from_api_error)
-            .unwrap_or_default();
+        let error_message = if protect_arguments {
+            result
+                .as_ref()
+                .err()
+                .map(|_| "protected websocket connection error".to_string())
+        } else {
+            result.as_ref().err().map(telemetry_api_error_message)
+        };
+        let response_debug = if protect_arguments {
+            Default::default()
+        } else {
+            result
+                .as_ref()
+                .err()
+                .map(extract_response_debug_context_from_api_error)
+                .unwrap_or_default()
+        };
         let status = result.as_ref().err().and_then(api_error_http_status);
         session_telemetry.record_websocket_connect(
             start.elapsed(),
@@ -1273,6 +1290,7 @@ impl ModelClientSession {
                 responses_metadata,
                 auth_context,
                 RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
+                /*protect_arguments*/ false,
             )
             .await?;
         self.websocket_session.connection = Some(connection);
@@ -1304,6 +1322,7 @@ impl ModelClientSession {
             responses_metadata,
             auth_context,
             request_route_telemetry,
+            protect_arguments,
         } = params;
         let needs_new = match self.websocket_session.connection.as_ref() {
             Some(conn) => conn.is_closed().await,
@@ -1323,6 +1342,7 @@ impl ModelClientSession {
                     responses_metadata,
                     auth_context,
                     request_route_telemetry,
+                    protect_arguments,
                 )
                 .await
             {
@@ -1410,6 +1430,7 @@ impl ModelClientSession {
                 request_auth_context,
                 RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
                 self.client.state.auth_env_telemetry.clone(),
+                inference_trace.protects_arguments(),
             );
             let compression = self.responses_request_compression(client_setup.auth.as_ref());
             let mut options = self
@@ -1470,6 +1491,7 @@ impl ModelClientSession {
                             &mut auth_recovery,
                             session_telemetry,
                             &self.client.state.provider,
+                            inference_trace.protects_arguments(),
                         )
                         .await?,
                     );
@@ -1533,6 +1555,7 @@ impl ModelClientSession {
                 request_auth_context,
                 RequestRouteTelemetry::for_endpoint("chat/completions"),
                 self.client.state.auth_env_telemetry.clone(),
+                inference_trace.protects_arguments(),
             );
             let mut request = self.client.build_responses_request(
                 &client_setup.api_provider,
@@ -1586,6 +1609,7 @@ impl ModelClientSession {
                             &mut auth_recovery,
                             session_telemetry,
                             &self.client.state.provider,
+                            inference_trace.protects_arguments(),
                         )
                         .await?,
                     );
@@ -1679,6 +1703,7 @@ impl ModelClientSession {
                     request_route_telemetry: RequestRouteTelemetry::for_endpoint(
                         RESPONSES_ENDPOINT,
                     ),
+                    protect_arguments: inference_trace.protects_arguments(),
                 })
                 .await
             {
@@ -1697,6 +1722,7 @@ impl ModelClientSession {
                             &mut auth_recovery,
                             session_telemetry,
                             &self.client.state.provider,
+                            inference_trace.protects_arguments(),
                         )
                         .await?,
                     );
@@ -1707,13 +1733,10 @@ impl ModelClientSession {
 
             let (incremental_request, previous_response_id_from_untraced_warmup) =
                 self.prepare_websocket_request(&request);
-            let inference_trace_attempt = if warmup {
-                // Prewarm sends `generate=false`; it is connection setup, not a
-                // model inference attempt that should appear in rollout traces.
-                InferenceTraceAttempt::disabled()
-            } else {
-                inference_trace.start_attempt()
-            };
+            // A disabled context still carries the argument-protection policy.
+            // Prewarm sends `generate=false`, so the attempt records nothing,
+            // but it must retain that policy while mapping provider events.
+            let inference_trace_attempt = inference_trace.start_attempt();
             if previous_response_id_from_untraced_warmup {
                 // The transport can reuse an untraced warmup response id and omit the
                 // already-sent input, but rollout replay needs the logical model-visible
@@ -1802,12 +1825,14 @@ impl ModelClientSession {
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
         auth_env_telemetry: AuthEnvTelemetry,
+        protect_arguments: bool,
     ) -> (Arc<dyn RequestTelemetry>, Arc<dyn SseTelemetry>) {
         let telemetry = Arc::new(ApiTelemetry::new(
             session_telemetry.clone(),
             auth_context,
             request_route_telemetry,
             auth_env_telemetry,
+            protect_arguments,
         ));
         let request_telemetry: Arc<dyn RequestTelemetry> = telemetry.clone();
         let sse_telemetry: Arc<dyn SseTelemetry> = telemetry;
@@ -1820,12 +1845,14 @@ impl ModelClientSession {
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
         auth_env_telemetry: AuthEnvTelemetry,
+        protect_arguments: bool,
     ) -> Arc<dyn WebsocketTelemetry> {
         let telemetry = Arc::new(ApiTelemetry::new(
             session_telemetry.clone(),
             auth_context,
             request_route_telemetry,
             auth_env_telemetry,
+            protect_arguments,
         ));
         let websocket_telemetry: Arc<dyn WebsocketTelemetry> = telemetry;
         websocket_telemetry
@@ -1842,6 +1869,31 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
+        self.prewarm_websocket_with_argument_policy(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            codex_rollout_trace::InferenceTraceArgumentPolicy::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prewarm_websocket_with_argument_policy(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        argument_policy: codex_rollout_trace::InferenceTraceArgumentPolicy,
+    ) -> Result<()> {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
@@ -1849,7 +1901,7 @@ impl ModelClientSession {
             return Ok(());
         }
 
-        let disabled_trace = InferenceTraceContext::disabled();
+        let disabled_trace = InferenceTraceContext::disabled_with_argument_policy(argument_policy);
         match self
             .stream_responses_websocket(
                 prompt,
@@ -2067,6 +2119,7 @@ where
         + Send
         + 'static,
 {
+    let protect_arguments = inference_trace_attempt.protects_arguments();
     let (tx_event, rx_event) =
         mpsc::channel::<Result<ResponseEvent>>(RESPONSE_STREAM_CHANNEL_CAPACITY);
     let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
@@ -2080,7 +2133,7 @@ where
         let (request_start, mut ttft_ms) = (Instant::now(), None);
         let mut api_stream = api_stream;
         let upstream_request_id = upstream_request_id.as_deref();
-        if let Some(upstream_request_id) = upstream_request_id {
+        if !protect_arguments && let Some(upstream_request_id) = upstream_request_id {
             feedback_tags!(last_model_request_id = upstream_request_id);
         }
         loop {
@@ -2100,7 +2153,7 @@ where
             };
             match event {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
-                    items_added.push(item.clone());
+                    items_added.push(inference_trace_attempt.project_response_item(&item));
                     if tx_event
                         .send(Ok(ResponseEvent::OutputItemDone(item)))
                         .await
@@ -2119,7 +2172,9 @@ where
                     token_usage,
                     end_turn,
                 }) => {
-                    feedback_tags!(last_model_response_id = &response_id);
+                    if !protect_arguments {
+                        feedback_tags!(last_model_response_id = &response_id);
+                    }
                     if let Some(usage) = &token_usage {
                         session_telemetry.sse_event_completed(usage, ttft_ms);
                     }
@@ -2135,9 +2190,14 @@ where
                             items_added: std::mem::take(&mut items_added),
                         });
                     }
+                    let emitted_response_id = if protect_arguments {
+                        "protected-response".to_string()
+                    } else {
+                        response_id
+                    };
                     if tx_event
                         .send(Ok(ResponseEvent::Completed {
-                            response_id,
+                            response_id: emitted_response_id,
                             token_usage,
                             end_turn,
                         }))
@@ -2163,20 +2223,25 @@ where
                     }
                 }
                 Err(err) => {
-                    let response_debug_context =
-                        extract_response_debug_context_from_api_error(&err);
-                    let upstream_request_id =
-                        upstream_request_id.or(response_debug_context.request_id.as_deref());
-                    if let Some(upstream_request_id) = upstream_request_id {
+                    let response_debug_context = (!protect_arguments)
+                        .then(|| extract_response_debug_context_from_api_error(&err));
+                    let event_upstream_request_id = if protect_arguments {
+                        None
+                    } else {
+                        upstream_request_id.or(response_debug_context
+                            .as_ref()
+                            .and_then(|debug| debug.request_id.as_deref()))
+                    };
+                    if let Some(upstream_request_id) = event_upstream_request_id {
                         feedback_tags!(last_model_request_id = upstream_request_id);
                     }
                     let mapped = provider.map_api_error(err);
                     inference_trace_attempt.record_failed(
                         &mapped,
-                        upstream_request_id,
+                        event_upstream_request_id,
                         &items_added,
                     );
-                    if !logged_error {
+                    if !protect_arguments && !logged_error {
                         session_telemetry.see_event_completed_failed(&mapped);
                         logged_error = true;
                     }
@@ -2278,6 +2343,7 @@ struct WebsocketConnectParams<'a> {
     responses_metadata: &'a CodexResponsesMetadata,
     auth_context: AuthRequestTelemetryContext,
     request_route_telemetry: RequestRouteTelemetry,
+    protect_arguments: bool,
 }
 
 async fn handle_unauthorized(
@@ -2285,8 +2351,13 @@ async fn handle_unauthorized(
     auth_recovery: &mut Option<UnauthorizedRecovery>,
     session_telemetry: &SessionTelemetry,
     provider: &SharedModelProvider,
+    protect_arguments: bool,
 ) -> Result<UnauthorizedRecoveryExecution> {
-    let debug = extract_response_debug_context(&transport);
+    let debug = if protect_arguments {
+        Default::default()
+    } else {
+        extract_response_debug_context(&transport)
+    };
     if let Some(recovery) = auth_recovery
         && recovery.has_next()
     {
@@ -2409,6 +2480,7 @@ struct ApiTelemetry {
     auth_context: AuthRequestTelemetryContext,
     request_route_telemetry: RequestRouteTelemetry,
     auth_env_telemetry: AuthEnvTelemetry,
+    protect_arguments: bool,
 }
 
 impl ApiTelemetry {
@@ -2417,12 +2489,14 @@ impl ApiTelemetry {
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
         auth_env_telemetry: AuthEnvTelemetry,
+        protect_arguments: bool,
     ) -> Self {
         Self {
             session_telemetry,
             auth_context,
             request_route_telemetry,
             auth_env_telemetry,
+            protect_arguments,
         }
     }
 }
@@ -2435,11 +2509,19 @@ impl RequestTelemetry for ApiTelemetry {
         error: Option<&TransportError>,
         duration: Duration,
     ) {
-        let error_message = error.map(telemetry_transport_error_message);
+        let error_message = if self.protect_arguments {
+            error.map(|_| "protected transport error".to_string())
+        } else {
+            error.map(telemetry_transport_error_message)
+        };
         let status = status.map(|s| s.as_u16());
-        let debug = error
-            .map(extract_response_debug_context)
-            .unwrap_or_default();
+        let debug = if self.protect_arguments {
+            Default::default()
+        } else {
+            error
+                .map(extract_response_debug_context)
+                .unwrap_or_default()
+        };
         self.session_telemetry.record_api_request(
             attempt,
             status,
@@ -2495,17 +2577,27 @@ impl SseTelemetry for ApiTelemetry {
         >,
         duration: Duration,
     ) {
-        self.session_telemetry.log_sse_event(result, duration);
+        if !self.protect_arguments {
+            self.session_telemetry.log_sse_event(result, duration);
+        }
     }
 }
 
 impl WebsocketTelemetry for ApiTelemetry {
     fn on_ws_request(&self, duration: Duration, error: Option<&ApiError>, connection_reused: bool) {
-        let error_message = error.map(telemetry_api_error_message);
+        let error_message = if self.protect_arguments {
+            error.map(|_| "protected websocket error".to_string())
+        } else {
+            error.map(telemetry_api_error_message)
+        };
         let status = error.and_then(api_error_http_status);
-        let debug = error
-            .map(extract_response_debug_context_from_api_error)
-            .unwrap_or_default();
+        let debug = if self.protect_arguments {
+            Default::default()
+        } else {
+            error
+                .map(extract_response_debug_context_from_api_error)
+                .unwrap_or_default()
+        };
         self.session_telemetry.record_websocket_request(
             duration,
             error_message.as_deref(),
@@ -2545,8 +2637,10 @@ impl WebsocketTelemetry for ApiTelemetry {
         result: &std::result::Result<Option<std::result::Result<Message, Error>>, ApiError>,
         duration: Duration,
     ) {
-        self.session_telemetry
-            .record_websocket_event(result, duration);
+        if !self.protect_arguments {
+            self.session_telemetry
+                .record_websocket_event(result, duration);
+        }
     }
 }
 

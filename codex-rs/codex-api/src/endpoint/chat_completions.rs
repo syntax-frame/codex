@@ -356,11 +356,11 @@ async fn process_chat_sse(
 
         let event = match sse_result {
             Ok(event) => event,
-            Err(err) => {
+            Err(_) => {
                 let _ = tx_event
-                    .send(Err(ApiError::Stream(format!(
-                        "chat completions SSE error: {err}"
-                    ))))
+                    .send(Err(ApiError::Stream(
+                        "chat completions SSE framing error".to_string(),
+                    )))
                     .await;
                 break;
             }
@@ -374,8 +374,10 @@ async fn process_chat_sse(
             Ok(chunk) => chunk,
             Err(err) => {
                 debug!(
-                    "failed to parse chat completions SSE chunk: {err}; data={}",
-                    event.data
+                    error_category = ?err.classify(),
+                    error_line = err.line(),
+                    error_column = err.column(),
+                    "failed to parse chat completions SSE chunk"
                 );
                 continue;
             }
@@ -460,7 +462,10 @@ async fn process_chat_sse(
 }
 
 fn split_namespaced_tool_name(name: &str) -> (Option<String>, String) {
-    if let Some((namespace, tool_name)) = name.split_once("__") {
+    // Namespaces may themselves contain the Chat Completions separator. Split
+    // from the right so the function identity remains intact for routing and
+    // argument-privacy classification.
+    if let Some((namespace, tool_name)) = name.rsplit_once("__") {
         (Some(namespace.to_string()), tool_name.to_string())
     } else {
         (None, name.to_string())
@@ -502,4 +507,93 @@ struct ChatCompletionDeltaToolCall {
 struct ChatCompletionDeltaFunction {
     name: Option<String>,
     arguments: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use codex_client::TransportError;
+    use futures::stream;
+
+    use super::*;
+
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+
+    #[test]
+    fn nested_namespace_round_trips_without_changing_protected_tool_identity() {
+        for tool_name in ["agentapp_browser_act", "browser.act"] {
+            let flattened = namespaced_tool_name(Some("mcp__hostile"), tool_name);
+            let (namespace, reconstructed_name) = split_namespaced_tool_name(&flattened);
+            assert_eq!(namespace.as_deref(), Some("mcp__hostile"));
+            assert_eq!(reconstructed_name, tool_name);
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct TestLogSink {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
+        type Writer = TestLogSink;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            TestLogSink {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    impl Write for TestLogSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_chat_sse_logs_only_structural_parse_diagnostics() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(TestLogWriter {
+                buffer: Arc::clone(&buffer),
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let body = format!("data: {{\"id\":\"{SENTINEL}\",\"choices\":[\n\n");
+        let stream = stream::iter([Ok::<Bytes, TransportError>(Bytes::from(body))]);
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        process_chat_sse(Box::pin(stream), tx, Duration::from_secs(1)).await;
+        while rx.recv().await.is_some() {}
+
+        let logs = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("utf-8 logs");
+        assert!(logs.contains("failed to parse chat completions SSE chunk"));
+        assert!(!logs.contains(SENTINEL));
+    }
 }

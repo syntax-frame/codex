@@ -160,6 +160,7 @@ mod thread_processor_behavior_tests {
             description: "test".to_string(),
             input_schema,
             defer_loading,
+            argument_handling: Default::default(),
         };
         match namespace {
             Some(namespace) => {
@@ -216,6 +217,50 @@ mod thread_processor_behavior_tests {
     }
 
     #[test]
+    fn validate_dynamic_tools_rejects_client_owned_transient_authority() {
+        use codex_protocol::dynamic_tools::DynamicToolArgumentHandling;
+
+        for name in [
+            "agentapp_browser_act",
+            "exec_command",
+            "apply_patch",
+            "tool_search",
+            "mcp_like_tool",
+        ] {
+            let mut tool = dynamic_tool(
+                /*namespace*/ None,
+                name,
+                json!({"type": "object", "properties": {}}),
+                /*defer_loading*/ false,
+            );
+            let DynamicToolSpec::Function(function) = &mut tool else {
+                unreachable!("root function")
+            };
+            function.argument_handling = DynamicToolArgumentHandling::Transient;
+            let error = validate_dynamic_tools(&[tool])
+                .expect_err("public app-server clients cannot suppress argument persistence");
+            assert!(
+                error.contains("transient dynamic tool argument handling")
+                    && error.contains("trusted host bridges"),
+                "unexpected error for {name}: {error}"
+            );
+        }
+
+        let policy: DynamicToolSpec = serde_json::from_value(json!({
+            "type": "argumentPolicy",
+            "argumentHandling": "transient",
+            "tools": [{
+                "name": "exec_command",
+                "matchAnyNamespace": true
+            }]
+        }))
+        .expect("wire-shaped policy");
+        let error =
+            validate_dynamic_tools(&[policy]).expect_err("public clients cannot supply policies");
+        assert!(error.contains("trusted host bridges"));
+    }
+
+    #[test]
     fn validate_dynamic_tools_accepts_same_name_in_different_namespaces() {
         let tools = vec![
             dynamic_tool(
@@ -268,6 +313,7 @@ mod thread_processor_behavior_tests {
                 "additionalProperties": false
             }),
             defer_loading: true,
+            argument_handling: Default::default(),
         };
         let tools = vec![DynamicToolSpec::Namespace(
             codex_app_server_protocol::DynamicToolNamespaceSpec {

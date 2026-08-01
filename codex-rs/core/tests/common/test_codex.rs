@@ -36,6 +36,7 @@ use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
@@ -305,6 +306,7 @@ pub struct TestCodexBuilder {
     external_time_provider: Option<Arc<dyn TimeProvider>>,
     code_mode_host_program: Option<PathBuf>,
     history_mode: Option<ThreadHistoryMode>,
+    resume_dynamic_tools: Vec<DynamicToolSpec>,
 }
 
 impl TestCodexBuilder {
@@ -330,6 +332,11 @@ impl TestCodexBuilder {
 
     pub fn with_history_mode(mut self, history_mode: ThreadHistoryMode) -> Self {
         self.history_mode = Some(history_mode);
+        self
+    }
+
+    pub fn with_resume_dynamic_tools(mut self, dynamic_tools: Vec<DynamicToolSpec>) -> Self {
+        self.resume_dynamic_tools = dynamic_tools;
         self
     }
 
@@ -675,12 +682,13 @@ impl TestCodexBuilder {
             }
             (Some(path), None) => {
                 let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
-                Box::pin(thread_manager.resume_thread_from_rollout(
+                Box::pin(thread_manager.resume_thread_from_rollout_with_tools(
                     config.clone(),
                     path,
                     auth_manager,
                     /*parent_trace*/ None,
                     self.supports_openai_form_elicitation,
+                    std::mem::take(&mut self.resume_dynamic_tools),
                 ))
                 .await?
             }
@@ -1250,6 +1258,7 @@ pub fn test_codex() -> TestCodexBuilder {
         external_time_provider: None,
         code_mode_host_program: None,
         history_mode: None,
+        resume_dynamic_tools: Vec::new(),
     }
 }
 

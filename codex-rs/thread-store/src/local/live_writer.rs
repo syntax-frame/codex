@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use codex_protocol::ThreadId;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicy;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
@@ -29,10 +30,11 @@ pub(super) async fn create_thread(
     let thread_id = params.thread_id;
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     let history_mode = params.history_mode;
+    let argument_policy = DynamicToolArgumentPolicy::from_dynamic_tools(&params.dynamic_tools);
     store.ensure_live_recorder_absent(thread_id).await?;
     let recorder = create_thread::create_thread(store, params).await?;
     store
-        .insert_live_recorder(thread_id, recorder, history_mode)
+        .insert_live_recorder(thread_id, recorder, history_mode, argument_policy)
         .await
 }
 
@@ -40,6 +42,7 @@ pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
 ) -> ThreadStoreResult<()> {
+    let argument_policy = DynamicToolArgumentPolicy::from_dynamic_tools(&params.dynamic_tools);
     let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
     store.ensure_live_recorder_absent(params.thread_id).await?;
     let history_mode = if let Some(history) = params.history.as_deref() {
@@ -104,7 +107,7 @@ pub(super) async fn resume_thread(
             message: format!("failed to resume local thread recorder: {err}"),
         })?;
     store
-        .insert_live_recorder(params.thread_id, recorder, history_mode)
+        .insert_live_recorder(params.thread_id, recorder, history_mode, argument_policy)
         .await
 }
 
@@ -144,16 +147,17 @@ pub(super) async fn shutdown_thread(
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    let (recorder, history_mode) = live_writer_parts(store, thread_id).await?;
+    let (recorder, history_mode, argument_policy) = live_writer_parts(store, thread_id).await?;
     let rollout_path = recorder.rollout_path().to_path_buf();
     if matches!(history_mode, ThreadHistoryMode::Legacy) {
         recorder.shutdown().await.map_err(thread_store_io_error)?;
     } else {
         recorder.shutdown().await.map_err(thread_store_io_error)?;
-        if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
+        if let Err(err) = super::thread_history_materialization::materialize_to_sqlite_with_policy(
             store,
             thread_id,
             rollout_path.as_path(),
+            &argument_policy,
         )
         .await
         {
@@ -267,12 +271,20 @@ enum RolloutWriteOp {
 async fn live_writer_parts(
     store: &LocalThreadStore,
     thread_id: ThreadId,
-) -> ThreadStoreResult<(RolloutRecorder, ThreadHistoryMode)> {
+) -> ThreadStoreResult<(
+    RolloutRecorder,
+    ThreadHistoryMode,
+    DynamicToolArgumentPolicy,
+)> {
     let live_recorders = store.live_recorders.lock().await;
     let entry = live_recorders
         .get(&thread_id)
         .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
-    Ok((entry.recorder.clone(), entry.history_mode))
+    Ok((
+        entry.recorder.clone(),
+        entry.history_mode,
+        entry.argument_policy.clone(),
+    ))
 }
 
 async fn write_and_project(
@@ -284,7 +296,7 @@ async fn write_and_project(
     // shutdown/discard/delete removes it. Keep the lookup defensive so late writes fail after
     // teardown.
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-    let (recorder, history_mode) = live_writer_parts(store, thread_id).await?;
+    let (recorder, history_mode, argument_policy) = live_writer_parts(store, thread_id).await?;
     let sync_rollout_path = matches!(&write_op, RolloutWriteOp::Persist | RolloutWriteOp::Flush);
     let write_op = match write_op {
         RolloutWriteOp::AppendItems(items) => {
@@ -304,10 +316,11 @@ async fn write_and_project(
         // SQLite is a rebuildable view. The flush barrier must win before projection starts so it
         // can lag JSONL after failure, but can never get ahead of canonical history.
         durable_write(&recorder, write_op).await?;
-        if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
+        if let Err(err) = super::thread_history_materialization::materialize_to_sqlite_with_policy(
             store,
             thread_id,
             rollout_path,
+            &argument_policy,
         )
         .await
         {

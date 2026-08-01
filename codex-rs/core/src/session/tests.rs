@@ -130,6 +130,7 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::NetworkApprovalProtocol;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
+use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::RealtimeAudioFrame;
 use codex_protocol::protocol::RealtimeConversationListVoicesResponseEvent;
 use codex_protocol::protocol::RealtimeVoice;
@@ -5446,6 +5447,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         active_turn: Mutex::new(None),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        dynamic_tool_argument_policy:
+            codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+                &turn_context.dynamic_tools,
+            ),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     };
@@ -7589,6 +7594,10 @@ where
         "turn_id".to_string(),
         skills_snapshot,
     ));
+    let dynamic_tool_argument_policy =
+        codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+            &session_configuration.dynamic_tools,
+        );
     let session = Arc::new(Session {
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -7604,6 +7613,7 @@ where
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
+        dynamic_tool_argument_policy,
         next_internal_sub_id: AtomicU64::new(0),
     });
 
@@ -7633,6 +7643,174 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
+}
+
+fn protected_browser_dynamic_tools() -> Vec<DynamicToolSpec> {
+    use codex_protocol::dynamic_tools::DynamicToolArgumentHandling;
+    use codex_protocol::dynamic_tools::DynamicToolArgumentIdentity;
+    use codex_protocol::dynamic_tools::DynamicToolArgumentPolicySpec;
+    use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+
+    vec![
+        DynamicToolSpec::Function(DynamicToolFunctionSpec {
+            name: "agentapp_browser_act".to_string(),
+            description: "browser action".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            defer_loading: false,
+            argument_handling: DynamicToolArgumentHandling::Transient,
+        }),
+        DynamicToolSpec::ArgumentPolicy(
+            DynamicToolArgumentPolicySpec::trusted_transient(vec![DynamicToolArgumentIdentity {
+                namespace: None,
+                name: "agentapp_browser_act".to_string(),
+                match_any_namespace: true,
+                match_case_insensitive: true,
+            }])
+            .expect("trusted browser policy"),
+        ),
+    ]
+}
+
+#[test]
+fn transient_dynamic_tool_resume_requires_fresh_trusted_host_authority() {
+    let fresh = protected_browser_dynamic_tools();
+    let retained =
+        retain_authorized_transient_dynamic_tools(fresh.clone()).expect("fresh trusted tools");
+    assert_eq!(retained.len(), fresh.len());
+
+    let serialized = serde_json::to_string(&fresh).expect("serialize dynamic tools");
+    let resumed: Vec<DynamicToolSpec> =
+        serde_json::from_str(&serialized).expect("deserialize dynamic tools");
+    let error = retain_authorized_transient_dynamic_tools(resumed)
+        .expect_err("wire metadata must not restore privacy authority");
+    assert!(error.contains("fresh trusted host registration"));
+}
+
+#[tokio::test]
+async fn transient_dynamic_tool_arguments_are_live_only_and_canonical_event_is_content_free() {
+    use codex_protocol::dynamic_tools::DynamicToolCallRequest;
+    use codex_protocol::items::DynamicToolCallItem;
+    use codex_protocol::items::DynamicToolCallStatus;
+    use codex_protocol::items::TurnItem;
+
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+    let (session, turn_context, rx_event) =
+        make_session_and_context_with_dynamic_tools_and_rx(protected_browser_dynamic_tools()).await;
+    let request = DynamicToolCallRequest {
+        call_id: "browser-call-1".to_string(),
+        turn_id: turn_context.sub_id.clone(),
+        started_at_ms: 123,
+        namespace: None,
+        tool: "agentapp_browser_act".to_string(),
+        arguments: serde_json::json!({
+            "action": "type",
+            "text": SENTINEL,
+            "encoded": "UkFXX0JST1dTRVJfQVJHVU1FTlRfU0VOVElORUw="
+        }),
+        arguments_transient: true,
+    };
+    session
+        .emit_transient_dynamic_tool_call_started(
+            &turn_context,
+            TurnItem::DynamicToolCall(DynamicToolCallItem {
+                id: request.call_id.clone(),
+                namespace: None,
+                tool: request.tool.clone(),
+                arguments: serde_json::json!({}),
+                arguments_transient: true,
+                status: DynamicToolCallStatus::InProgress,
+                content_items: None,
+                success: None,
+                error: None,
+                duration: None,
+            }),
+            request.clone(),
+        )
+        .await;
+
+    let canonical = rx_event.recv().await.expect("canonical event");
+    let EventMsg::ItemStarted(started) = canonical.msg else {
+        panic!("content-free item started");
+    };
+    let TurnItem::DynamicToolCall(item) = started.item else {
+        panic!("dynamic tool item");
+    };
+    assert!(item.arguments_transient);
+    assert_eq!(item.arguments, serde_json::json!({}));
+    assert!(!serde_json::to_string(&item).unwrap().contains(SENTINEL));
+
+    let live = rx_event.recv().await.expect("live-only request");
+    let EventMsg::DynamicToolCallRequest(live_request) = live.msg else {
+        panic!("raw live request");
+    };
+    assert_eq!(live_request.arguments, request.arguments);
+    assert!(live_request.arguments_transient);
+
+    let projected =
+        session.project_event_for_argument_privacy(EventMsg::DynamicToolCallRequest(request));
+    let projected_json = serde_json::to_string(&projected).expect("projected event JSON");
+    assert!(!projected_json.contains(SENTINEL));
+    assert!(projected_json.contains("\"arguments\":{}"));
+}
+
+#[tokio::test]
+async fn protected_turn_events_keep_structural_status_without_provider_strings() {
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+    let (protected, _turn_context, _rx_event) =
+        make_session_and_context_with_dynamic_tools_and_rx(protected_browser_dynamic_tools()).await;
+    let error = protected.project_event_for_argument_privacy(EventMsg::Error(ErrorEvent {
+        message: format!("provider reflected {SENTINEL}"),
+        codex_error_info: Some(CodexErrorInfo::BadRequest),
+    }));
+    let EventMsg::Error(error) = error else {
+        panic!("protected error event");
+    };
+    assert_eq!(error.message, "A protected turn failed.");
+    assert_eq!(error.codex_error_info, Some(CodexErrorInfo::BadRequest));
+
+    let stream_error =
+        protected.project_event_for_argument_privacy(EventMsg::StreamError(StreamErrorEvent {
+            message: format!("retry {SENTINEL}"),
+            codex_error_info: Some(CodexErrorInfo::ResponseStreamDisconnected {
+                http_status_code: Some(503),
+            }),
+            additional_details: Some(SENTINEL.to_string()),
+        }));
+    let EventMsg::StreamError(stream_error) = stream_error else {
+        panic!("protected stream error event");
+    };
+    assert_eq!(
+        stream_error.message,
+        "The protected response stream was interrupted."
+    );
+    assert!(stream_error.additional_details.is_none());
+    assert_eq!(
+        stream_error.codex_error_info,
+        Some(CodexErrorInfo::ResponseStreamDisconnected {
+            http_status_code: Some(503),
+        })
+    );
+
+    let completed = protected.project_event_for_argument_privacy(EventMsg::RawResponseCompleted(
+        RawResponseCompletedEvent {
+            response_id: SENTINEL.to_string(),
+            token_usage: None,
+        },
+    ));
+    let EventMsg::RawResponseCompleted(completed) = completed else {
+        panic!("protected completion event");
+    };
+    assert_eq!(completed.response_id, "protected-response");
+
+    let (unprotected, _turn_context, _rx_event) = make_session_and_context_with_rx().await;
+    let error = unprotected.project_event_for_argument_privacy(EventMsg::Error(ErrorEvent {
+        message: SENTINEL.to_string(),
+        codex_error_info: None,
+    }));
+    let EventMsg::Error(error) = error else {
+        panic!("unprotected error event");
+    };
+    assert_eq!(error.message, SENTINEL);
 }
 
 #[tokio::test]

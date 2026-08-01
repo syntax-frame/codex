@@ -397,6 +397,7 @@ fn dynamic_tool(namespace: Option<&str>, name: &str, defer_loading: bool) -> Dyn
             "additionalProperties": false,
         }),
         defer_loading,
+        argument_handling: Default::default(),
     };
     match namespace {
         Some(namespace) => {

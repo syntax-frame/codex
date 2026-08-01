@@ -89,6 +89,7 @@ async fn dynamic_tool_audio_exceeding_the_output_budget_is_omitted() -> Result<(
                     "additionalProperties": false,
                 }),
                 defer_loading: false,
+                argument_handling: Default::default(),
             },
         )],
     });

@@ -1391,6 +1391,31 @@ impl ThreadManagerState {
         (!originator.is_empty()).then_some(originator)
     }
 
+    /// In-process children and forks inherit the currently authorized dynamic
+    /// tool catalog from their live source thread. A missing source fails
+    /// closed with no dynamic tools; persisted history never restores this
+    /// authority on its own.
+    async fn inherited_dynamic_tools_for_spawn(
+        &self,
+        session_source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> Vec<codex_protocol::dynamic_tools::DynamicToolSpec> {
+        let inherited_thread_id = match session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) => Some(*parent_thread_id),
+            _ => parent_thread_id.or(forked_from_thread_id),
+        };
+        let Some(thread_id) = inherited_thread_id else {
+            return Vec::new();
+        };
+        let Ok(thread) = self.get_thread(thread_id).await else {
+            return Vec::new();
+        };
+        thread.session.dynamic_tools_snapshot().await
+    }
+
     async fn effective_originator(
         &self,
         initial_history: &InitialHistory,
@@ -1678,6 +1703,16 @@ impl ThreadManagerState {
                 threads.remove(&resumed.conversation_id);
             }
         }
+        let dynamic_tools = if dynamic_tools.is_empty() {
+            self.inherited_dynamic_tools_for_spawn(
+                &session_source,
+                parent_thread_id,
+                forked_from_thread_id,
+            )
+            .await
+        } else {
+            dynamic_tools
+        };
         let user_instructions = self
             .user_instructions_for_spawn(&session_source, parent_thread_id, forked_from_thread_id)
             .await;

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicy;
 use codex_protocol::models::ResponseItem;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -50,6 +51,7 @@ struct EnabledCompactionTraceContext {
     compaction_id: CompactionId,
     model: String,
     provider_name: String,
+    argument_policy: DynamicToolArgumentPolicy,
 }
 
 /// One upstream request attempt made while computing a compaction checkpoint.
@@ -103,6 +105,26 @@ impl CompactionTraceContext {
         model: String,
         provider_name: String,
     ) -> Self {
+        Self::enabled_with_argument_policy(
+            writer,
+            thread_id,
+            codex_turn_id,
+            compaction_id,
+            model,
+            provider_name,
+            DynamicToolArgumentPolicy::default(),
+        )
+    }
+
+    pub fn enabled_with_argument_policy(
+        writer: Arc<TraceWriter>,
+        thread_id: AgentThreadId,
+        codex_turn_id: CodexTurnId,
+        compaction_id: CompactionId,
+        model: String,
+        provider_name: String,
+        argument_policy: DynamicToolArgumentPolicy,
+    ) -> Self {
         Self {
             state: CompactionTraceContextState::Enabled(EnabledCompactionTraceContext {
                 writer,
@@ -111,6 +133,7 @@ impl CompactionTraceContext {
                 compaction_id,
                 model,
                 provider_name,
+                argument_policy,
             }),
         }
     }
@@ -144,9 +167,15 @@ impl CompactionTraceContext {
         let CompactionTraceContextState::Enabled(context) = &self.state else {
             return;
         };
+        let Ok(mut projected_checkpoint) = serde_json::to_value(checkpoint) else {
+            return;
+        };
+        context
+            .argument_policy
+            .redact_json(&mut projected_checkpoint);
         let checkpoint_payload = match context
             .writer
-            .write_json_payload(RawPayloadKind::CompactionCheckpoint, checkpoint)
+            .write_json_payload(RawPayloadKind::CompactionCheckpoint, &projected_checkpoint)
         {
             Ok(payload_ref) => payload_ref,
             Err(err) => {
@@ -183,10 +212,17 @@ impl CompactionTraceAttempt {
         let CompactionTraceAttemptState::Enabled(attempt) = &self.state else {
             return;
         };
+        let Ok(mut projected_request) = serde_json::to_value(request) else {
+            return;
+        };
+        attempt
+            .context
+            .argument_policy
+            .redact_json(&mut projected_request);
         let Some(request_payload) = write_json_payload_best_effort(
             &attempt.context.writer,
             RawPayloadKind::CompactionRequest,
-            request,
+            &projected_request,
         ) else {
             return;
         };
@@ -215,7 +251,14 @@ impl CompactionTraceAttempt {
             return;
         };
         let response_payload = TracedCompactionCompleted {
-            output_items: output_items.iter().map(trace_response_item_json).collect(),
+            output_items: output_items
+                .iter()
+                .map(trace_response_item_json)
+                .map(|mut item| {
+                    attempt.context.argument_policy.redact_json(&mut item);
+                    item
+                })
+                .collect(),
         };
         let Some(response_payload) = write_json_payload_best_effort(
             &attempt.context.writer,
@@ -253,7 +296,11 @@ impl CompactionTraceAttempt {
             RawTraceEventPayload::CompactionRequestFailed {
                 compaction_id: attempt.context.compaction_id.clone(),
                 compaction_request_id: attempt.compaction_request_id.clone(),
-                error: error.to_string(),
+                error: if attempt.context.argument_policy.is_empty() {
+                    error.to_string()
+                } else {
+                    "compaction failed while transient tool arguments were active".to_string()
+                },
             },
         );
     }

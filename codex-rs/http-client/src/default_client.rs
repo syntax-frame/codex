@@ -154,7 +154,7 @@ impl RequestBuilder {
                         method = %self.method,
                         url = %self.url,
                         status = %response.status(),
-                        headers = ?response.headers(),
+                        response_header_count = response.headers().len(),
                         version = ?response.version(),
                         "Request completed"
                     );
@@ -169,7 +169,11 @@ impl RequestBuilder {
                         method = %self.method,
                         url = %self.url,
                         status = status.map(|s| s.as_u16()),
-                        error = %error,
+                        timeout = error.is_timeout(),
+                        connect = error.is_connect(),
+                        request = error.is_request(),
+                        body = error.is_body(),
+                        decode = error.is_decode(),
                         "Request failed"
                     );
                 }
@@ -205,6 +209,10 @@ fn trace_headers() -> HeaderMap {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
+
     use super::*;
     use opentelemetry::propagation::Extractor;
     use opentelemetry::propagation::TextMapPropagator;
@@ -215,6 +223,49 @@ mod tests {
     use tracing::trace_span;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_test::internal::MockWriter;
+
+    #[tokio::test]
+    async fn response_logging_omits_provider_header_values() {
+        const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read request");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nx-provider-reflection: {SENTINEL}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .expect("write response");
+        });
+        let buffer: &'static std::sync::Mutex<Vec<u8>> =
+            Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(MockWriter::new(buffer))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        HttpClient::new(reqwest::Client::new())
+            .get(format!("http://{address}/responses"))
+            .send()
+            .await
+            .expect("request should succeed");
+        server.join().expect("join test server");
+
+        let logs = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("response log should be utf-8");
+        assert!(!logs.contains(SENTINEL));
+        assert!(logs.contains("response_header_count=3"));
+    }
 
     #[test]
     fn inject_trace_headers_uses_current_span_context() {

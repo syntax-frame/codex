@@ -7,11 +7,17 @@ use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::dynamic_tools::DynamicToolArgumentHandling;
+use codex_protocol::dynamic_tools::DynamicToolArgumentIdentity;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicySpec;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
+use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -43,6 +49,7 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::time::Duration;
 use tracing_subscriber::prelude::*;
@@ -51,6 +58,51 @@ use wiremock::Mock;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
+
+const BROWSER_ARGUMENT_SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+const BROWSER_ARGUMENT_SENTINEL_BASE64: &str = "UkFXX0JST1dTRVJfQVJHVU1FTlRfU0VOVElORUw=";
+
+fn read_artifact_tree(root: &Path) -> Result<String> {
+    let mut artifact = String::new();
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            artifact.push_str(&read_artifact_tree(&path)?);
+        } else {
+            artifact.push_str(&String::from_utf8_lossy(&fs::read(path)?));
+        }
+    }
+    Ok(artifact)
+}
+
+fn protected_browser_dynamic_tools(tool_name: &str) -> Vec<DynamicToolSpec> {
+    vec![
+        DynamicToolSpec::Function(DynamicToolFunctionSpec {
+            name: tool_name.to_string(),
+            description: "Act on a managed local browser tab.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "target_id": {"type": "string"},
+                    "text": {"type": "string"},
+                },
+                "additionalProperties": false,
+            }),
+            defer_loading: false,
+            argument_handling: DynamicToolArgumentHandling::Transient,
+        }),
+        DynamicToolSpec::ArgumentPolicy(
+            DynamicToolArgumentPolicySpec::trusted_transient(vec![DynamicToolArgumentIdentity {
+                namespace: None,
+                name: tool_name.to_string(),
+                match_any_namespace: true,
+                match_case_insensitive: true,
+            }])
+            .expect("trusted browser argument policy"),
+        ),
+    ]
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_thread_is_recorded_in_state_db() -> Result<()> {
@@ -139,6 +191,7 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
                 description: tool_description.to_string(),
                 input_schema: input_schema.clone(),
                 defer_loading: false,
+                argument_handling: Default::default(),
             },
         )],
     });
@@ -215,6 +268,471 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
         })
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_browser_arguments_are_live_only_across_rollout_sqlite_and_failed_resume()
+-> Result<()> {
+    let server = start_mock_server().await;
+    let call_id = "browser-call-provenance";
+    let resumed_call_id = "browser-call-after-resume";
+    let tool_name = "agentapp_browser_act";
+    mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                ev_response_created("resp-browser"),
+                ev_function_call(
+                    call_id,
+                    tool_name,
+                    &json!({
+                        "action": "type",
+                        "target_id": "target-safe",
+                        "aliases": {
+                            "pwd": BROWSER_ARGUMENT_SENTINEL,
+                            "encoded": BROWSER_ARGUMENT_SENTINEL_BASE64,
+                        },
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-browser"),
+            ]),
+            responses::sse(vec![
+                ev_response_created("resp-browser-followup"),
+                ev_completed("resp-browser-followup"),
+            ]),
+            responses::sse(vec![
+                ev_response_created("resp-browser-resumed"),
+                ev_function_call(
+                    resumed_call_id,
+                    tool_name,
+                    &json!({
+                        "action": "type",
+                        "target_id": "target-after-resume",
+                        "aliases": {
+                            "secret_value": BROWSER_ARGUMENT_SENTINEL,
+                            "encoded": BROWSER_ARGUMENT_SENTINEL_BASE64,
+                        },
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-browser-resumed"),
+            ]),
+            responses::sse(vec![
+                ev_response_created("resp-browser-resumed-followup"),
+                ev_completed("resp-browser-resumed-followup"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Sqlite)
+            .expect("test config should allow feature update");
+    });
+    let base_test = builder.build(&server).await?;
+    let dynamic_tools = protected_browser_dynamic_tools(tool_name);
+    let started = base_test
+        .thread_manager
+        .start_thread_with_tools(base_test.config.clone(), dynamic_tools.clone())
+        .await?;
+    let rollout_path = started
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    started
+        .thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "exercise the browser tool".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    let EventMsg::DynamicToolCallRequest(request) = wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::DynamicToolCallRequest(_))
+    })
+    .await
+    else {
+        unreachable!("event guard guarantees DynamicToolCallRequest");
+    };
+    assert!(request.arguments_transient);
+    assert_eq!(request.tool, tool_name);
+    assert_eq!(request.call_id, call_id);
+    assert!(
+        request
+            .arguments
+            .to_string()
+            .contains(BROWSER_ARGUMENT_SENTINEL)
+    );
+    started
+        .thread
+        .submit(Op::DynamicToolResponse {
+            id: request.call_id,
+            response: DynamicToolResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "typed outcome: secure_handoff".to_string(),
+                }],
+                success: false,
+            },
+        })
+        .await?;
+    wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let rollout = fs::read_to_string(&rollout_path)?;
+    let first_line = rollout.lines().next().expect("session metadata line");
+    serde_json::from_str::<RolloutLine>(first_line)
+        .unwrap_or_else(|error| panic!("protected session metadata must decode: {error}"));
+    assert!(rollout.contains(tool_name));
+    assert!(rollout.contains(call_id));
+    assert!(!rollout.contains(BROWSER_ARGUMENT_SENTINEL));
+    assert!(!rollout.contains(BROWSER_ARGUMENT_SENTINEL_BASE64));
+    let before_resume = read_artifact_tree(base_test.codex_home_path())?;
+    assert!(!before_resume.contains(BROWSER_ARGUMENT_SENTINEL));
+    assert!(!before_resume.contains(BROWSER_ARGUMENT_SENTINEL_BASE64));
+
+    let mut resume_builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Sqlite)
+            .expect("test config should allow feature update");
+    });
+    let resume_error = match resume_builder
+        .resume(&server, base_test.home.clone(), rollout_path.clone())
+        .await
+    {
+        Ok(_) => panic!("resume without fresh trusted host policy must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        resume_error
+            .to_string()
+            .contains("fresh trusted host registration"),
+        "unexpected resume error: {resume_error:#}"
+    );
+    let after_resume = read_artifact_tree(base_test.codex_home_path())?;
+    assert!(!after_resume.contains(BROWSER_ARGUMENT_SENTINEL));
+    assert!(!after_resume.contains(BROWSER_ARGUMENT_SENTINEL_BASE64));
+
+    let mut trusted_resume_builder = test_codex()
+        .with_resume_dynamic_tools(dynamic_tools)
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Sqlite)
+                .expect("test config should allow feature update");
+        });
+    let resumed = trusted_resume_builder
+        .resume(&server, base_test.home.clone(), rollout_path.clone())
+        .await?;
+    resumed
+        .codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "exercise the protected browser tool after resume".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let EventMsg::DynamicToolCallRequest(resumed_request) =
+        wait_for_event(&resumed.codex, |event| {
+            matches!(event, EventMsg::DynamicToolCallRequest(_))
+        })
+        .await
+    else {
+        unreachable!("event guard guarantees DynamicToolCallRequest");
+    };
+    assert!(resumed_request.arguments_transient);
+    assert_eq!(resumed_request.tool, tool_name);
+    assert_eq!(resumed_request.call_id, resumed_call_id);
+    assert!(
+        resumed_request
+            .arguments
+            .to_string()
+            .contains(BROWSER_ARGUMENT_SENTINEL)
+    );
+    resumed
+        .codex
+        .submit(Op::DynamicToolResponse {
+            id: resumed_request.call_id,
+            response: DynamicToolResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "typed outcome: denied".to_string(),
+                }],
+                success: false,
+            },
+        })
+        .await?;
+    wait_for_event(&resumed.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let appended_call_id = "browser-call-direct-append";
+    resumed
+        .codex
+        .append_rollout_items(&[RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            call_id: appended_call_id.to_string(),
+            name: tool_name.to_string(),
+            namespace: None,
+            arguments: json!({
+                "text": BROWSER_ARGUMENT_SENTINEL,
+                "encoded": BROWSER_ARGUMENT_SENTINEL_BASE64,
+            })
+            .to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        })])
+        .await?;
+    resumed.codex.flush_rollout().await?;
+
+    let after_authorized_resume = read_artifact_tree(base_test.codex_home_path())?;
+    assert!(after_authorized_resume.contains(resumed_call_id));
+    assert!(after_authorized_resume.contains(appended_call_id));
+    assert!(!after_authorized_resume.contains(BROWSER_ARGUMENT_SENTINEL));
+    assert!(!after_authorized_resume.contains(BROWSER_ARGUMENT_SENTINEL_BASE64));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_transient_browser_call_keeps_only_content_free_provenance() -> Result<()> {
+    let server = start_mock_server().await;
+    let call_id = "browser-call-interrupted";
+    let tool_name = "agentapp_browser_act";
+    mount_sse_once(
+        &server,
+        responses::sse(vec![
+            ev_response_created("resp-browser-interrupted"),
+            ev_function_call(
+                call_id,
+                tool_name,
+                &json!({
+                    "action": "type",
+                    "target_id": "target-interrupted",
+                    "text": BROWSER_ARGUMENT_SENTINEL,
+                    "encoded": BROWSER_ARGUMENT_SENTINEL_BASE64,
+                })
+                .to_string(),
+            ),
+            ev_completed("resp-browser-interrupted"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Sqlite)
+            .expect("test config should allow feature update");
+    });
+    let base_test = builder.build(&server).await?;
+    let started = base_test
+        .thread_manager
+        .start_thread_with_tools(
+            base_test.config.clone(),
+            protected_browser_dynamic_tools(tool_name),
+        )
+        .await?;
+    let rollout_path = started
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    started
+        .thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "start a browser call, then interrupt it".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    let EventMsg::DynamicToolCallRequest(request) = wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::DynamicToolCallRequest(_))
+    })
+    .await
+    else {
+        unreachable!("event guard guarantees DynamicToolCallRequest");
+    };
+    assert!(request.arguments_transient);
+    assert!(
+        request
+            .arguments
+            .to_string()
+            .contains(BROWSER_ARGUMENT_SENTINEL)
+    );
+
+    started.thread.submit(Op::Interrupt).await?;
+    wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    started.thread.flush_rollout().await?;
+
+    let rollout = fs::read_to_string(&rollout_path)?;
+    assert!(rollout.contains(tool_name));
+    assert!(rollout.contains(call_id));
+    assert!(
+        rollout.contains("\"arguments\":{}")
+            || rollout.contains("\"arguments\":\"{}\"")
+            || rollout.contains("\\\"arguments\\\":{}"),
+        "interrupted call must retain only an empty argument projection: {rollout}"
+    );
+    assert!(!rollout.contains(BROWSER_ARGUMENT_SENTINEL));
+    assert!(!rollout.contains(BROWSER_ARGUMENT_SENTINEL_BASE64));
+    let artifacts = read_artifact_tree(base_test.codex_home_path())?;
+    assert!(!artifacts.contains(BROWSER_ARGUMENT_SENTINEL));
+    assert!(!artifacts.contains(BROWSER_ARGUMENT_SENTINEL_BASE64));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_transient_browser_call_is_content_free_across_persistence_and_resume()
+-> Result<()> {
+    let server = start_mock_server().await;
+    let call_id = "browser-call-rejected";
+    let tool_name = "agentapp_browser_act";
+    mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse(vec![
+                ev_response_created("resp-browser-rejected"),
+                ev_function_call(
+                    call_id,
+                    tool_name,
+                    &json!({
+                        "action": "type",
+                        "target_id": "stale-target",
+                        "aliases": {
+                            "password": BROWSER_ARGUMENT_SENTINEL,
+                            "encoded": BROWSER_ARGUMENT_SENTINEL_BASE64,
+                        },
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-browser-rejected"),
+            ]),
+            responses::sse(vec![
+                ev_response_created("resp-browser-rejected-followup"),
+                responses::ev_assistant_message(
+                    "browser-rejected-message",
+                    "The unavailable browser call was rejected.",
+                ),
+                ev_completed("resp-browser-rejected-followup"),
+            ]),
+            responses::sse(vec![
+                ev_response_created("resp-browser-rejected-resume"),
+                responses::ev_assistant_message(
+                    "browser-rejected-resume-message",
+                    "The protected thread resumed without restoring the disabled tool.",
+                ),
+                ev_completed("resp-browser-rejected-resume"),
+            ]),
+        ],
+    )
+    .await;
+
+    let trusted_policy = DynamicToolSpec::ArgumentPolicy(
+        DynamicToolArgumentPolicySpec::trusted_transient(vec![DynamicToolArgumentIdentity {
+            namespace: None,
+            name: tool_name.to_string(),
+            match_any_namespace: true,
+            match_case_insensitive: true,
+        }])
+        .expect("trusted browser argument policy"),
+    );
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Sqlite)
+            .expect("test config should allow feature update");
+    });
+    let base_test = builder.build(&server).await?;
+    let started = base_test
+        .thread_manager
+        .start_thread_with_tools(base_test.config.clone(), vec![trusted_policy.clone()])
+        .await?;
+    let rollout_path = started
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    started
+        .thread
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "attempt the browser tool while it is disabled".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    started.thread.flush_rollout().await?;
+
+    let rollout = fs::read_to_string(&rollout_path)?;
+    assert!(rollout.contains(tool_name));
+    assert!(rollout.contains(call_id));
+    assert!(rollout.contains("unsupported call"));
+    assert!(!rollout.contains(BROWSER_ARGUMENT_SENTINEL));
+    assert!(!rollout.contains(BROWSER_ARGUMENT_SENTINEL_BASE64));
+    let before_resume = read_artifact_tree(base_test.codex_home_path())?;
+    assert!(before_resume.contains(tool_name));
+    assert!(before_resume.contains(call_id));
+    assert!(before_resume.contains("unsupported call"));
+    assert!(!before_resume.contains(BROWSER_ARGUMENT_SENTINEL));
+    assert!(!before_resume.contains(BROWSER_ARGUMENT_SENTINEL_BASE64));
+
+    let mut resume_builder = test_codex()
+        .with_resume_dynamic_tools(vec![trusted_policy])
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Sqlite)
+                .expect("test config should allow feature update");
+        });
+    let resumed = resume_builder
+        .resume(&server, base_test.home.clone(), rollout_path)
+        .await?;
+    resumed
+        .submit_turn("continue after the rejected call")
+        .await?;
+    resumed.codex.flush_rollout().await?;
+
+    let after_resume = read_artifact_tree(base_test.codex_home_path())?;
+    assert!(after_resume.contains(tool_name));
+    assert!(after_resume.contains(call_id));
+    assert!(after_resume.contains("unsupported call"));
+    assert!(!after_resume.contains(BROWSER_ARGUMENT_SENTINEL));
+    assert!(!after_resume.contains(BROWSER_ARGUMENT_SENTINEL_BASE64));
     Ok(())
 }
 

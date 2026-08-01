@@ -5,8 +5,15 @@ use std::time::Duration;
 use chrono::Utc;
 use codex_app_server_protocol::ThreadItem;
 use codex_protocol::ThreadId;
+use codex_protocol::dynamic_tools::DynamicToolArgumentHandling;
+use codex_protocol::dynamic_tools::DynamicToolArgumentIdentity;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicySpec;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::DynamicToolCallItem;
+use codex_protocol::items::DynamicToolCallStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::BaseInstructions;
@@ -30,6 +37,7 @@ use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
 use crate::ListTurnsParams;
+use crate::ResumeThreadParams;
 use crate::SortDirection;
 use crate::StoredTurnItemsView;
 use crate::ThreadPersistenceMetadata;
@@ -851,6 +859,116 @@ async fn shutdown_materializes_items_queued_without_a_flush() {
     .await
     .expect("read projected turns");
     assert_eq!(projected_turns, 1);
+}
+
+#[tokio::test]
+async fn fresh_resume_policy_redacts_legacy_browser_arguments_before_sqlite_materialization() {
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let initial_store = LocalThreadStore::new(config.clone(), /*state_db*/ None);
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&initial_store, thread_id).await;
+    let recorder = initial_store
+        .live_recorders
+        .lock()
+        .await
+        .get(&thread_id)
+        .expect("live recorder")
+        .recorder
+        .clone();
+    recorder.persist().await.expect("persist session metadata");
+    recorder
+        .record_canonical_items(&[
+            turn_started("turn-legacy"),
+            completed_item(
+                thread_id,
+                "turn-legacy",
+                TurnItem::DynamicToolCall(DynamicToolCallItem {
+                    id: "legacy-browser-call".to_string(),
+                    namespace: None,
+                    tool: "agentapp_browser_act".to_string(),
+                    arguments: serde_json::json!({
+                        "action": "type",
+                        "text": SENTINEL,
+                        "encoded": "UkFXX0JST1dTRVJfQVJHVU1FTlRfU0VOVElORUw=",
+                    }),
+                    arguments_transient: false,
+                    status: DynamicToolCallStatus::Completed,
+                    content_items: None,
+                    success: Some(true),
+                    error: None,
+                    duration: Some(Duration::from_millis(5)),
+                }),
+            ),
+            turn_completed("turn-legacy"),
+        ])
+        .await
+        .expect("queue legacy raw rollout");
+    recorder.flush().await.expect("flush legacy raw rollout");
+    let rollout_path = recorder.rollout_path().to_path_buf();
+    let raw_rollout = fs::read_to_string(&rollout_path).expect("read raw rollout");
+    assert!(raw_rollout.contains(SENTINEL));
+    initial_store.live_recorders.lock().await.remove(&thread_id);
+    drop(initial_store);
+
+    let protected_tools = vec![
+        DynamicToolSpec::Function(DynamicToolFunctionSpec {
+            name: "agentapp_browser_act".to_string(),
+            description: "Act on a managed browser tab.".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            defer_loading: false,
+            argument_handling: DynamicToolArgumentHandling::Transient,
+        }),
+        DynamicToolSpec::ArgumentPolicy(
+            DynamicToolArgumentPolicySpec::trusted_transient(vec![DynamicToolArgumentIdentity {
+                namespace: None,
+                name: "agentapp_browser_act".to_string(),
+                match_any_namespace: true,
+                match_case_insensitive: true,
+            }])
+            .expect("trusted browser policy"),
+        ),
+    ];
+    let resumed_store = LocalThreadStore::new(config, /*state_db*/ None);
+    resumed_store
+        .resume_thread(ResumeThreadParams {
+            thread_id,
+            rollout_path: Some(rollout_path),
+            history: None,
+            include_archived: true,
+            dynamic_tools: protected_tools,
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(std::env::current_dir().expect("cwd")),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("resume with fresh trusted browser policy");
+    resumed_store
+        .flush_thread(thread_id)
+        .await
+        .expect("materialize protected legacy rollout");
+
+    let pool = codex_state::open_thread_history_db(home.path())
+        .await
+        .expect("open thread history db");
+    let item_json = sqlx::query_scalar::<_, String>(
+        "SELECT item_json FROM thread_items WHERE thread_id = ? AND item_id = ?",
+    )
+    .bind(thread_id.to_string())
+    .bind("legacy-browser-call")
+    .fetch_one(&pool)
+    .await
+    .expect("read protected legacy browser item");
+    assert!(!item_json.contains(SENTINEL));
+    assert!(!item_json.contains("UkFXX0JST1dTRVJfQVJHVU1FTlRfU0VOVElORUw="));
+    let item = serde_json::from_str::<ThreadItem>(&item_json).expect("decode browser item");
+    let ThreadItem::DynamicToolCall { arguments, .. } = item else {
+        panic!("expected dynamic browser tool item");
+    };
+    assert_eq!(arguments, serde_json::json!({}));
 }
 
 #[tokio::test]

@@ -26,6 +26,12 @@ use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::dynamic_tools::DynamicToolArgumentHandling;
+use codex_protocol::dynamic_tools::DynamicToolArgumentIdentity;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicy;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicySpec;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ContentItem;
@@ -124,6 +130,36 @@ fn spawn_agent_call(call_id: &str) -> ResponseItem {
     }
 }
 
+fn protected_browser_dynamic_tools() -> Vec<DynamicToolSpec> {
+    vec![
+        DynamicToolSpec::Function(DynamicToolFunctionSpec {
+            name: "agentapp_browser_act".to_string(),
+            description: "browser action".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            defer_loading: false,
+            argument_handling: DynamicToolArgumentHandling::Transient,
+        }),
+        DynamicToolSpec::ArgumentPolicy(
+            DynamicToolArgumentPolicySpec::trusted_transient(vec![DynamicToolArgumentIdentity {
+                namespace: None,
+                name: "agentapp_browser_act".to_string(),
+                match_any_namespace: true,
+                match_case_insensitive: true,
+            }])
+            .expect("trusted browser policy"),
+        ),
+    ]
+}
+
+async fn assert_browser_arguments_are_transient(thread: &CodexThread) {
+    let dynamic_tools = thread.session.dynamic_tools_snapshot().await;
+    assert_eq!(
+        DynamicToolArgumentPolicy::from_dynamic_tools(&dynamic_tools)
+            .handling_for(None, "agentapp_browser_act"),
+        DynamicToolArgumentHandling::Transient
+    );
+}
+
 struct AgentControlHarness {
     _home: TempDir,
     config: Config,
@@ -163,6 +199,18 @@ impl AgentControlHarness {
             .start_thread(self.config.clone())
             .await
             .expect("start thread");
+        (new_thread.thread_id, new_thread.thread)
+    }
+
+    async fn start_thread_with_dynamic_tools(
+        &self,
+        dynamic_tools: Vec<DynamicToolSpec>,
+    ) -> (ThreadId, Arc<CodexThread>) {
+        let new_thread = self
+            .manager
+            .start_thread_with_tools(self.config.clone(), dynamic_tools)
+            .await
+            .expect("start thread with dynamic tools");
         (new_thread.thread_id, new_thread.thread)
     }
 
@@ -869,6 +917,82 @@ async fn spawn_agent_creates_thread_and_sends_prompt() {
         .into_iter()
         .find(|entry| *entry == expected);
     assert_eq!(captured, Some(expected));
+}
+
+#[test]
+fn spawned_and_forked_agents_inherit_live_transient_argument_authority() {
+    std::thread::Builder::new()
+        .name("transient-argument-inheritance-test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(async {
+                    let harness = AgentControlHarness::new().await;
+                    let (parent_thread_id, parent_thread) = harness
+                        .start_thread_with_dynamic_tools(protected_browser_dynamic_tools())
+                        .await;
+                    assert_browser_arguments_are_transient(&parent_thread).await;
+
+                    let child_thread_id = harness
+                        .control
+                        .spawn_agent(
+                            harness.config.clone(),
+                            text_input("spawned"),
+                            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                                parent_thread_id,
+                                depth: 1,
+                                agent_path: None,
+                                agent_nickname: None,
+                                agent_role: None,
+                            })),
+                        )
+                        .await
+                        .expect("spawned child");
+                    let child_thread = harness
+                        .manager
+                        .get_thread(child_thread_id)
+                        .await
+                        .expect("spawned child thread");
+                    assert_browser_arguments_are_transient(&child_thread).await;
+
+                    let forked = harness
+                        .manager
+                        .spawn_subagent(
+                            parent_thread_id,
+                            StartThreadOptions {
+                                config: harness.config.clone(),
+                                allow_provider_model_fallback: false,
+                                initial_history: InitialHistory::New,
+                                history_mode: None,
+                                session_source: Some(SessionSource::SubAgent(
+                                    SubAgentSource::ThreadSpawn {
+                                        parent_thread_id,
+                                        depth: 1,
+                                        agent_path: None,
+                                        agent_nickname: None,
+                                        agent_role: None,
+                                    },
+                                )),
+                                thread_source: None,
+                                dynamic_tools: Vec::new(),
+                                metrics_service_name: None,
+                                parent_trace: None,
+                                environments: Vec::new(),
+                                thread_extension_init: ExtensionDataInit::default(),
+                                supports_openai_form_elicitation: false,
+                            },
+                        )
+                        .await
+                        .expect("forked child");
+                    assert_browser_arguments_are_transient(&forked.thread).await;
+                });
+        })
+        .expect("spawn inheritance test thread")
+        .join()
+        .expect("inheritance test thread");
 }
 
 #[tokio::test]
@@ -2663,7 +2787,10 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         manager,
         control,
     };
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let (parent_thread_id, parent_thread) = harness
+        .start_thread_with_dynamic_tools(protected_browser_dynamic_tools())
+        .await;
+    assert_browser_arguments_are_transient(&parent_thread).await;
     let agent_path = AgentPath::from_string("/root/explorer".to_string())
         .expect("test agent path should be valid");
 
@@ -2763,13 +2890,13 @@ async fn resume_thread_subagent_restores_stored_metadata() {
         .expect("resume should succeed");
     assert_eq!(resumed_thread_id, child_thread_id);
 
-    let resumed_snapshot = harness
+    let resumed_thread = harness
         .manager
         .get_thread(resumed_thread_id)
         .await
-        .expect("resumed child thread should exist")
-        .config_snapshot()
-        .await;
+        .expect("resumed child thread should exist");
+    assert_browser_arguments_are_transient(&resumed_thread).await;
+    let resumed_snapshot = resumed_thread.config_snapshot().await;
     let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: resumed_parent_thread_id,
         depth: resumed_depth,

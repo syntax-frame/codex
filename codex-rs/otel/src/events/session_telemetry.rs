@@ -68,6 +68,31 @@ const RESPONSES_API_ENGINE_SERVICE_TTFT_FIELD: &str = "engine_service_ttft_total
 const RESPONSES_API_ENGINE_IAPI_TBT_FIELD: &str = "engine_iapi_tbt_across_engine_calls_ms";
 const RESPONSES_API_ENGINE_SERVICE_TBT_FIELD: &str = "engine_service_tbt_across_engine_calls_ms";
 
+fn normalized_websocket_event_kind(kind: Option<&str>) -> &str {
+    match kind {
+        Some(
+            kind @ ("response.created"
+            | "response.completed"
+            | "response.failed"
+            | "response.incomplete"
+            | "response.output_item.added"
+            | "response.output_item.done"
+            | "response.output_text.delta"
+            | "response.function_call_arguments.delta"
+            | "response.custom_tool_call_input.delta"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.delta"
+            | "response.metadata"
+            | "response.new_tool_event"
+            | "responsesapi.websocket_timing"
+            | "parse_error"),
+        ) => kind,
+        Some(_) | None => WEBSOCKET_UNKNOWN_KIND,
+    }
+}
+
 fn trace_field_value<'a>(fields: &'a [(&str, &str)], key: &str) -> Option<&'a str> {
     fields
         .iter()
@@ -759,10 +784,8 @@ impl SessionTelemetry {
                 tokio_tungstenite::tungstenite::Message::Text(text) => {
                     match serde_json::from_str::<serde_json::Value>(text) {
                         Ok(value) => {
-                            kind = value
-                                .get("type")
-                                .and_then(|value| value.as_str())
-                                .map(std::string::ToString::to_string);
+                            let raw_kind = value.get("type").and_then(|value| value.as_str());
+                            kind = Some(normalized_websocket_event_kind(raw_kind).to_string());
                             if kind.as_deref() == Some(RESPONSES_WEBSOCKET_TIMING_KIND) {
                                 self.record_responses_websocket_timing_metrics(&value);
                             }
@@ -791,7 +814,7 @@ impl SessionTelemetry {
             }
         }
 
-        let kind_str = kind.as_deref().unwrap_or(WEBSOCKET_UNKNOWN_KIND);
+        let kind_str = normalized_websocket_event_kind(kind.as_deref());
         let success_str = if success { "true" } else { "false" };
         let tags = [("kind", kind_str), ("success", success_str)];
         self.counter(WEBSOCKET_EVENT_COUNT_METRIC, /*inc*/ 1, &tags);
@@ -1265,4 +1288,22 @@ fn f64_ms_value(value: Option<&serde_json::Value>) -> Option<f64> {
         return None;
     }
     Some(ms.min(u64::MAX as f64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalized_websocket_event_kind;
+
+    #[test]
+    fn websocket_event_kind_rejects_provider_controlled_values() {
+        assert_eq!(
+            normalized_websocket_event_kind(Some("response.completed")),
+            "response.completed"
+        );
+        assert_eq!(
+            normalized_websocket_event_kind(Some("RAW_BROWSER_ARGUMENT_SENTINEL")),
+            "unknown"
+        );
+        assert_eq!(normalized_websocket_event_kind(None), "unknown");
+    }
 }

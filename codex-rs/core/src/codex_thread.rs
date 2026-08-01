@@ -546,13 +546,19 @@ impl CodexThread {
 
     /// Appends rollout items through the live thread so derived metadata stays in sync.
     pub async fn append_rollout_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        let projected_items = self
+            .session
+            .project_rollout_items_for_argument_privacy(items)
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to privacy-project rollout items: {err}"),
+            })?;
         let live_thread = self
             .session
             .live_thread_for_persistence("append rollout items")
             .map_err(|err| ThreadStoreError::Internal {
                 message: err.to_string(),
             })?;
-        live_thread.append_items(items).await
+        live_thread.append_items(&projected_items).await
     }
 
     pub fn state_db(&self) -> Option<StateDbHandle> {

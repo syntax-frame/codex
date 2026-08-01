@@ -360,15 +360,33 @@ impl ThreadTraceContext {
         model: impl Into<String>,
         provider_name: impl Into<String>,
     ) -> InferenceTraceContext {
+        self.inference_trace_context_with_argument_policy(
+            codex_turn_id,
+            model,
+            provider_name,
+            crate::InferenceTraceArgumentPolicy::default(),
+        )
+    }
+
+    /// Builds reusable inference trace context with an argument projection
+    /// policy for tools whose model-produced arguments are live-dispatch-only.
+    pub fn inference_trace_context_with_argument_policy(
+        &self,
+        codex_turn_id: impl Into<CodexTurnId>,
+        model: impl Into<String>,
+        provider_name: impl Into<String>,
+        argument_policy: crate::InferenceTraceArgumentPolicy,
+    ) -> InferenceTraceContext {
         let ThreadTraceContextState::Enabled(context) = &self.state else {
-            return InferenceTraceContext::disabled();
+            return InferenceTraceContext::disabled_with_argument_policy(argument_policy);
         };
-        InferenceTraceContext::enabled(
+        InferenceTraceContext::enabled_with_argument_policy(
             Arc::clone(&context.writer),
             context.thread_id.clone(),
             codex_turn_id.into(),
             model.into(),
             provider_name.into(),
+            argument_policy,
         )
     }
 
@@ -385,16 +403,34 @@ impl ThreadTraceContext {
         model: impl Into<String>,
         provider_name: impl Into<String>,
     ) -> CompactionTraceContext {
+        self.compaction_trace_context_with_argument_policy(
+            codex_turn_id,
+            compaction_id,
+            model,
+            provider_name,
+            crate::InferenceTraceArgumentPolicy::default(),
+        )
+    }
+
+    pub fn compaction_trace_context_with_argument_policy(
+        &self,
+        codex_turn_id: impl Into<CodexTurnId>,
+        compaction_id: impl Into<CompactionId>,
+        model: impl Into<String>,
+        provider_name: impl Into<String>,
+        argument_policy: crate::InferenceTraceArgumentPolicy,
+    ) -> CompactionTraceContext {
         let ThreadTraceContextState::Enabled(context) = &self.state else {
             return CompactionTraceContext::disabled();
         };
-        CompactionTraceContext::enabled(
+        CompactionTraceContext::enabled_with_argument_policy(
             Arc::clone(&context.writer),
             context.thread_id.clone(),
             codex_turn_id.into(),
             compaction_id.into(),
             model.into(),
             provider_name.into(),
+            argument_policy,
         )
     }
 

@@ -114,6 +114,10 @@ pub struct ResumeThreadParams {
     pub history: Option<Arc<Vec<RolloutItem>>>,
     /// Whether archived threads may be reopened.
     pub include_archived: bool,
+    /// Fresh host-authorized dynamic tools for future writes and any lazy
+    /// history materialization performed by this live resume.
+    #[serde(default)]
+    pub dynamic_tools: Vec<DynamicToolSpec>,
     /// Metadata for future writes appended to the resumed live thread.
     pub metadata: ThreadPersistenceMetadata,
 }

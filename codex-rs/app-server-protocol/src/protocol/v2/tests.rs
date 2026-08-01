@@ -2714,6 +2714,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         namespace: Some("apps".to_string()),
         tool: "lookup".to_string(),
         arguments: json!({"id": "123"}),
+        arguments_transient: false,
         status: CoreDynamicToolCallStatus::Completed,
         content_items: Some(vec![
             codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputText {
@@ -2721,6 +2722,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             },
             codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputImage {
                 image_url: "data:image/png;base64,AAA".to_string(),
+                detail: None,
             },
             codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem::InputAudio {
                 audio_url: "data:audio/wav;base64,YXVkaW8=".to_string(),

@@ -197,12 +197,18 @@ async fn run_remote_compact_task_inner_impl(
     let compaction_id = context_compaction_item.id.clone();
     // Use the UI compaction item ID as the trace compaction ID so protocol lifecycle events,
     // endpoint attempts, and the installed history checkpoint all have one join key.
-    let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
-        turn_context.sub_id.as_str(),
-        compaction_id.as_str(),
-        turn_context.model_info.slug.as_str(),
-        turn_context.provider.info().name.as_str(),
-    );
+    let compaction_trace = sess
+        .services
+        .rollout_thread_trace
+        .compaction_trace_context_with_argument_policy(
+            turn_context.sub_id.as_str(),
+            compaction_id.as_str(),
+            turn_context.model_info.slug.as_str(),
+            turn_context.provider.info().name.as_str(),
+            codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+                &turn_context.dynamic_tools,
+            ),
+        );
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
@@ -225,12 +231,17 @@ async fn run_remote_compact_task_inner_impl(
                 return Err(error);
             }
             let fallback_turn_context = &fallback_step_context.turn;
-            let fallback_compaction_trace =
-                sess.services.rollout_thread_trace.compaction_trace_context(
+            let fallback_compaction_trace = sess
+                .services
+                .rollout_thread_trace
+                .compaction_trace_context_with_argument_policy(
                     fallback_turn_context.sub_id.as_str(),
                     compaction_id.as_str(),
                     fallback_turn_context.model_info.slug.as_str(),
                     fallback_turn_context.provider.info().name.as_str(),
+                    codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+                        &fallback_turn_context.dynamic_tools,
+                    ),
                 );
             let fallback_result = run_remote_compact_attempt(
                 sess,

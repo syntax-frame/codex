@@ -4543,6 +4543,7 @@ mod tests {
                                 description: "Look up a ticket".to_string(),
                                 input_schema: json!({"type": "object", "properties": {}}),
                                 defer_loading: true,
+                                argument_handling: Default::default(),
                             },
                         ),
                         crate::dynamic_tools::DynamicToolNamespaceTool::Function(
@@ -4551,6 +4552,7 @@ mod tests {
                                 description: "Update a ticket".to_string(),
                                 input_schema: json!({"type": "object", "properties": {}}),
                                 defer_loading: false,
+                                argument_handling: Default::default(),
                             },
                         ),
                     ],
@@ -5536,6 +5538,7 @@ mod tests {
                 namespace: Some("apps".into()),
                 tool: "lookup".into(),
                 arguments: json!({"id": "123"}),
+                arguments_transient: false,
                 status: DynamicToolCallStatus::InProgress,
                 content_items: None,
                 success: None,
@@ -5552,6 +5555,7 @@ mod tests {
                 namespace: Some("apps".into()),
                 tool: "lookup".into(),
                 arguments: json!({"id": "123"}),
+                arguments_transient: false,
                 status: DynamicToolCallStatus::Completed,
                 content_items: Some(vec![DynamicToolCallOutputContentItem::InputText {
                     text: "ok".into(),

@@ -18,6 +18,7 @@ fn parse_dynamic_tool_sanitizes_input_schema() {
             }
         }),
         defer_loading: false,
+        argument_handling: Default::default(),
     };
 
     assert_eq!(
@@ -46,6 +47,7 @@ fn parse_dynamic_tool_preserves_defer_loading() {
             "properties": {}
         }),
         defer_loading: true,
+        argument_handling: Default::default(),
     };
 
     assert_eq!(

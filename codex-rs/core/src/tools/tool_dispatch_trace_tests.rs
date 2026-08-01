@@ -3,6 +3,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_protocol::dynamic_tools::DynamicToolArgumentHandling;
+use codex_protocol::dynamic_tools::DynamicToolArgumentIdentity;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicySpec;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout_trace::ExecutionStatus;
 use codex_rollout_trace::ThreadStartedTraceMetadata;
@@ -29,6 +33,7 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 
 struct TestHandler {
     tool_name: codex_tools::ToolName,
+    allows_transient_arguments: bool,
 }
 
 impl ToolExecutor<ToolInvocation> for TestHandler {
@@ -57,7 +62,11 @@ impl ToolExecutor<ToolInvocation> for TestHandler {
     }
 }
 
-impl CoreToolRuntime for TestHandler {}
+impl CoreToolRuntime for TestHandler {
+    fn allows_transient_arguments(&self) -> bool {
+        self.allows_transient_arguments
+    }
+}
 
 #[tokio::test]
 async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> anyhow::Result<()> {
@@ -73,6 +82,7 @@ async fn dispatch_lifecycle_trace_records_direct_and_code_mode_requesters() -> a
 
     let registry = ToolRegistry::with_handler_for_test(Arc::new(TestHandler {
         tool_name: codex_tools::ToolName::plain("test_tool"),
+        allows_transient_arguments: false,
     }));
     let session = Arc::new(session);
     let turn = Arc::new(turn);
@@ -193,6 +203,7 @@ async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> any
 
     let registry = ToolRegistry::with_handler_for_test(Arc::new(TestHandler {
         tool_name: codex_tools::ToolName::plain("test_tool"),
+        allows_transient_arguments: false,
     }));
     let session = Arc::new(session);
     let turn = Arc::new(turn);
@@ -218,6 +229,77 @@ async fn dispatch_lifecycle_trace_records_incompatible_payload_failures() -> any
     let tool_call = &replayed.tool_calls["incompatible-call"];
     assert_eq!(tool_call.execution.status, ExecutionStatus::Failed);
     assert!(tool_call.raw_result_payload_id.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn transient_dispatch_trace_preserves_provenance_without_argument_bytes() -> anyhow::Result<()>
+{
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+    let temp = TempDir::new()?;
+    let (mut session, mut turn) = make_session_and_context().await;
+    let tool_name = "agentapp_browser_act";
+    turn.dynamic_tools = vec![
+        DynamicToolSpec::Function(codex_protocol::dynamic_tools::DynamicToolFunctionSpec {
+            name: tool_name.to_string(),
+            description: "Test browser tool.".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            defer_loading: false,
+            argument_handling: DynamicToolArgumentHandling::Transient,
+        }),
+        DynamicToolSpec::ArgumentPolicy(
+            DynamicToolArgumentPolicySpec::trusted_transient(vec![DynamicToolArgumentIdentity {
+                namespace: None,
+                name: tool_name.to_string(),
+                match_any_namespace: true,
+                match_case_insensitive: true,
+            }])
+            .expect("trusted policy"),
+        ),
+    ];
+    attach_test_trace(&mut session, &turn, temp.path())?;
+
+    let registry = ToolRegistry::with_handler_for_test(Arc::new(TestHandler {
+        tool_name: codex_tools::ToolName::plain(tool_name),
+        allows_transient_arguments: true,
+    }));
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let call_id = "protected-dispatch-call";
+
+    registry
+        .dispatch_any_with_terminal_outcome(
+            test_invocation(
+                session,
+                turn,
+                call_id,
+                tool_name,
+                ToolCallSource::Direct,
+                &serde_json::json!({
+                    "aliases": {"pwd": SENTINEL},
+                    "encoded": "UkFXX0JST1dTRVJfQVJHVU1FTlRfU0VOVElORUw=",
+                })
+                .to_string(),
+            ),
+            /*terminal_outcome_reached*/ None,
+        )
+        .await?;
+
+    let bundle = single_bundle_dir(temp.path())?;
+    let replayed = codex_rollout_trace::replay_bundle(&bundle)?;
+    let tool_call = &replayed.tool_calls[call_id];
+    assert_eq!(tool_call.model_visible_call_id, Some(call_id.to_string()));
+    assert_eq!(tool_call.execution.status, ExecutionStatus::Completed);
+    assert!(tool_call.raw_invocation_payload_id.is_some());
+    assert!(tool_call.raw_result_payload_id.is_some());
+    let artifact_bytes = artifact_tree_bytes(&bundle)?;
+    assert!(
+        !artifact_bytes
+            .windows(SENTINEL.len())
+            .any(|window| window == SENTINEL.as_bytes()),
+        "transient dispatch trace must retain only its content-free projection"
+    );
 
     Ok(())
 }
@@ -331,4 +413,21 @@ fn single_bundle_dir(root: &Path) -> anyhow::Result<PathBuf> {
     entries.sort();
     assert_eq!(entries.len(), 1);
     Ok(entries.remove(0))
+}
+
+fn artifact_tree_bytes(root: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                pending.push(path);
+            } else {
+                bytes.extend(fs::read(path)?);
+            }
+        }
+    }
+    Ok(bytes)
 }

@@ -504,13 +504,16 @@ async fn connect_websocket(
     let (stream, response) = match response {
         Ok((stream, response)) => {
             info!(
-                "successfully connected to websocket: {url}, headers: {:?}",
-                response.headers()
+                status = %response.status(),
+                "successfully connected to websocket: {url}"
             );
             (stream, response)
         }
         Err(err) => {
-            error!("failed to connect to websocket: {err}, url: {url}");
+            error!(
+                error_type = std::any::type_name_of_val(&err),
+                "failed to connect to websocket: {url}"
+            );
             return Err(map_ws_error(err, &url));
         }
     };
@@ -556,16 +559,11 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
     match err {
         WsError::Http(response) => {
             let status = response.status();
-            let headers = response.headers().clone();
-            let body = response
-                .body()
-                .as_ref()
-                .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
             ApiError::Transport(TransportError::Http {
                 status,
                 url: Some(url.to_string()),
-                headers: Some(headers),
-                body,
+                headers: None,
+                body: None,
             })
         }
         WsError::ConnectionClosed | WsError::AlreadyClosed => {
@@ -718,7 +716,12 @@ async fn run_websocket_response_stream(
                 let event = match serde_json::from_str::<ResponsesStreamEvent>(&text) {
                     Ok(event) => event,
                     Err(err) => {
-                        debug!("failed to parse websocket event: {err}, data: {text}");
+                        debug!(
+                            error_category = ?err.classify(),
+                            error_line = err.line(),
+                            error_column = err.column(),
+                            "failed to parse websocket event"
+                        );
                         continue;
                     }
                 };
@@ -812,15 +815,16 @@ async fn run_websocket_response_stream(
 
 fn emit_responses_websocket_timing_event(
     kind: &str,
-    payload: &str,
+    _payload: &str,
     context: &ResponsesWebsocketTimingLogContext,
 ) {
     if kind != RESPONSES_WEBSOCKET_TIMING_KIND {
         return;
     }
 
-    // This full payload is excluded from always-on sinks. Opt in with
-    // `RUST_LOG='codex_api::responses_websocket_timing=trace'`.
+    // Timing events intentionally expose only locally owned correlation and
+    // transport fields. Provider payloads can echo model-produced arguments
+    // and must never enter a logging sink, even at opt-in TRACE.
     tracing::event!(
         name: RESPONSES_WEBSOCKET_TIMING_KIND,
         target: RESPONSES_WEBSOCKET_TIMING_EVENT_TARGET,
@@ -830,11 +834,10 @@ fn emit_responses_websocket_timing_event(
         thread_id = context.thread_id.as_deref().unwrap_or_default(),
         turn_id = context.turn_id.as_deref().unwrap_or_default(),
         traceparent = context.traceparent.as_deref().unwrap_or_default(),
-        previous_response_id = context.previous_response_id.as_deref().unwrap_or_default(),
+        has_previous_response = context.previous_response_id.is_some(),
         request_start_ms = context.request_start_ms.as_deref().unwrap_or_default(),
         warmup = context.warmup,
         connection_reused = context.connection_reused,
-        payload,
         "responses websocket timing"
     );
 }

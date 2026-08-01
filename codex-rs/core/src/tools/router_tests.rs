@@ -283,7 +283,10 @@ async fn tools_without_handlers_do_not_support_parallel() -> anyhow::Result<()> 
 
 #[tokio::test]
 async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
-    let (_, turn) = make_session_and_context().await;
+    let (_, mut turn) = make_session_and_context().await;
+    // This contract is specifically about deferred exposure; do not depend on
+    // whichever fallback model happens to be the test configuration default.
+    turn.model_info.supports_search_tool = true;
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
     let hidden_tool = "hidden_dynamic_tool";
@@ -301,6 +304,7 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
                     "additionalProperties": false,
                 }),
                 defer_loading: true,
+                argument_handling: Default::default(),
             }),
             DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
                 name: visible_tool.to_string(),
@@ -311,6 +315,7 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
                     "additionalProperties": false,
                 }),
                 defer_loading: false,
+                argument_handling: Default::default(),
             }),
         ],
     })];

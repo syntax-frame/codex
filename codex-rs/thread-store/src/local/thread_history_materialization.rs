@@ -5,6 +5,7 @@ use chrono::DateTime;
 use codex_app_server_protocol::ThreadHistoryChangeSet;
 use codex_app_server_protocol::project_rollout_line;
 use codex_protocol::ThreadId;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicy;
 use codex_protocol::protocol::RolloutLine;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncSeekExt;
@@ -14,10 +15,26 @@ use super::LocalThreadStore;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
+#[cfg(test)]
 pub(super) async fn materialize_to_sqlite(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     rollout_path: &Path,
+) -> ThreadStoreResult<()> {
+    materialize_to_sqlite_with_policy(
+        store,
+        thread_id,
+        rollout_path,
+        &DynamicToolArgumentPolicy::default(),
+    )
+    .await
+}
+
+pub(super) async fn materialize_to_sqlite_with_policy(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+    argument_policy: &DynamicToolArgumentPolicy,
 ) -> ThreadStoreResult<()> {
     let start_offset = super::thread_history::next_rollout_byte_offset(store, thread_id).await?;
     let (lines, next_offset) = read_complete_rollout_lines(rollout_path, start_offset).await?;
@@ -41,7 +58,10 @@ pub(super) async fn materialize_to_sqlite(
             }) {
                 ThreadHistoryChangeSet::default()
             } else {
-                project_rollout_line(line)
+                let projected_line = argument_policy
+                    .redact_serializable(line)
+                    .map_err(thread_history_error)?;
+                project_rollout_line(&projected_line)
             };
             Ok((line.ordinal, created_at_ms, changes))
         })

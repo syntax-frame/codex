@@ -211,6 +211,7 @@ impl DynamicToolCallItem {
             namespace: self.namespace.clone(),
             tool: self.tool.clone(),
             arguments: self.arguments.clone(),
+            arguments_transient: self.arguments_transient,
         })
     }
 

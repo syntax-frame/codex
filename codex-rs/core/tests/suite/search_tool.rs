@@ -931,6 +931,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
                 description: tool_description.to_string(),
                 input_schema: input_schema.clone(),
                 defer_loading: true,
+                argument_handling: Default::default(),
             },
         )],
     });
@@ -1563,6 +1564,7 @@ async fn tool_search_matches_dynamic_tools_by_name_description_namespace_and_sch
                     "additionalProperties": false,
                 }),
                 defer_loading: true,
+                argument_handling: Default::default(),
             },
         )],
     });

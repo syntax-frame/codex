@@ -89,6 +89,8 @@ use codex_app_server_protocol::item_event_to_server_notification;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
 use codex_protocol::ThreadId;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem as CoreDynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolResponse as CoreDynamicToolResponse;
 use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::models::AdditionalPermissionProfile as CoreAdditionalPermissionProfile;
@@ -841,6 +843,31 @@ pub(crate) async fn apply_bespoke_event_handling(
                 on_request_permissions_response(pending_response, conversation, thread_state).await;
             });
         }
+        EventMsg::DynamicToolCallRequest(request) if request.arguments_transient => {
+            // Transient arguments are authority-bound to the trusted host bridge
+            // that registered the privacy policy. App-server subscriptions are
+            // broadcast/replay surfaces and therefore must never receive them.
+            // Fail the unreachable public-client path content-free instead of
+            // forwarding, retaining, replaying, or waiting indefinitely.
+            let response = CoreDynamicToolResponse {
+                content_items: vec![CoreDynamicToolCallOutputContentItem::InputText {
+                    text: "transient dynamic tool requires its trusted host bridge".to_string(),
+                }],
+                success: false,
+            };
+            if let Err(error) = conversation
+                .submit(Op::DynamicToolResponse {
+                    id: request.call_id,
+                    response,
+                })
+                .await
+            {
+                tracing::error!(
+                    error_type = std::any::type_name_of_val(&error),
+                    "failed to reject transient dynamic tool request on app-server"
+                );
+            }
+        }
         EventMsg::DynamicToolCallRequest(_)
         | EventMsg::DynamicToolCallResponse(_)
         | EventMsg::CollabAgentSpawnBegin(_)
@@ -971,14 +998,16 @@ pub(crate) async fn apply_bespoke_event_handling(
                 _ => true,
             };
             let dynamic_tool_call_params = match &event.item {
-                CoreTurnItem::DynamicToolCall(item) => Some(DynamicToolCallParams {
-                    thread_id: conversation_id.to_string(),
-                    turn_id: event.turn_id.clone(),
-                    call_id: item.id.clone(),
-                    namespace: item.namespace.clone(),
-                    tool: item.tool.clone(),
-                    arguments: item.arguments.clone(),
-                }),
+                CoreTurnItem::DynamicToolCall(item) if !item.arguments_transient => {
+                    Some(DynamicToolCallParams {
+                        thread_id: conversation_id.to_string(),
+                        turn_id: event.turn_id.clone(),
+                        call_id: item.id.clone(),
+                        namespace: item.namespace.clone(),
+                        tool: item.tool.clone(),
+                        arguments: item.arguments.clone(),
+                    })
+                }
                 _ => None,
             };
             if should_emit {
@@ -3431,6 +3460,7 @@ mod tests {
                         namespace: Some("apps".to_string()),
                         tool: "lookup".to_string(),
                         arguments: json!({"id": "123"}),
+                        arguments_transient: false,
                         status: CoreDynamicToolCallStatus::InProgress,
                         content_items: None,
                         success: None,
@@ -3473,6 +3503,113 @@ mod tests {
                 arguments: json!({"id": "123"}),
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transient_dynamic_tool_events_never_reach_app_server_subscribers() -> Result<()> {
+        const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.to_path_buf(),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config).await?;
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+        let thread_state = new_thread_state();
+        let watch_manager = ThreadWatchManager::new();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1));
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "turn-protected".to_string(),
+                msg: EventMsg::ItemStarted(ItemStartedEvent {
+                    thread_id: conversation_id,
+                    turn_id: "turn-protected".to_string(),
+                    item: CoreTurnItem::DynamicToolCall(DynamicToolCallItem {
+                        id: "browser-call".to_string(),
+                        namespace: None,
+                        tool: "agentapp_browser_act".to_string(),
+                        arguments: json!({}),
+                        arguments_transient: true,
+                        status: CoreDynamicToolCallStatus::InProgress,
+                        content_items: None,
+                        success: None,
+                        error: None,
+                        duration: None,
+                    }),
+                    started_at_ms: 42,
+                }),
+            },
+            conversation_id,
+            Arc::clone(&conversation),
+            Arc::clone(&thread_manager),
+            outgoing.clone(),
+            Arc::clone(&thread_state),
+            watch_manager.clone(),
+            Arc::clone(&semaphore),
+            "test-provider".to_string(),
+        )
+        .await;
+
+        let item_started = recv_broadcast_notification(&mut rx).await?;
+        let ServerNotification::ItemStarted(payload) = item_started else {
+            bail!("unexpected message: {item_started:?}");
+        };
+        assert_eq!(payload.item.id(), "browser-call");
+        assert!(
+            rx.try_recv().is_err(),
+            "transient lifecycle item must not synthesize a client tool request"
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "turn-protected".to_string(),
+                msg: EventMsg::DynamicToolCallRequest(
+                    codex_protocol::dynamic_tools::DynamicToolCallRequest {
+                        call_id: "browser-call".to_string(),
+                        turn_id: "turn-protected".to_string(),
+                        started_at_ms: 42,
+                        namespace: None,
+                        tool: "agentapp_browser_act".to_string(),
+                        arguments: json!({"text": SENTINEL}),
+                        arguments_transient: true,
+                    },
+                ),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            thread_state,
+            watch_manager,
+            semaphore,
+            "test-provider".to_string(),
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "raw transient request must not be broadcast, replayed, or retained"
+        );
+
         Ok(())
     }
 

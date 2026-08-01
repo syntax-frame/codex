@@ -84,12 +84,12 @@ impl ReqwestTransport {
 
 fn request_body_for_trace(req: &Request) -> String {
     match req.body.as_ref() {
-        Some(RequestBody::Json(body)) => body.to_string(),
+        Some(RequestBody::Json(_)) => "<json body>".to_string(),
         Some(RequestBody::EncodedJson(body)) => {
-            String::from_utf8_lossy(body.trace_bytes()).into_owned()
+            format!("<encoded json body: {} bytes>", body.trace_bytes().len())
         }
         Some(RequestBody::Raw(body)) => format!("<raw body: {} bytes>", body.len()),
-        None => String::new(),
+        None => "<no body>".to_string(),
     }
 }
 
@@ -158,5 +158,27 @@ impl HttpTransport for ReqwestTransport {
             headers,
             bytes: Box::pin(stream),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_body_for_trace;
+    use crate::request::Request;
+    use http::Method;
+    use serde_json::json;
+
+    #[test]
+    fn trace_summary_never_includes_json_request_contents() {
+        const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+        let request = Request::new(
+            Method::POST,
+            "https://example.invalid/responses".to_string(),
+        )
+        .with_json(&json!({"arguments": {"text": SENTINEL}}));
+
+        let summary = request_body_for_trace(&request);
+        assert_eq!(summary, "<json body>");
+        assert!(!summary.contains(SENTINEL));
     }
 }

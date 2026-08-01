@@ -61,6 +61,11 @@ async fn thread_start_normalizes_legacy_dynamic_tools_into_model_request() -> Re
 
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
+    let config = load_default_config_for_test(&codex_home).await;
+    let mut model_info =
+        codex_core::test_support::construct_model_info_offline("mock-model", &config);
+    model_info.supports_search_tool = true;
+    write_models_cache_with_models(codex_home.path(), vec![model_info])?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -195,6 +200,7 @@ async fn thread_start_rejects_hidden_dynamic_tools_without_namespace() -> Result
             "additionalProperties": false,
         }),
         defer_loading: true,
+        argument_handling: Default::default(),
     });
 
     let thread_req = mcp
@@ -400,12 +406,14 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
                 description: "Demo dynamic tool".to_string(),
                 input_schema: input_schema.clone(),
                 defer_loading: false,
+                argument_handling: Default::default(),
             }),
             DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
                 name: "lookup_status".to_string(),
                 description: "Look up ticket status".to_string(),
                 input_schema: status_schema.clone(),
                 defer_loading: false,
+                argument_handling: Default::default(),
             }),
         ],
     });
@@ -621,6 +629,7 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
             "additionalProperties": false,
         }),
         defer_loading: false,
+        argument_handling: Default::default(),
     });
 
     let thread_req = mcp

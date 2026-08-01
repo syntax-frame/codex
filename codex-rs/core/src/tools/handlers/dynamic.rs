@@ -9,6 +9,8 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolExposure;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicy;
+use codex_protocol::dynamic_tools::DynamicToolCallRequest;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
@@ -162,7 +164,11 @@ impl DynamicToolHandler {
     }
 }
 
-impl CoreToolRuntime for DynamicToolHandler {}
+impl CoreToolRuntime for DynamicToolHandler {
+    fn allows_transient_arguments(&self) -> bool {
+        true
+    }
+}
 
 #[expect(
     clippy::await_holding_invalid_type,
@@ -177,6 +183,14 @@ async fn request_dynamic_tool(
 ) -> Option<DynamicToolResponse> {
     let namespace = tool_name.namespace;
     let tool = tool_name.name;
+    let argument_handling =
+        DynamicToolArgumentPolicy::from_dynamic_tools(&turn_context.dynamic_tools)
+            .handling_for(namespace.as_deref(), &tool);
+    let persisted_arguments = if argument_handling.redacts_arguments() {
+        Value::Object(Default::default())
+    } else {
+        arguments.clone()
+    };
     let (tx_response, rx_response) = oneshot::channel();
     let event_id = call_id.clone();
     let prev_entry = {
@@ -194,22 +208,40 @@ async fn request_dynamic_tool(
     }
 
     let started_at = Instant::now();
-    session
-        .emit_turn_item_started(
-            turn_context,
-            &TurnItem::DynamicToolCall(DynamicToolCallItem {
-                id: call_id.clone(),
-                namespace: namespace.clone(),
-                tool: tool.clone(),
-                arguments: arguments.clone(),
-                status: DynamicToolCallStatus::InProgress,
-                content_items: None,
-                success: None,
-                error: None,
-                duration: None,
-            }),
-        )
-        .await;
+    let started_at_ms = crate::turn_timing::now_unix_timestamp_ms();
+    let started_item = TurnItem::DynamicToolCall(DynamicToolCallItem {
+        id: call_id.clone(),
+        namespace: namespace.clone(),
+        tool: tool.clone(),
+        arguments: persisted_arguments.clone(),
+        arguments_transient: argument_handling.redacts_arguments(),
+        status: DynamicToolCallStatus::InProgress,
+        content_items: None,
+        success: None,
+        error: None,
+        duration: None,
+    });
+    if argument_handling.redacts_arguments() {
+        session
+            .emit_transient_dynamic_tool_call_started(
+                turn_context,
+                started_item,
+                DynamicToolCallRequest {
+                    call_id: call_id.clone(),
+                    turn_id: turn_context.sub_id.clone(),
+                    started_at_ms,
+                    namespace: namespace.clone(),
+                    tool: tool.clone(),
+                    arguments: arguments.clone(),
+                    arguments_transient: true,
+                },
+            )
+            .await;
+    } else {
+        session
+            .emit_turn_item_started(turn_context, &started_item)
+            .await;
+    }
     let response = rx_response.await.ok();
 
     let item = match &response {
@@ -217,7 +249,8 @@ async fn request_dynamic_tool(
             id: call_id,
             namespace,
             tool,
-            arguments,
+            arguments: persisted_arguments,
+            arguments_transient: argument_handling.redacts_arguments(),
             status: if response.success {
                 DynamicToolCallStatus::Completed
             } else {
@@ -232,7 +265,8 @@ async fn request_dynamic_tool(
             id: call_id,
             namespace,
             tool,
-            arguments,
+            arguments: persisted_arguments,
+            arguments_transient: argument_handling.redacts_arguments(),
             status: DynamicToolCallStatus::Failed,
             content_items: Some(Vec::new()),
             success: Some(false),

@@ -316,7 +316,7 @@ async fn schedule_startup_prewarm_inner(
     let mut client_session = session.services.model_client.new_session();
     let websocket_warmup_started_at = Instant::now();
     client_session
-        .prewarm_websocket(
+        .prewarm_websocket_with_argument_policy(
             &startup_prompt,
             &startup_turn_context.model_info,
             &startup_turn_context.session_telemetry,
@@ -324,6 +324,9 @@ async fn schedule_startup_prewarm_inner(
             startup_turn_context.reasoning_summary,
             startup_turn_context.config.service_tier.clone(),
             &responses_metadata,
+            codex_rollout_trace::InferenceTraceArgumentPolicy::from_dynamic_tools(
+                &startup_turn_context.dynamic_tools,
+            ),
         )
         .await?;
     startup_turn_context.session_telemetry.record_startup_phase(

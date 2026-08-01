@@ -706,6 +706,7 @@ mod tests {
             rollout_path: None,
             history: Some(Arc::new(history)),
             include_archived: false,
+            dynamic_tools: Vec::new(),
             metadata: ThreadPersistenceMetadata {
                 cwd: None,
                 model_provider: "test-provider".to_string(),

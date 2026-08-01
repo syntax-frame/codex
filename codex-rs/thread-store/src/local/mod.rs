@@ -19,6 +19,7 @@ mod update_thread_metadata;
 mod test_support;
 
 use codex_protocol::ThreadId;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicy;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::StateDbHandle;
@@ -85,6 +86,7 @@ struct LiveRecorderEntry {
     // canonical SessionMeta is durable. Retain the mode captured when live persistence was opened
     // so missing SQLite rows can still be seeded.
     history_mode: ThreadHistoryMode,
+    argument_policy: DynamicToolArgumentPolicy,
 }
 
 #[derive(Default)]
@@ -203,6 +205,7 @@ impl LocalThreadStore {
         thread_id: ThreadId,
         recorder: RolloutRecorder,
         history_mode: ThreadHistoryMode,
+        argument_policy: DynamicToolArgumentPolicy,
     ) -> ThreadStoreResult<()> {
         match self.live_recorders.lock().await.entry(thread_id) {
             Entry::Occupied(entry) => Err(ThreadStoreError::InvalidRequest {
@@ -212,6 +215,7 @@ impl LocalThreadStore {
                 entry.insert(LiveRecorderEntry {
                     recorder,
                     history_mode,
+                    argument_policy,
                 });
                 Ok(())
             }
@@ -859,6 +863,7 @@ mod tests {
                 rollout_path: Some(rollout_path),
                 history: None,
                 include_archived: false,
+                dynamic_tools: Vec::new(),
                 metadata: ThreadPersistenceMetadata {
                     cwd: Some(home.path().to_path_buf()),
                     model_provider: "different-provider".to_string(),
@@ -914,6 +919,7 @@ mod tests {
                 rollout_path: Some(rollout_path),
                 history: None,
                 include_archived: false,
+                dynamic_tools: Vec::new(),
                 metadata: ThreadPersistenceMetadata {
                     cwd: Some(home.path().to_path_buf()),
                     model_provider: "different-provider".to_string(),
@@ -1043,6 +1049,7 @@ mod tests {
                 rollout_path: None,
                 history: None,
                 include_archived: true,
+                dynamic_tools: Vec::new(),
                 metadata: thread_metadata(),
             })
             .await
@@ -1103,6 +1110,7 @@ mod tests {
                 rollout_path: Some(rollout_path),
                 history: None,
                 include_archived: true,
+                dynamic_tools: Vec::new(),
                 metadata: thread_metadata(),
             })
             .await
@@ -1125,6 +1133,7 @@ mod tests {
                 rollout_path: Some(rollout_path),
                 history: None,
                 include_archived: true,
+                dynamic_tools: Vec::new(),
                 metadata: ThreadPersistenceMetadata {
                     cwd: None,
                     model_provider: "test-provider".to_string(),
@@ -1154,6 +1163,7 @@ mod tests {
                 rollout_path: Some(rollout_path),
                 history: None,
                 include_archived: true,
+                dynamic_tools: Vec::new(),
                 metadata: thread_metadata(),
             })
             .await
@@ -1202,6 +1212,7 @@ mod tests {
                 rollout_path: Some(rollout_path.clone()),
                 history: None,
                 include_archived: true,
+                dynamic_tools: Vec::new(),
                 metadata: thread_metadata(),
             })
             .await
@@ -1240,6 +1251,7 @@ mod tests {
                 rollout_path: Some(rollout_path),
                 history: None,
                 include_archived: true,
+                dynamic_tools: Vec::new(),
                 metadata: thread_metadata(),
             })
             .await
@@ -1410,6 +1422,7 @@ mod tests {
                 rollout_path: Some(rollout_path),
                 history: None,
                 include_archived: false,
+                dynamic_tools: Vec::new(),
                 metadata: thread_metadata(),
             })
             .await

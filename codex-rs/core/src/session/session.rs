@@ -44,6 +44,10 @@ pub(crate) struct Session {
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
+    /// Immutable authority-bearing projection policy for this thread. Keeping
+    /// it outside mutable session state lets every event/persistence boundary
+    /// apply it without taking a lock or risking a re-entrant deadlock.
+    pub(super) dynamic_tool_argument_policy: DynamicToolArgumentPolicy,
     pub(super) next_internal_sub_id: AtomicU64,
 }
 
@@ -504,6 +508,17 @@ impl Session {
         external_time_provider: Option<Arc<dyn TimeProvider>>,
         multi_agent_version: Option<MultiAgentVersion>,
     ) -> anyhow::Result<Arc<Self>> {
+        let dynamic_tool_argument_policy =
+            DynamicToolArgumentPolicy::from_dynamic_tools(&session_configuration.dynamic_tools);
+        if !dynamic_tool_argument_policy.is_empty() {
+            initial_history = dynamic_tool_argument_policy
+                .redact_serializable(&initial_history)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "failed to safely project resumed history for protected tool arguments"
+                    )
+                })?;
+        }
         debug!(
             "Configuring session: model={}; provider={:?}",
             session_configuration.collaboration_mode.model(),
@@ -647,6 +662,7 @@ impl Session {
                             rollout_path: resumed_history.rollout_path.clone(),
                             history: Some(resumed_history.history.clone()),
                             include_archived: true,
+                            dynamic_tools: session_configuration.dynamic_tools.clone(),
                             metadata: ThreadPersistenceMetadata {
                                 cwd: Some(config.cwd.to_path_buf()),
                                 model_provider: config.model_provider_id.clone(),
@@ -1151,6 +1167,7 @@ impl Session {
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,
+                dynamic_tool_argument_policy,
                 next_internal_sub_id: AtomicU64::new(0),
             });
             if let Some(network_policy_decider_session) = network_policy_decider_session {

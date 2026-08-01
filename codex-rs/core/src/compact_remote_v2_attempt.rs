@@ -65,10 +65,22 @@ pub(super) async fn run_remote_compact_v2_attempt(
             });
     }
 
-    let trace_input_history = compaction_trace
-        .is_enabled()
-        .then(|| history.raw_items().to_vec());
-    let mut input = history.for_prompt(&turn_context.model_info.input_modalities);
+    let argument_policy =
+        codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+            &turn_context.dynamic_tools,
+        );
+    let trace_input_history = compaction_trace.is_enabled().then(|| {
+        history
+            .raw_items()
+            .iter()
+            .map(|item| argument_policy.redact_response_item(item))
+            .collect()
+    });
+    let input = history.for_prompt(&turn_context.model_info.input_modalities);
+    let mut input = input
+        .iter()
+        .map(|item| argument_policy.redact_response_item(item))
+        .collect::<Vec<_>>();
     let tool_router = built_tools(
         sess.as_ref(),
         step_context.as_ref(),

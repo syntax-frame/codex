@@ -14,6 +14,7 @@ use crate::memory_usage::shell_script_for_invocation;
 use crate::sandbox_tags::permission_profile_policy_tag;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
 use crate::session::turn_context::TurnContext;
+use crate::tools::argument_privacy;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -49,6 +50,15 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    /// Whether this handler is the trusted live-only dynamic-tool boundary.
+    ///
+    /// Privacy policy metadata must never suppress hooks or normal auditing for
+    /// built-in, MCP, extension, or tool-search handlers merely because a
+    /// client supplied a colliding name.
+    fn allows_transient_arguments(&self) -> bool {
+        false
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(
             payload,
@@ -281,6 +291,10 @@ impl ToolExecutor<ToolInvocation> for ExposureOverride {
 }
 
 impl CoreToolRuntime for ExposureOverride {
+    fn allows_transient_arguments(&self) -> bool {
+        self.handler.allows_transient_arguments()
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         self.handler.matches_kind(payload)
     }
@@ -432,12 +446,16 @@ impl ToolRegistry {
             }
         }
 
-        let dispatch_trace = ToolDispatchTrace::start(&invocation);
+        let requested_argument_handling =
+            argument_privacy::handling_for(&invocation.turn, &tool_name);
         let tool = match self.tool(&tool_name) {
             Some(tool) => tool,
             None => {
+                let argument_handling = requested_argument_handling;
+                let dispatch_trace = ToolDispatchTrace::start(&invocation, argument_handling);
                 let message = unsupported_tool_call_message(&invocation.payload, &tool_name);
-                let log_payload = invocation.payload.log_payload();
+                let log_payload =
+                    argument_privacy::log_payload(&invocation.payload, argument_handling);
                 otel.tool_result_with_tags(
                     tool_name_flat.as_ref(),
                     &call_id_owned,
@@ -453,6 +471,33 @@ impl ToolRegistry {
                 return Err(err);
             }
         };
+        if requested_argument_handling.redacts_arguments() && !tool.allows_transient_arguments() {
+            // A built-in, MCP, extension, or tool-search handler can collide
+            // with a protected dynamic-tool identity. Never "downgrade" that
+            // call to persistent handling: doing so would copy its raw payload
+            // into hooks, telemetry, and rollout traces after history had
+            // already been projected. Only the trusted live dynamic bridge may
+            // receive transient arguments.
+            let dispatch_trace = ToolDispatchTrace::start(&invocation, requested_argument_handling);
+            let message = "tool call rejected by transient argument policy".to_string();
+            let log_payload =
+                argument_privacy::log_payload(&invocation.payload, requested_argument_handling);
+            otel.tool_result_with_tags(
+                tool_name_flat.as_ref(),
+                &call_id_owned,
+                log_payload.as_ref(),
+                Duration::ZERO,
+                /*success*/ false,
+                &message,
+                &base_tool_result_tags,
+                /*extra_trace_fields*/ &[],
+            );
+            let err = FunctionCallError::RespondToModel(message);
+            dispatch_trace.record_failed(&err);
+            return Err(err);
+        }
+        let argument_handling = requested_argument_handling;
+        let dispatch_trace = ToolDispatchTrace::start(&invocation, argument_handling);
 
         let telemetry_tags = tool.telemetry_tags(&invocation).await;
         let mut tool_result_tags =
@@ -468,7 +513,7 @@ impl ToolRegistry {
         }
         if !tool.matches_kind(&invocation.payload) {
             let message = format!("tool {tool_name} invoked with incompatible payload");
-            let log_payload = invocation.payload.log_payload();
+            let log_payload = argument_privacy::log_payload(&invocation.payload, argument_handling);
             otel.tool_result_with_tags(
                 tool_name_flat.as_ref(),
                 &call_id_owned,
@@ -486,7 +531,9 @@ impl ToolRegistry {
 
         notify_tool_start(&invocation).await;
 
-        if let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation) {
+        if argument_handling.is_persistent()
+            && let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation)
+        {
             match run_pre_tool_use_hooks(
                 &invocation.session,
                 &invocation.turn,
@@ -550,7 +597,7 @@ impl ToolRegistry {
 
         let response_cell = tokio::sync::Mutex::new(None);
         let invocation_for_tool = invocation.clone();
-        let log_payload = invocation.payload.log_payload();
+        let log_payload = argument_privacy::log_payload(&invocation.payload, argument_handling);
 
         let result = otel
             .log_tool_result_with_tags(
@@ -563,7 +610,13 @@ impl ToolRegistry {
                     let tool = tool.clone();
                     let response_cell = &response_cell;
                     async move {
-                        match handle_any_tool(tool.as_ref(), invocation_for_tool).await {
+                        match handle_any_tool(
+                            tool.as_ref(),
+                            invocation_for_tool,
+                            argument_handling.is_persistent(),
+                        )
+                        .await
+                        {
                             Ok(result) => {
                                 let preview = result.result.log_preview();
                                 let success = result.result.success_for_logging();
@@ -696,6 +749,7 @@ async fn notify_tool_finish_if_unclaimed(
 async fn handle_any_tool(
     tool: &dyn CoreToolRuntime,
     invocation: ToolInvocation,
+    allow_hook_payload: bool,
 ) -> Result<AnyToolResult, FunctionCallError> {
     let call_id = invocation.call_id.clone();
     let payload = invocation.payload.clone();
@@ -710,8 +764,9 @@ async fn handle_any_tool(
         )
         .await;
     }
-    let post_tool_use_payload =
-        CoreToolRuntime::post_tool_use_payload(tool, &invocation, output.as_ref());
+    let post_tool_use_payload = allow_hook_payload
+        .then(|| CoreToolRuntime::post_tool_use_payload(tool, &invocation, output.as_ref()))
+        .flatten();
     Ok(AnyToolResult {
         call_id,
         payload,

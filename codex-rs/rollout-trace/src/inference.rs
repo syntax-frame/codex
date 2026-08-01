@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicy;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
 use http::HeaderMap;
@@ -26,6 +27,29 @@ use crate::raw_event::RawTraceEventPayload;
 use crate::writer::TraceWriter;
 
 const INFERENCE_CALL_ID_HEADER: &str = "x-codex-inference-call-id";
+const PROVIDER_REFLECTION_FIELDS: [&str; 3] =
+    ["previous_response_id", "response_id", "upstream_request_id"];
+
+fn redact_provider_reflection_metadata(value: &mut JsonValue) {
+    match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                redact_provider_reflection_metadata(value);
+            }
+        }
+        JsonValue::Object(object) => {
+            for field in PROVIDER_REFLECTION_FIELDS {
+                if let Some(value) = object.get_mut(field) {
+                    *value = JsonValue::Null;
+                }
+            }
+            for value in object.values_mut() {
+                redact_provider_reflection_metadata(value);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Turn-local inference tracing context.
 ///
@@ -40,7 +64,7 @@ pub struct InferenceTraceContext {
 
 #[derive(Clone, Debug)]
 enum InferenceTraceContextState {
-    Disabled,
+    Disabled(InferenceTraceArgumentPolicy),
     Enabled(EnabledInferenceTraceContext),
 }
 
@@ -51,7 +75,11 @@ struct EnabledInferenceTraceContext {
     codex_turn_id: CodexTurnId,
     model: String,
     provider_name: String,
+    argument_policy: InferenceTraceArgumentPolicy,
 }
+
+/// Dynamic-tool argument projection applied to inference trace payloads.
+pub type InferenceTraceArgumentPolicy = DynamicToolArgumentPolicy;
 
 /// One concrete upstream request attempt.
 ///
@@ -66,7 +94,7 @@ pub struct InferenceTraceAttempt {
 
 #[derive(Debug)]
 enum InferenceTraceAttemptState {
-    Disabled,
+    Disabled(InferenceTraceArgumentPolicy),
     Enabled(EnabledInferenceTraceAttempt),
 }
 
@@ -94,8 +122,12 @@ struct TracedResponseStreamOutput<'a> {
 impl InferenceTraceContext {
     /// Builds a context that accepts trace calls and records nothing.
     pub fn disabled() -> Self {
+        Self::disabled_with_argument_policy(InferenceTraceArgumentPolicy::default())
+    }
+
+    pub fn disabled_with_argument_policy(argument_policy: InferenceTraceArgumentPolicy) -> Self {
         Self {
-            state: InferenceTraceContextState::Disabled,
+            state: InferenceTraceContextState::Disabled(argument_policy),
         }
     }
 
@@ -107,6 +139,24 @@ impl InferenceTraceContext {
         model: String,
         provider_name: String,
     ) -> Self {
+        Self::enabled_with_argument_policy(
+            writer,
+            thread_id,
+            codex_turn_id,
+            model,
+            provider_name,
+            InferenceTraceArgumentPolicy::default(),
+        )
+    }
+
+    pub fn enabled_with_argument_policy(
+        writer: Arc<TraceWriter>,
+        thread_id: AgentThreadId,
+        codex_turn_id: CodexTurnId,
+        model: String,
+        provider_name: String,
+        argument_policy: InferenceTraceArgumentPolicy,
+    ) -> Self {
         Self {
             state: InferenceTraceContextState::Enabled(EnabledInferenceTraceContext {
                 writer,
@@ -114,14 +164,20 @@ impl InferenceTraceContext {
                 codex_turn_id,
                 model,
                 provider_name,
+                argument_policy,
             }),
         }
     }
 
     /// Starts a new attempt after the concrete provider request has been built.
     pub fn start_attempt(&self) -> InferenceTraceAttempt {
-        let InferenceTraceContextState::Enabled(context) = &self.state else {
-            return InferenceTraceAttempt::disabled();
+        let context = match &self.state {
+            InferenceTraceContextState::Disabled(argument_policy) => {
+                return InferenceTraceAttempt::disabled_with_argument_policy(
+                    argument_policy.clone(),
+                );
+            }
+            InferenceTraceContextState::Enabled(context) => context,
         };
 
         InferenceTraceAttempt {
@@ -132,19 +188,59 @@ impl InferenceTraceContext {
             }),
         }
     }
+
+    /// Whether protected dynamic-tool argument/input blobs and the known
+    /// response-id/error reflection surfaces must be projected before durable
+    /// telemetry or cache writes for this turn.
+    ///
+    /// This is not general provider-output DLP; unrelated response metadata and
+    /// ordinary model output retain their normal persistence behavior.
+    pub fn protects_arguments(&self) -> bool {
+        match &self.state {
+            InferenceTraceContextState::Disabled(argument_policy) => !argument_policy.is_empty(),
+            InferenceTraceContextState::Enabled(context) => !context.argument_policy.is_empty(),
+        }
+    }
 }
 
 impl InferenceTraceAttempt {
+    pub fn protects_arguments(&self) -> bool {
+        match &self.state {
+            InferenceTraceAttemptState::Disabled(argument_policy) => !argument_policy.is_empty(),
+            InferenceTraceAttemptState::Enabled(attempt) => {
+                !attempt.context.argument_policy.is_empty()
+            }
+        }
+    }
+
+    /// Projects an output item for any cache or replay surface that outlives
+    /// the live stream delivery. The caller may still forward the original item
+    /// synchronously to the active trusted host.
+    pub fn project_response_item(&self, item: &ResponseItem) -> ResponseItem {
+        match &self.state {
+            InferenceTraceAttemptState::Disabled(argument_policy) => {
+                argument_policy.redact_response_item(item)
+            }
+            InferenceTraceAttemptState::Enabled(attempt) => {
+                attempt.context.argument_policy.redact_response_item(item)
+            }
+        }
+    }
+
     /// Builds an attempt that records nothing.
     pub fn disabled() -> Self {
+        Self::disabled_with_argument_policy(InferenceTraceArgumentPolicy::default())
+    }
+
+    pub fn disabled_with_argument_policy(argument_policy: InferenceTraceArgumentPolicy) -> Self {
         Self {
-            state: InferenceTraceAttemptState::Disabled,
+            state: InferenceTraceAttemptState::Disabled(argument_policy),
         }
     }
 
     fn inference_call_id(&self) -> Option<&str> {
         match &self.state {
-            InferenceTraceAttemptState::Disabled => None,
+            InferenceTraceAttemptState::Disabled(_) => None,
             InferenceTraceAttemptState::Enabled(attempt) => {
                 Some(attempt.inference_call_id.as_str())
             }
@@ -175,11 +271,25 @@ impl InferenceTraceAttempt {
         let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
             return;
         };
-        let Some(request_payload) = write_json_payload_best_effort(
-            &attempt.context.writer,
-            RawPayloadKind::InferenceRequest,
-            request,
-        ) else {
+        let request_payload = if attempt.context.argument_policy.is_empty() {
+            write_json_payload_best_effort(
+                &attempt.context.writer,
+                RawPayloadKind::InferenceRequest,
+                request,
+            )
+        } else {
+            let Ok(mut projected) = serde_json::to_value(request) else {
+                return;
+            };
+            attempt.context.argument_policy.redact_json(&mut projected);
+            redact_provider_reflection_metadata(&mut projected);
+            write_json_payload_best_effort(
+                &attempt.context.writer,
+                RawPayloadKind::InferenceRequest,
+                &projected,
+            )
+        };
+        let Some(request_payload) = request_payload else {
             return;
         };
 
@@ -212,10 +322,15 @@ impl InferenceTraceAttempt {
         let Some(attempt) = self.take_terminal_attempt() else {
             return;
         };
+        let provider_metadata_allowed = attempt.context.argument_policy.is_empty();
+        let durable_response_id = provider_metadata_allowed.then_some(response_id);
+        let durable_upstream_request_id = provider_metadata_allowed
+            .then_some(upstream_request_id)
+            .flatten();
         let Some(response_payload) = write_response_payload_best_effort(
             attempt,
-            Some(response_id),
-            upstream_request_id,
+            durable_response_id,
+            durable_upstream_request_id,
             token_usage.as_ref(),
             output_items,
         ) else {
@@ -226,8 +341,8 @@ impl InferenceTraceAttempt {
             &attempt.context,
             RawTraceEventPayload::InferenceCompleted {
                 inference_call_id: attempt.inference_call_id.clone(),
-                response_id: Some(response_id.to_string()),
-                upstream_request_id: upstream_request_id.map(str::to_string),
+                response_id: durable_response_id.map(str::to_string),
+                upstream_request_id: durable_upstream_request_id.map(str::to_string),
                 response_payload,
             },
         );
@@ -243,13 +358,19 @@ impl InferenceTraceAttempt {
         let Some(attempt) = self.take_terminal_attempt() else {
             return;
         };
+        let durable_upstream_request_id = attempt
+            .context
+            .argument_policy
+            .is_empty()
+            .then_some(upstream_request_id)
+            .flatten();
         let partial_response_payload = if output_items.is_empty() {
             None
         } else {
             write_response_payload_best_effort(
                 attempt,
                 /*response_id*/ None,
-                upstream_request_id,
+                durable_upstream_request_id,
                 /*token_usage*/ None,
                 output_items,
             )
@@ -258,8 +379,12 @@ impl InferenceTraceAttempt {
             &attempt.context,
             RawTraceEventPayload::InferenceFailed {
                 inference_call_id: attempt.inference_call_id.clone(),
-                upstream_request_id: upstream_request_id.map(str::to_string),
-                error: error.to_string(),
+                upstream_request_id: durable_upstream_request_id.map(str::to_string),
+                error: if attempt.context.argument_policy.is_empty() {
+                    error.to_string()
+                } else {
+                    "inference failed while transient tool arguments were active".to_string()
+                },
                 partial_response_payload,
             },
         );
@@ -279,13 +404,19 @@ impl InferenceTraceAttempt {
         let Some(attempt) = self.take_terminal_attempt() else {
             return;
         };
+        let durable_upstream_request_id = attempt
+            .context
+            .argument_policy
+            .is_empty()
+            .then_some(upstream_request_id)
+            .flatten();
         let partial_response_payload = if output_items.is_empty() {
             None
         } else {
             write_response_payload_best_effort(
                 attempt,
                 /*response_id*/ None,
-                upstream_request_id,
+                durable_upstream_request_id,
                 /*token_usage*/ None,
                 output_items,
             )
@@ -294,8 +425,12 @@ impl InferenceTraceAttempt {
             &attempt.context,
             RawTraceEventPayload::InferenceCancelled {
                 inference_call_id: attempt.inference_call_id.clone(),
-                upstream_request_id: upstream_request_id.map(str::to_string),
-                reason: reason.to_string(),
+                upstream_request_id: durable_upstream_request_id.map(str::to_string),
+                reason: if attempt.context.argument_policy.is_empty() {
+                    reason.to_string()
+                } else {
+                    "inference cancelled while transient tool arguments were active".to_string()
+                },
                 partial_response_payload,
             },
         );
@@ -303,7 +438,7 @@ impl InferenceTraceAttempt {
 
     fn take_terminal_attempt(&self) -> Option<&EnabledInferenceTraceAttempt> {
         let attempt = match &self.state {
-            InferenceTraceAttemptState::Disabled => return None,
+            InferenceTraceAttemptState::Disabled(_) => return None,
             InferenceTraceAttemptState::Enabled(attempt) => attempt,
         };
         if attempt.terminal_recorded.swap(true, Ordering::AcqRel) {
@@ -363,11 +498,21 @@ fn write_response_payload_best_effort(
     token_usage: Option<&TokenUsage>,
     output_items: &[ResponseItem],
 ) -> Option<crate::RawPayloadRef> {
+    let provider_metadata_allowed = attempt.context.argument_policy.is_empty();
     let response_payload = TracedResponseStreamOutput {
-        response_id,
-        upstream_request_id,
+        response_id: provider_metadata_allowed.then_some(response_id).flatten(),
+        upstream_request_id: provider_metadata_allowed
+            .then_some(upstream_request_id)
+            .flatten(),
         token_usage,
-        output_items: output_items.iter().map(trace_response_item_json).collect(),
+        output_items: output_items
+            .iter()
+            .map(|item| {
+                let mut item = trace_response_item_json(item);
+                attempt.context.argument_policy.redact_json(&mut item);
+                item
+            })
+            .collect(),
     };
     write_json_payload_best_effort(
         &attempt.context.writer,
@@ -389,9 +534,14 @@ fn append_with_context_best_effort(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
     use std::sync::Arc;
 
     use codex_protocol::ResponseItemId;
+    use codex_protocol::dynamic_tools::DynamicToolArgumentIdentity;
+    use codex_protocol::dynamic_tools::DynamicToolArgumentPolicySpec;
+    use codex_protocol::dynamic_tools::DynamicToolSpec;
     use codex_protocol::models::ReasoningItemContent;
     use codex_protocol::models::ReasoningItemReasoningSummary;
     use pretty_assertions::assert_eq;
@@ -401,6 +551,33 @@ mod tests {
     use super::*;
     use crate::model::ExecutionStatus;
     use crate::replay_bundle;
+
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+
+    fn protected_browser_policy() -> DynamicToolArgumentPolicy {
+        DynamicToolArgumentPolicy::from_dynamic_tools(&[DynamicToolSpec::ArgumentPolicy(
+            DynamicToolArgumentPolicySpec::trusted_transient(vec![DynamicToolArgumentIdentity {
+                namespace: None,
+                name: "agentapp_browser_act".to_string(),
+                match_any_namespace: true,
+                match_case_insensitive: true,
+            }])
+            .expect("trusted browser policy"),
+        )])
+    }
+
+    fn read_artifact_tree(root: &Path) -> anyhow::Result<String> {
+        let mut artifact = String::new();
+        for entry in fs::read_dir(root)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                artifact.push_str(&read_artifact_tree(&path)?);
+            } else {
+                artifact.push_str(&String::from_utf8_lossy(&fs::read(path)?));
+            }
+        }
+        Ok(artifact)
+    }
 
     #[test]
     fn disabled_attempt_adds_no_request_headers() {
@@ -491,6 +668,103 @@ mod tests {
         assert_eq!(inference.upstream_request_id, Some("req-1".to_string()));
         assert_eq!(rollout.raw_payloads.len(), 2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn protected_inference_artifacts_project_completed_failed_and_cancelled_arguments()
+    -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let writer = Arc::new(TraceWriter::create(
+            temp.path(),
+            "trace-protected".to_string(),
+            "rollout-protected".to_string(),
+            "thread-root".to_string(),
+        )?);
+        writer.append(RawTraceEventPayload::ThreadStarted {
+            thread_id: "thread-root".to_string(),
+            agent_path: "/root".to_string(),
+            metadata_payload: None,
+        })?;
+        writer.append(RawTraceEventPayload::CodexTurnStarted {
+            codex_turn_id: "turn-protected".to_string(),
+            thread_id: "thread-root".to_string(),
+        })?;
+        let context = InferenceTraceContext::enabled_with_argument_policy(
+            Arc::clone(&writer),
+            "thread-root".to_string(),
+            "turn-protected".to_string(),
+            "gpt-test".to_string(),
+            "test-provider".to_string(),
+            protected_browser_policy(),
+        );
+        let request = json!({
+            "model": "gpt-test",
+            "previous_response_id": SENTINEL,
+            "input": [{
+                "type": "function_call",
+                "name": "agentapp_browser_act",
+                "call_id": "browser-call-request",
+                "arguments": {
+                    "aliases": {
+                        "pwd": SENTINEL,
+                        "encoded": "UkFXX0JST1dTRVJfQVJHVU1FTlRfU0VOVElORUw=",
+                    }
+                },
+            }],
+        });
+        let output_item = ResponseItem::FunctionCall {
+            id: None,
+            name: "agentapp_browser_act".to_string(),
+            namespace: None,
+            arguments: format!(r#"{{"otp":"004201","nested":{{"value":"{SENTINEL}"}}}}"#),
+            call_id: "browser-call-output".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+
+        let completed = context.start_attempt();
+        completed.record_started(&request);
+        completed.record_completed(
+            SENTINEL,
+            Some(SENTINEL),
+            &None,
+            std::slice::from_ref(&output_item),
+        );
+
+        let failed = context.start_attempt();
+        failed.record_started(&request);
+        failed.record_failed(
+            format!("provider failure {SENTINEL}"),
+            Some(SENTINEL),
+            std::slice::from_ref(&output_item),
+        );
+
+        let cancelled = context.start_attempt();
+        cancelled.record_started(&request);
+        cancelled.record_cancelled(
+            format!("user interrupted {SENTINEL}"),
+            Some(SENTINEL),
+            std::slice::from_ref(&output_item),
+        );
+
+        let artifact = read_artifact_tree(temp.path())?;
+        assert!(!artifact.contains(SENTINEL));
+        assert!(!artifact.contains("UkFXX0JST1dTRVJfQVJHVU1FTlRfU0VOVElORUw="));
+        assert!(artifact.contains("agentapp_browser_act"));
+        assert!(artifact.contains("browser-call-output"));
+        assert!(artifact.contains("inference failed while transient tool arguments were active"));
+        assert!(
+            artifact.contains("inference cancelled while transient tool arguments were active")
+        );
+
+        let rollout = replay_bundle(temp.path())?;
+        assert_eq!(rollout.inference_calls.len(), 3);
+        assert!(
+            rollout
+                .inference_calls
+                .values()
+                .all(|inference| inference.upstream_request_id.is_none())
+        );
         Ok(())
     }
 

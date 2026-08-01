@@ -254,6 +254,14 @@ async fn run_compact_task_inner_impl(
         let turn_input = history
             .clone()
             .for_prompt(&turn_context.model_info.input_modalities);
+        let argument_policy =
+            codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+                &turn_context.dynamic_tools,
+            );
+        let turn_input = turn_input
+            .iter()
+            .map(|item| argument_policy.redact_response_item(item))
+            .collect::<Vec<_>>();
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
@@ -668,6 +676,11 @@ async fn drain_to_completed(
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
 ) -> CodexResult<()> {
+    let inference_trace = InferenceTraceContext::disabled_with_argument_policy(
+        codex_rollout_trace::InferenceTraceArgumentPolicy::from_dynamic_tools(
+            &turn_context.dynamic_tools,
+        ),
+    );
     let mut stream = client_session
         .stream(
             prompt,
@@ -679,7 +692,7 @@ async fn drain_to_completed(
             responses_metadata,
             // Rollout tracing currently models remote compaction only; local compaction streams
             // are left untraced until the reducer has a first-class local compaction lifecycle.
-            &InferenceTraceContext::disabled(),
+            &inference_trace,
         )
         .await?;
     loop {

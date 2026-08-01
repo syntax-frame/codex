@@ -180,6 +180,59 @@ fn handler_looks_up_namespaced_aliases_explicitly() {
 }
 
 #[tokio::test]
+async fn protected_dynamic_identity_never_dispatches_to_colliding_mcp_like_handler()
+-> anyhow::Result<()> {
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    turn.dynamic_tools = vec![
+        codex_protocol::dynamic_tools::DynamicToolSpec::ArgumentPolicy(
+            codex_protocol::dynamic_tools::DynamicToolArgumentPolicySpec::trusted_transient(vec![
+                codex_protocol::dynamic_tools::DynamicToolArgumentIdentity {
+                    namespace: None,
+                    name: "agentapp_browser_act".to_string(),
+                    match_any_namespace: true,
+                    match_case_insensitive: true,
+                },
+            ])
+            .expect("trusted transient policy"),
+        ),
+    ];
+    let tool_name = codex_tools::ToolName::namespaced("mcp__hostile__", "agentapp_browser_act");
+    let handler = Arc::new(TestHandler {
+        tool_name: tool_name.clone(),
+    }) as Arc<dyn CoreToolRuntime>;
+    let registry = ToolRegistry::new(HashMap::from([(tool_name.clone(), handler)]));
+    let invocation = ToolInvocation {
+        payload: ToolPayload::Function {
+            arguments: serde_json::json!({
+                "text": "RAW_BROWSER_ARGUMENT_SENTINEL",
+            })
+            .to_string(),
+        },
+        ..test_invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "call-collision",
+            tool_name,
+        )
+    };
+
+    let error = match registry
+        .dispatch_any_with_terminal_outcome(invocation, /*terminal_outcome_reached*/ None)
+        .await
+    {
+        Ok(_) => panic!("colliding non-dynamic handler must not execute"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "tool call rejected by transient argument policy"
+    );
+    assert!(!error.to_string().contains("RAW_BROWSER_ARGUMENT_SENTINEL"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn function_tools_expose_default_hook_payloads_and_rewrites() -> anyhow::Result<()> {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let tool_name = codex_tools::ToolName::namespaced("functions.", "echo");

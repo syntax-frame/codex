@@ -24,6 +24,7 @@ use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
@@ -178,6 +179,38 @@ fn effective_originator_prefers_thread_scoped_sources_before_env_originator() {
             expected_originator
         );
     }
+}
+
+#[tokio::test]
+async fn missing_live_parent_inherits_no_dynamic_tool_authority() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let missing_parent = ThreadId::new();
+    let inherited = manager
+        .state
+        .inherited_dynamic_tools_for_spawn(
+            &SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: missing_parent,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            }),
+            Some(missing_parent),
+            /*forked_from_thread_id*/ None,
+        )
+        .await;
+
+    assert!(inherited.is_empty());
 }
 
 #[test]

@@ -1,4 +1,5 @@
 mod approvals;
+pub(crate) mod argument_privacy;
 #[cfg(feature = "code-mode")]
 pub(crate) mod code_mode;
 pub(crate) mod context;
@@ -85,7 +86,7 @@ fn resolve_effective_tool_mode(
         return ToolMode::Direct;
     }
 
-    model_tool_mode.unwrap_or_else(|| {
+    model_tool_mode.unwrap_or({
         if code_mode_only_enabled {
             ToolMode::CodeModeOnly
         } else if code_mode_enabled {
@@ -94,39 +95,6 @@ fn resolve_effective_tool_mode(
             ToolMode::Direct
         }
     })
-}
-
-#[cfg(test)]
-mod effective_tool_mode_tests {
-    use super::resolve_effective_tool_mode;
-    use codex_protocol::openai_models::ToolMode;
-
-    #[test]
-    fn unavailable_code_mode_runtime_forces_direct_tools() {
-        for requested in [Some(ToolMode::CodeMode), Some(ToolMode::CodeModeOnly), None] {
-            assert_eq!(
-                resolve_effective_tool_mode(
-                    requested, /*code_mode_enabled*/ true,
-                    /*code_mode_only_enabled*/ true,
-                    /*code_mode_runtime_available*/ false,
-                ),
-                ToolMode::Direct
-            );
-        }
-    }
-
-    #[test]
-    fn available_code_mode_runtime_honors_model_selector() {
-        assert_eq!(
-            resolve_effective_tool_mode(
-                Some(ToolMode::CodeModeOnly),
-                /*code_mode_enabled*/ false,
-                /*code_mode_only_enabled*/ false,
-                /*code_mode_runtime_available*/ true,
-            ),
-            ToolMode::CodeModeOnly
-        );
-    }
 }
 
 /// Format the combined exec output for sending back to the model.
@@ -178,5 +146,38 @@ fn build_content_with_timeout(exec_output: &ExecToolCallOutput) -> String {
         )
     } else {
         exec_output.aggregated_output.text.clone()
+    }
+}
+
+#[cfg(test)]
+mod effective_tool_mode_tests {
+    use super::resolve_effective_tool_mode;
+    use codex_protocol::openai_models::ToolMode;
+
+    #[test]
+    fn unavailable_code_mode_runtime_forces_direct_tools() {
+        for requested in [Some(ToolMode::CodeMode), Some(ToolMode::CodeModeOnly), None] {
+            assert_eq!(
+                resolve_effective_tool_mode(
+                    requested, /*code_mode_enabled*/ true,
+                    /*code_mode_only_enabled*/ true,
+                    /*code_mode_runtime_available*/ false,
+                ),
+                ToolMode::Direct
+            );
+        }
+    }
+
+    #[test]
+    fn available_code_mode_runtime_honors_model_selector() {
+        assert_eq!(
+            resolve_effective_tool_mode(
+                Some(ToolMode::CodeModeOnly),
+                /*code_mode_enabled*/ false,
+                /*code_mode_only_enabled*/ false,
+                /*code_mode_runtime_available*/ true,
+            ),
+            ToolMode::CodeModeOnly
+        );
     }
 }

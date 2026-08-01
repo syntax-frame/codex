@@ -57,10 +57,22 @@ pub(super) async fn run_remote_compact_attempt(
                     .saturating_sub(estimated_deleted_tokens.min(max_local_deleted_tokens))
             });
     }
-    let trace_input_history = compaction_trace
-        .is_enabled()
-        .then(|| history.raw_items().to_vec());
+    let argument_policy =
+        codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+            &turn_context.dynamic_tools,
+        );
+    let trace_input_history = compaction_trace.is_enabled().then(|| {
+        history
+            .raw_items()
+            .iter()
+            .map(|item| argument_policy.redact_response_item(item))
+            .collect()
+    });
     let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
+    let prompt_input = prompt_input
+        .iter()
+        .map(|item| argument_policy.redact_response_item(item))
+        .collect();
     let tool_router = built_tools(
         sess.as_ref(),
         step_context.as_ref(),

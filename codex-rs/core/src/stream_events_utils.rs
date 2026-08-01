@@ -303,7 +303,10 @@ pub(crate) async fn handle_output_item_done(
                 )
                 .await;
 
-            let payload_preview = call.payload.log_payload().into_owned();
+            let argument_handling =
+                crate::tools::argument_privacy::handling_for(&ctx.turn_context, &call.tool_name);
+            let payload_preview =
+                crate::tools::argument_privacy::log_payload(&call.payload, argument_handling);
             tracing::info!(
                 thread_id = %ctx.sess.thread_id,
                 "ToolCall: {} {}",

@@ -442,8 +442,18 @@ pub fn process_responses_event(
                         }));
                     }
                     Err(err) => {
-                        let error = format!("failed to parse ResponseCompleted: {err}");
-                        debug!("{error}");
+                        let error = format!(
+                            "failed to parse ResponseCompleted ({:?} at {}:{})",
+                            err.classify(),
+                            err.line(),
+                            err.column()
+                        );
+                        debug!(
+                            error_category = ?err.classify(),
+                            error_line = err.line(),
+                            error_column = err.column(),
+                            "failed to parse ResponseCompleted"
+                        );
                         return Err(ResponsesEventError::Api(ApiError::Stream(error)));
                     }
                 }
@@ -465,7 +475,7 @@ pub fn process_responses_event(
             }
         }
         _ => {
-            trace!("unhandled responses event: {}", event.kind);
+            trace!("unhandled responses event kind");
         }
     }
 
@@ -509,7 +519,10 @@ async fn process_sse_with_treatment(
         let sse = match response {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
-                debug!("SSE Error: {e:#}");
+                debug!(
+                    error_type = std::any::type_name_of_val(&e),
+                    "SSE transport error"
+                );
                 let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
                 return;
             }
@@ -528,12 +541,17 @@ async fn process_sse_with_treatment(
             }
         };
 
-        trace!("SSE event: {}", &sse.data);
+        trace!("SSE event received");
 
         let event: ResponsesStreamEvent = match serde_json::from_str(&sse.data) {
             Ok(event) => event,
             Err(e) => {
-                debug!("Failed to parse SSE event: {e}, data: {}", &sse.data);
+                debug!(
+                    error_category = ?e.classify(),
+                    error_line = e.line(),
+                    error_column = e.column(),
+                    "failed to parse SSE event"
+                );
                 continue;
             }
         };
@@ -663,6 +681,10 @@ fn rate_limit_regex() -> &'static regex_lite::Regex {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::io::Write;
+    use std::sync::Mutex;
+
     use super::*;
     use assert_matches::assert_matches;
     use bytes::Bytes;
@@ -680,6 +702,41 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_test::io::Builder as IoBuilder;
     use tokio_util::io::ReaderStream;
+
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+
+    #[derive(Clone)]
+    struct TestLogWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct TestLogSink {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
+        type Writer = TestLogSink;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            TestLogSink {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    impl Write for TestLogSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     async fn collect_events(chunks: &[&[u8]]) -> Vec<Result<ResponseEvent, ApiError>> {
         let mut builder = IoBuilder::new();
@@ -738,6 +795,46 @@ mod tests {
 
     fn idle_timeout() -> Duration {
         Duration::from_millis(1000)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_responses_sse_logs_no_provider_content() {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(TestLogWriter {
+                buffer: Arc::clone(&buffer),
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let body = format!(
+            "data: {{\"type\":\"response.output_item.done\",\"item\":\"{SENTINEL}\"\n\n\
+             data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp\",\"usage\":\"{SENTINEL}\"}}}}\n\n"
+        );
+        let stream = ReaderStream::new(std::io::Cursor::new(body))
+            .map_err(|err| TransportError::Network(err.to_string()));
+        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        process_sse(
+            Box::pin(stream),
+            tx,
+            idle_timeout(),
+            /*telemetry*/ None,
+        )
+        .await;
+        while rx.recv().await.is_some() {}
+
+        let logs = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("utf-8 logs");
+        assert!(logs.contains("failed to parse SSE event"));
+        assert!(logs.contains("failed to parse ResponseCompleted"));
+        assert!(!logs.contains(SENTINEL));
     }
 
     #[tokio::test]

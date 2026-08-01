@@ -283,6 +283,12 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
         namespace: Option<&str>,
         seen: &mut HashSet<&'a str>,
     ) -> Result<(), String> {
+        if tool.argument_handling.redacts_arguments() {
+            return Err(
+                "transient dynamic tool argument handling is reserved for trusted host bridges"
+                    .to_string(),
+            );
+        }
         let name = tool.name.trim();
         if name.is_empty() {
             return Err("dynamic tool name must not be empty".to_string());
@@ -370,6 +376,12 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
                     let DynamicToolNamespaceTool::Function(tool) = tool;
                     validate_dynamic_tool(tool, Some(name), &mut seen_namespace_tools)?;
                 }
+            }
+            DynamicToolSpec::ArgumentPolicy(_) => {
+                return Err(
+                    "dynamic tool argument policies are reserved for trusted host bridges"
+                        .to_string(),
+                );
             }
         }
     }
@@ -1222,6 +1234,7 @@ impl ThreadRequestProcessor {
             .map(|tool| match tool {
                 DynamicToolSpec::Function(_) => 1,
                 DynamicToolSpec::Namespace(namespace) => namespace.tools.len(),
+                DynamicToolSpec::ArgumentPolicy(_) => 0,
             })
             .sum();
         let mut thread_extension_init = ExtensionDataInit::new();

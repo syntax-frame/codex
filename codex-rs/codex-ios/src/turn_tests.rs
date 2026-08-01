@@ -13,6 +13,7 @@ use codex_protocol::items::UserMessageItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::ItemStartedEvent;
 
+use super::AGENTAPP_BROWSER_TOOL_NAMES;
 use super::CONTEXT_POINTER_FILE;
 use super::KIND_CONTEXT_COMPACTION_STARTED;
 use super::KIND_ERROR;
@@ -22,6 +23,7 @@ use super::codex_ios_tool_discovery_contract_version;
 use super::codex_run_turn_streaming_apikey;
 use super::codex_steer_turn;
 use super::emit_item_started_events;
+use super::parse_agentapp_dynamic_tools_json;
 use super::parse_reasoning_effort;
 use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
@@ -144,6 +146,160 @@ fn reasoning_effort_supports_automatic_known_and_future_values() {
         parse_reasoning_effort("future-tier").unwrap(),
         Some(ReasoningEffort::Custom("future-tier".to_string()))
     );
+}
+
+#[test]
+fn browser_argument_policy_is_bridge_owned_and_present_when_catalog_is_off() {
+    let tools = parse_agentapp_dynamic_tools_json("[]").expect("Off catalog");
+    assert_eq!(tools.len(), 1);
+    let codex_protocol::dynamic_tools::DynamicToolSpec::ArgumentPolicy(policy) = &tools[0] else {
+        panic!("privacy-only policy");
+    };
+    assert!(policy.is_trusted());
+    assert_eq!(policy.tools.len(), AGENTAPP_BROWSER_TOOL_NAMES.len() * 3);
+    let runtime_policy =
+        codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(&tools);
+    for name in AGENTAPP_BROWSER_TOOL_NAMES {
+        let identity = policy
+            .tools
+            .iter()
+            .find(|identity| identity.name == name)
+            .expect("canonical identity");
+        assert!(
+            identity.match_any_namespace,
+            "canonical browser names stay protected across namespace shifts"
+        );
+        assert!(
+            runtime_policy
+                .handling_for(Some("hostile__namespace"), name)
+                .redacts_arguments()
+        );
+
+        let suffix = name
+            .strip_prefix("agentapp_browser_")
+            .expect("canonical browser prefix");
+        assert!(
+            runtime_policy
+                .handling_for(None, &format!("browser.{suffix}"))
+                .redacts_arguments()
+        );
+        assert!(
+            runtime_policy
+                .handling_for(Some("browser"), suffix)
+                .redacts_arguments()
+        );
+    }
+}
+
+#[test]
+fn bridge_marks_exact_browser_functions_transient_and_leaves_other_tools_persistent() {
+    let mut wire_tools = AGENTAPP_BROWSER_TOOL_NAMES
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "type": "function",
+                "name": name,
+                "description": "browser",
+                "inputSchema": {"type": "object", "properties": {}},
+                "deferLoading": false
+            })
+        })
+        .collect::<Vec<_>>();
+    wire_tools.push(serde_json::json!({
+        "type": "function",
+        "name": "ordinary_tool",
+        "description": "ordinary",
+        "inputSchema": {"type": "object", "properties": {}},
+        "deferLoading": false
+    }));
+    let tools =
+        parse_agentapp_dynamic_tools_json(&serde_json::to_string(&wire_tools).expect("wire JSON"))
+            .expect("bridge tools");
+
+    let functions = tools
+        .iter()
+        .filter_map(|spec| match spec {
+            codex_protocol::dynamic_tools::DynamicToolSpec::Function(function) => Some(function),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(functions.len(), AGENTAPP_BROWSER_TOOL_NAMES.len() + 1);
+    for function in functions {
+        if AGENTAPP_BROWSER_TOOL_NAMES.contains(&function.name.as_str()) {
+            assert!(function.argument_handling.redacts_arguments());
+        } else {
+            assert!(function.argument_handling.is_persistent());
+        }
+    }
+}
+
+#[test]
+fn bridge_rejects_client_supplied_privacy_authority() {
+    let client_policy = serde_json::json!([{
+        "type": "argumentPolicy",
+        "argumentHandling": "transient",
+        "tools": [{
+            "name": "exec_command",
+            "matchAnyNamespace": true
+        }]
+    }]);
+    assert!(
+        parse_agentapp_dynamic_tools_json(&client_policy.to_string())
+            .expect_err("client policy must fail")
+            .contains("cannot supply argument privacy policies")
+    );
+
+    let client_transient_function = serde_json::json!([{
+        "type": "function",
+        "name": "exec_command",
+        "description": "collision",
+        "inputSchema": {"type": "object", "properties": {}},
+        "argumentHandling": "transient"
+    }]);
+    assert!(
+        parse_agentapp_dynamic_tools_json(&client_transient_function.to_string())
+            .expect_err("client transient function must fail")
+            .contains("cannot set transient argument handling")
+    );
+}
+
+#[test]
+fn bridge_reserves_browser_names_across_case_and_namespaces() {
+    let case_variant = serde_json::json!([{
+        "type": "function",
+        "name": "AGENTAPP_BROWSER_ACT",
+        "description": "browser",
+        "inputSchema": {"type": "object", "properties": {}}
+    }]);
+    let tools =
+        parse_agentapp_dynamic_tools_json(&case_variant.to_string()).expect("case variant tool");
+    let function = tools
+        .iter()
+        .find_map(|spec| match spec {
+            codex_protocol::dynamic_tools::DynamicToolSpec::Function(function) => Some(function),
+            _ => None,
+        })
+        .expect("function");
+    assert!(function.argument_handling.redacts_arguments());
+
+    for namespace in ["", "mcp_server"] {
+        let namespaced_collision = serde_json::json!([{
+            "type": "namespace",
+            "name": namespace,
+            "description": "hostile namespace shift",
+            "tools": [{
+                "type": "function",
+                "name": "agentapp_browser_act",
+                "description": "collision",
+                "inputSchema": {"type": "object", "properties": {}}
+            }]
+        }]);
+        assert!(
+            parse_agentapp_dynamic_tools_json(&namespaced_collision.to_string())
+                .expect_err("reserved browser name must not be namespaced")
+                .contains("reserved for the root namespace")
+        );
+    }
 }
 
 #[test]

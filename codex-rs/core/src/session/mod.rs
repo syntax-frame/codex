@@ -98,6 +98,9 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicy;
+use codex_protocol::dynamic_tools::DynamicToolCallRequest;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::EnteredReviewModeItem;
@@ -465,6 +468,53 @@ pub(crate) fn resolve_multi_agent_version(
         })
 }
 
+fn retain_authorized_transient_dynamic_tools(
+    dynamic_tools: Vec<DynamicToolSpec>,
+) -> Result<Vec<DynamicToolSpec>, &'static str> {
+    let policy = DynamicToolArgumentPolicy::from_dynamic_tools(&dynamic_tools);
+    let requires_transient_authority = dynamic_tools.iter().any(|spec| match spec {
+        DynamicToolSpec::Function(function) => function.argument_handling.redacts_arguments(),
+        DynamicToolSpec::Namespace(namespace) => namespace.tools.iter().any(|tool| {
+            let DynamicToolNamespaceTool::Function(function) = tool;
+            function.argument_handling.redacts_arguments()
+        }),
+        DynamicToolSpec::ArgumentPolicy(_) => true,
+    });
+    if requires_transient_authority && policy.is_empty() {
+        return Err(
+            "transient dynamic tools require fresh trusted host registration before resume",
+        );
+    }
+    Ok(dynamic_tools
+        .into_iter()
+        .filter_map(|spec| match spec {
+            DynamicToolSpec::Function(function)
+                if function.argument_handling.redacts_arguments()
+                    && !policy
+                        .handling_for(/*namespace*/ None, &function.name)
+                        .redacts_arguments() =>
+            {
+                None
+            }
+            DynamicToolSpec::Function(function) => Some(DynamicToolSpec::Function(function)),
+            DynamicToolSpec::Namespace(mut namespace) => {
+                let namespace_name = namespace.name.clone();
+                namespace.tools.retain(|tool| {
+                    let DynamicToolNamespaceTool::Function(function) = tool;
+                    function.argument_handling.is_persistent()
+                        || policy
+                            .handling_for(Some(&namespace_name), &function.name)
+                            .redacts_arguments()
+                });
+                (!namespace.tools.is_empty()).then_some(DynamicToolSpec::Namespace(namespace))
+            }
+            DynamicToolSpec::ArgumentPolicy(policy) => policy
+                .is_trusted()
+                .then_some(DynamicToolSpec::ArgumentPolicy(policy)),
+        })
+        .collect())
+}
+
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
@@ -638,6 +688,8 @@ impl Session {
         } else {
             dynamic_tools
         };
+        let dynamic_tools = retain_authorized_transient_dynamic_tools(dynamic_tools)
+            .map_err(|message| CodexErr::Fatal(message.to_string()))?;
         // TODO (aibrahim): Consolidate config.model and config.model_reasoning_effort into config.collaboration_mode
         // to avoid extracting these fields separately and constructing CollaborationMode here.
         let collaboration_mode = CollaborationMode {
@@ -1513,6 +1565,15 @@ impl Session {
         state.session_configuration.thread_config_snapshot()
     }
 
+    /// Clone the live, host-authorized dynamic-tool catalog for an in-process
+    /// child or fork. Persisted history is intentionally not a source of this
+    /// authority; cold process resumes must receive a fresh catalog from the
+    /// trusted host.
+    pub(crate) async fn dynamic_tools_snapshot(&self) -> Vec<DynamicToolSpec> {
+        let state = self.state.lock().await;
+        state.session_configuration.dynamic_tools.clone()
+    }
+
     pub(crate) async fn set_app_server_client_info(
         &self,
         app_server_client_name: Option<String>,
@@ -1745,8 +1806,50 @@ impl Session {
             ));
     }
 
+    fn project_event_for_argument_privacy(&self, msg: EventMsg) -> EventMsg {
+        let policy = &self.dynamic_tool_argument_policy;
+        let msg = if policy.is_empty() {
+            msg
+        } else {
+            match msg {
+                EventMsg::Error(error) => EventMsg::Error(ErrorEvent {
+                    message: "A protected turn failed.".to_string(),
+                    codex_error_info: error.codex_error_info,
+                }),
+                EventMsg::StreamError(error) => EventMsg::StreamError(StreamErrorEvent {
+                    message: "The protected response stream was interrupted.".to_string(),
+                    codex_error_info: error.codex_error_info,
+                    additional_details: None,
+                }),
+                EventMsg::RawResponseCompleted(mut event) => {
+                    event.response_id = "protected-response".to_string();
+                    EventMsg::RawResponseCompleted(event)
+                }
+                other => other,
+            }
+        };
+        match policy.redact_serializable(&msg) {
+            Ok(projected) => projected,
+            Err(error) => {
+                error!(
+                    error_type = std::any::type_name_of_val(&error),
+                    "failed to project event for transient argument privacy"
+                );
+                let codex_error_info = match msg {
+                    EventMsg::Error(error) => error.codex_error_info,
+                    _ => None,
+                };
+                EventMsg::Error(ErrorEvent {
+                    message: "A protected tool event could not be safely represented.".to_string(),
+                    codex_error_info,
+                })
+            }
+        }
+    }
+
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+        let msg = self.project_event_for_argument_privacy(msg);
         let legacy_source = msg.clone();
         if let EventMsg::Error(error) = &legacy_source
             && error
@@ -1789,6 +1892,24 @@ impl Session {
             };
             self.send_event_raw(legacy_event).await;
         }
+    }
+
+    /// Persists and delivers one canonical event without synthesizing legacy
+    /// compatibility events. Transient dynamic calls use this for their
+    /// content-free item lifecycle before a separate live-only request.
+    async fn send_event_without_legacy(&self, turn_context: &TurnContext, msg: EventMsg) {
+        let msg = self.project_event_for_argument_privacy(msg);
+        self.services
+            .rollout_thread_trace
+            .record_codex_turn_event(&turn_context.sub_id, &msg);
+        self.services
+            .rollout_thread_trace
+            .record_tool_call_event(turn_context.sub_id.clone(), &msg);
+        let event = Event {
+            id: turn_context.sub_id.clone(),
+            msg,
+        };
+        self.send_event_raw(event).await;
     }
 
     /// Forwards terminal turn events from spawned MultiAgentV2 children to their direct parent.
@@ -1976,6 +2097,10 @@ impl Session {
     }
 
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
+        let event = Event {
+            id: event.id,
+            msg: self.project_event_for_argument_privacy(event.msg),
+        };
         // Persist the event into rollout storage; the store applies its persistence policy.
         if persist {
             let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
@@ -2007,6 +2132,33 @@ impl Session {
                 started_at_ms: now_unix_timestamp_ms(),
             }),
         )
+        .await;
+    }
+
+    /// Emits a content-free canonical lifecycle item and one raw request that
+    /// is delivered directly to the live client without rollout, trace, log,
+    /// replay, or legacy duplication.
+    pub(crate) async fn emit_transient_dynamic_tool_call_started(
+        &self,
+        turn_context: &TurnContext,
+        item: TurnItem,
+        request: DynamicToolCallRequest,
+    ) {
+        let started_at_ms = request.started_at_ms;
+        self.send_event_without_legacy(
+            turn_context,
+            EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id: self.thread_id,
+                turn_id: turn_context.sub_id.clone(),
+                item,
+                started_at_ms,
+            }),
+        )
+        .await;
+        self.deliver_event_raw(Event {
+            id: turn_context.sub_id.clone(),
+            msg: EventMsg::DynamicToolCallRequest(request),
+        })
         .await;
     }
 
@@ -2788,8 +2940,13 @@ impl Session {
         let mut items = Cow::Borrowed(items);
         prepare_image_response_items(items.to_mut());
         prepare_audio_response_items(items.to_mut());
+        let argument_policy =
+            codex_protocol::dynamic_tools::DynamicToolArgumentPolicy::from_dynamic_tools(
+                &turn_context.dynamic_tools,
+            );
         // Most response items get their passthrough turn ID at the durable history boundary.
         for item in items.to_mut() {
+            *item = argument_policy.redact_response_item(item);
             item.set_turn_id_if_missing(&turn_context.sub_id);
         }
         Self::assign_missing_response_item_ids(items)
@@ -3032,6 +3189,10 @@ impl Session {
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
     ) {
+        let items = items
+            .iter()
+            .map(|item| self.dynamic_tool_argument_policy.redact_response_item(item))
+            .collect();
         let mut state = self.state.lock().await;
         state.replace_history(items, reference_context_item);
     }
@@ -3043,6 +3204,10 @@ impl Session {
         world_state_baseline: Option<Arc<WorldState>>,
         compacted_item: CompactedItem,
     ) {
+        let items = items
+            .iter()
+            .map(|item| self.dynamic_tool_argument_policy.redact_response_item(item))
+            .collect();
         let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
         let compacted_item = CompactedItem {
             replacement_history: Some(items.clone()),
@@ -3458,11 +3623,29 @@ impl Session {
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
+        let projected_items = match self.project_rollout_items_for_argument_privacy(items) {
+            Ok(items) => items,
+            Err(error) => {
+                error!(
+                    error_type = std::any::type_name_of_val(&error),
+                    "refusing to persist rollout items that could not be privacy-projected"
+                );
+                return;
+            }
+        };
         if let Some(live_thread) = self.live_thread()
-            && let Err(e) = live_thread.append_items(items).await
+            && let Err(e) = live_thread.append_items(&projected_items).await
         {
             error!("failed to record rollout items: {e:#}");
         }
+    }
+
+    pub(crate) fn project_rollout_items_for_argument_privacy(
+        &self,
+        items: &[RolloutItem],
+    ) -> Result<Vec<RolloutItem>, serde_json::Error> {
+        self.dynamic_tool_argument_policy
+            .redact_serializable(&items.to_vec())
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {

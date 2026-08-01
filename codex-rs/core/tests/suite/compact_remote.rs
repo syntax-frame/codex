@@ -1276,12 +1276,14 @@ async fn remote_compact_filters_deferred_dynamic_tools() -> Result<()> {
                 description: "Hidden until discovered.".to_string(),
                 input_schema: input_schema.clone(),
                 defer_loading: true,
+                argument_handling: Default::default(),
             }),
             DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
                 name: visible_tool.to_string(),
                 description: "Visible immediately.".to_string(),
                 input_schema,
                 defer_loading: false,
+                argument_handling: Default::default(),
             }),
         ],
     })];
@@ -1398,6 +1400,7 @@ async fn remote_compact_does_not_charge_inline_audio_payload_as_text() -> Result
                     "additionalProperties": false,
                 }),
                 defer_loading: false,
+                argument_handling: Default::default(),
             },
         )],
     });
@@ -2032,6 +2035,7 @@ async fn remote_compact_trims_tool_search_output_to_empty_tools_array() -> Resul
                 description: tool_description,
                 input_schema,
                 defer_loading: true,
+                argument_handling: Default::default(),
             },
         )],
     });

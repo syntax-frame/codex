@@ -1171,6 +1171,7 @@ mod tests {
                 rollout_path: Some(path.clone()),
                 history: None,
                 include_archived: true,
+                dynamic_tools: Vec::new(),
                 metadata: test_thread_metadata(),
             })
             .await
@@ -2034,6 +2035,7 @@ mod tests {
                 rollout_path: Some(archived_path.clone()),
                 history: None,
                 include_archived: true,
+                dynamic_tools: Vec::new(),
                 metadata: test_thread_metadata(),
             })
             .await

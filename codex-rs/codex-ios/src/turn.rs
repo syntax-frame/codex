@@ -49,7 +49,11 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::Settings;
+use codex_protocol::dynamic_tools::DynamicToolArgumentHandling;
+use codex_protocol::dynamic_tools::DynamicToolArgumentIdentity;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicySpec;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::TurnItem;
@@ -84,6 +88,116 @@ server's filesystem. When the user asks you to run a shell command, use the shel
 and report the command's actual output. To create or edit files on the server, prefer \
 `apply_patch` (it edits files directly on the remote host); the shell/exec tools and \
 `apply_patch` all operate on the same remote server.";
+
+const AGENTAPP_BROWSER_TOOL_NAMES: [&str; 7] = [
+    "agentapp_browser_create",
+    "agentapp_browser_open",
+    "agentapp_browser_list",
+    "agentapp_browser_snapshot",
+    "agentapp_browser_act",
+    "agentapp_browser_screenshot",
+    "agentapp_browser_close",
+];
+
+fn trusted_agentapp_browser_argument_policy() -> Result<DynamicToolSpec, String> {
+    let canonical = AGENTAPP_BROWSER_TOOL_NAMES.iter().map(|name| {
+        DynamicToolArgumentIdentity {
+            namespace: None,
+            name: (*name).to_string(),
+            // The AgentApp-owned flat names are reserved across namespaces.
+            // A stale or hostile response must not regain persistence merely
+            // by adding a namespace to the same function name.
+            match_any_namespace: true,
+            match_case_insensitive: true,
+        }
+    });
+    let legacy_root = AGENTAPP_BROWSER_TOOL_NAMES
+        .iter()
+        .map(|name| DynamicToolArgumentIdentity {
+            namespace: None,
+            name: format!(
+                "browser.{}",
+                name.strip_prefix("agentapp_browser_").unwrap_or(name)
+            ),
+            match_any_namespace: true,
+            match_case_insensitive: true,
+        });
+    let legacy_namespace =
+        AGENTAPP_BROWSER_TOOL_NAMES
+            .iter()
+            .map(|name| DynamicToolArgumentIdentity {
+                namespace: Some("browser".to_string()),
+                name: name
+                    .strip_prefix("agentapp_browser_")
+                    .unwrap_or(name)
+                    .to_string(),
+                match_any_namespace: false,
+                match_case_insensitive: true,
+            });
+    DynamicToolArgumentPolicySpec::trusted_transient(
+        canonical
+            .chain(legacy_root)
+            .chain(legacy_namespace)
+            .collect(),
+    )
+    .map(DynamicToolSpec::ArgumentPolicy)
+    .map_err(str::to_string)
+}
+
+fn parse_agentapp_dynamic_tools_json(
+    dynamic_tools_json: &str,
+) -> Result<Vec<DynamicToolSpec>, String> {
+    let mut dynamic_tools: Vec<DynamicToolSpec> = if dynamic_tools_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(dynamic_tools_json)
+            .map_err(|error| format!("failed to parse dynamic_tools_json: {error}"))?
+    };
+
+    for spec in &mut dynamic_tools {
+        match spec {
+            DynamicToolSpec::Function(function) => {
+                if function.argument_handling.redacts_arguments() {
+                    return Err(
+                        "dynamic_tools_json cannot set transient argument handling".to_string()
+                    );
+                }
+                if AGENTAPP_BROWSER_TOOL_NAMES
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&function.name))
+                {
+                    function.argument_handling = DynamicToolArgumentHandling::Transient;
+                }
+            }
+            DynamicToolSpec::Namespace(namespace) => {
+                for tool in &mut namespace.tools {
+                    let DynamicToolNamespaceTool::Function(function) = tool;
+                    if function.argument_handling.redacts_arguments() {
+                        return Err(
+                            "dynamic_tools_json cannot set transient argument handling".to_string()
+                        );
+                    }
+                    if AGENTAPP_BROWSER_TOOL_NAMES
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&function.name))
+                    {
+                        return Err(format!(
+                            "AgentApp browser tool name {} is reserved for the root namespace",
+                            function.name
+                        ));
+                    }
+                }
+            }
+            DynamicToolSpec::ArgumentPolicy(_) => {
+                return Err(
+                    "dynamic_tools_json cannot supply argument privacy policies".to_string()
+                );
+            }
+        }
+    }
+    dynamic_tools.push(trusted_agentapp_browser_argument_policy()?);
+    Ok(dynamic_tools)
+}
 
 /// SSH connection parameters for "server mode": when supplied to
 /// [`run_turn_async`], the turn's shell/exec tools run on the SSH host instead
@@ -868,14 +982,11 @@ pub(crate) async fn run_turn_async(
     let _ = config.features.disable(Feature::Collab);
 
     // Orchestration tools are supplied by the client (Swift) as dynamic tool
-    // specs and executed on-device. Parse the JSON array into DynamicToolSpecs;
-    // empty/absent => a plain turn with no dynamic tools.
-    let dynamic_tools: Vec<DynamicToolSpec> = if dynamic_tools_json.trim().is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(&dynamic_tools_json)
-            .map_err(|e| format!("failed to parse dynamic_tools_json: {e}"))?
-    };
+    // specs and executed on-device. The bridge, rather than client JSON, owns
+    // the fixed browser argument-privacy policy. It is appended even when the
+    // Browser Tool setting is Off so stale calls and resumed histories remain
+    // protected without restoring any model-visible browser schema.
+    let dynamic_tools = parse_agentapp_dynamic_tools_json(&dynamic_tools_json)?;
 
     let resume_path = read_thread_pointer(&codex_home).await?;
     let mut resumed = false;

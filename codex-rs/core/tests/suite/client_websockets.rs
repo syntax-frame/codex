@@ -24,6 +24,10 @@ use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::dynamic_tools::DynamicToolArgumentIdentity;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicy;
+use codex_protocol::dynamic_tools::DynamicToolArgumentPolicySpec;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -539,6 +543,56 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
         Some("sequential_cutoff")
     );
 
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[traced_test]
+async fn protected_websocket_prewarm_never_emits_provider_response_id() {
+    skip_if_no_network!();
+
+    const SENTINEL: &str = "RAW_BROWSER_ARGUMENT_SENTINEL";
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created(SENTINEL),
+        ev_completed(SENTINEL),
+    ]]])
+    .await;
+    let harness = websocket_harness_with_options(&server, /*runtime_metrics_enabled*/ true).await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![message_item("hello")]);
+    let responses_metadata = prewarm_metadata(&harness, /*turn_id*/ None);
+    let policy = DynamicToolArgumentPolicy::from_dynamic_tools(&[DynamicToolSpec::ArgumentPolicy(
+        DynamicToolArgumentPolicySpec::trusted_transient(vec![DynamicToolArgumentIdentity {
+            namespace: None,
+            name: "agentapp_browser_act".to_string(),
+            match_any_namespace: true,
+            match_case_insensitive: true,
+        }])
+        .expect("trusted browser policy"),
+    )]);
+
+    client_session
+        .prewarm_websocket_with_argument_policy(
+            &prompt,
+            &harness.model_info,
+            &harness.session_telemetry,
+            harness.effort.clone(),
+            harness.summary,
+            /*service_tier*/ None,
+            &responses_metadata,
+            policy,
+        )
+        .await
+        .expect("protected websocket prewarm failed");
+
+    assert!(
+        !logs_contain(SENTINEL),
+        "protected prewarm must not emit provider-controlled response ids"
+    );
+    assert!(
+        !logs_contain("last_model_response_id"),
+        "protected prewarm must not emit response-id feedback tags"
+    );
     server.shutdown().await;
 }
 
