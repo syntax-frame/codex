@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use codex_exec_server::SshAuthentication;
 use codex_exec_server::SshTmuxMode;
+use codex_features::Feature;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
@@ -28,6 +29,7 @@ use super::build_turn_runtime;
 use super::codex_ios_tool_discovery_contract_version;
 use super::codex_run_turn_streaming_apikey;
 use super::codex_steer_turn;
+use super::disable_upstream_multi_agent;
 use super::emit_item_started_events;
 use super::model_context_resume_error_class;
 use super::parse_reasoning_effort;
@@ -139,6 +141,23 @@ fn turn_runtime_enforces_blocking_pool_ceiling() {
     eprintln!(
         "turn_runtime_blocking_ceiling_evidence started_before_release={started_before_release}"
     );
+}
+
+#[tokio::test]
+async fn agentapp_policy_cannot_be_reenabled_by_model_multi_agent_defaults() {
+    let home = tempfile::tempdir().expect("config home");
+    let mut config = codex_core::config::ConfigBuilder::default()
+        .codex_home(home.path().to_path_buf())
+        .build()
+        .await
+        .expect("default config");
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let _ = config.features.enable(Feature::Collab);
+    disable_upstream_multi_agent(&mut config);
+
+    assert!(!config.agents_enabled);
+    assert!(!config.features.enabled(Feature::MultiAgentV2));
+    assert!(!config.features.enabled(Feature::Collab));
 }
 
 #[test]
