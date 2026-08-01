@@ -314,7 +314,7 @@ pub(super) async fn load_history_items(
     let (items, _, _) = RolloutRecorder::load_rollout_items(path)
         .await
         .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to load thread history {}: {err}", path.display()),
+            message: format!("failed to load thread history: {err}"),
         })?;
     Ok(items)
 }

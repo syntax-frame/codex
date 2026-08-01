@@ -48,6 +48,7 @@ use super::list::get_threads;
 use super::list::get_threads_in_root;
 use super::list::parse_cursor;
 use super::list::parse_timestamp_uuid_from_filename;
+use super::loader;
 use super::metadata;
 use super::ordinal::RolloutOrdinalState;
 use super::ordinal::ordinal_state_for_rollout;
@@ -849,6 +850,16 @@ impl RolloutRecorder {
                 }
             }
             RolloutRecorderParams::Resume { path } => {
+                // Validate the complete source representation without retaining
+                // a second history vector before opening it for append. This
+                // keeps malformed/truncated plain and compressed rollouts
+                // byte-identical on every resume failure without doubling the
+                // caller's already-loaded history peak.
+                if let Err(error) = validate_rollout_items(path.as_path()).await
+                    && !is_empty_session_file_error(&error)
+                {
+                    return Err(error);
+                }
                 let (path, file, ordinal_state) = open_rollout_for_append(path.as_path()).await?;
                 RolloutWriterState {
                     writer: Some(JsonlWriter { file }),
@@ -961,65 +972,12 @@ impl RolloutRecorder {
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
         trace!("Resuming rollout from {path:?}");
-        let mut items: Vec<RolloutItem> = Vec::new();
-        let mut thread_id: Option<ThreadId> = None;
-        let mut parse_errors = 0usize;
-        let mut reader = compression::open_rollout_line_reader(path).await?;
-        let mut saw_non_empty_line = false;
-        while let Some(line) = reader.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
-            }
-            saw_non_empty_line = true;
-            let mut value: Value = match serde_json::from_str(&line) {
-                Ok(value) => value,
-                Err(e) => {
-                    warn!("failed to parse line as JSON: {line:?}, error: {e}");
-                    parse_errors = parse_errors.saturating_add(1);
-                    continue;
-                }
-            };
-            if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
-                trace!("skipping legacy ghost_snapshot rollout line");
-                continue;
-            }
-            if thread_id.is_none() {
-                // The first SessionMeta belongs to this rollout. Later SessionMeta lines
-                // can be copied from fork history, so only validate unknown history modes
-                // before we have parsed the rollout's own SessionMeta.
-                reject_unknown_thread_history_mode(&value)?;
-            }
-
-            let rollout_line = match serde_json::from_value::<RolloutLine>(value) {
-                Ok(rollout_line) => rollout_line,
-                Err(e) => {
-                    trace!("failed to parse rollout line: {e}");
-                    parse_errors = parse_errors.saturating_add(1);
-                    continue;
-                }
-            };
-
-            let item = rollout_line.item;
-            // Use the FIRST SessionMeta encountered in the file as the canonical
-            // thread id and main session information. Keep all items intact.
-            if thread_id.is_none()
-                && let RolloutItem::SessionMeta(session_meta_line) = &item
-            {
-                thread_id = Some(session_meta_line.meta.id);
-            }
-            items.push(item);
-        }
-        if !saw_non_empty_line {
-            return Err(IoError::other("empty session file"));
-        }
-
-        tracing::debug!(
-            "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
-            items.len(),
-            thread_id,
-            parse_errors,
-        );
-        Ok((items, thread_id, parse_errors))
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            load_rollout_items_blocking(path.as_path(), loader::RolloutReadLimits::default())
+        })
+        .await
+        .map_err(|_| loader::worker_failed())?
     }
 
     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
@@ -1065,6 +1023,99 @@ impl RolloutRecorder {
         };
         Ok(())
     }
+}
+
+fn load_rollout_items_blocking(
+    path: &Path,
+    limits: loader::RolloutReadLimits,
+) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+    let mut items: Vec<RolloutItem> = Vec::new();
+    let (thread_id, parse_errors) = scan_rollout_items_blocking(path, limits, |item, record| {
+        loader::reserve_rollout_items(&mut items, 1, record)?;
+        items.push(item);
+        Ok(())
+    })?;
+
+    tracing::debug!(
+        "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
+        items.len(),
+        thread_id,
+        parse_errors,
+    );
+    Ok((items, thread_id, parse_errors))
+}
+
+async fn validate_rollout_items(path: &Path) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        scan_rollout_items_blocking(
+            path.as_path(),
+            loader::RolloutReadLimits::default(),
+            |_item, _record| Ok(()),
+        )
+        .map(|_| ())
+    })
+    .await
+    .map_err(|_| loader::worker_failed())?
+}
+
+fn scan_rollout_items_blocking(
+    path: &Path,
+    limits: loader::RolloutReadLimits,
+    mut visit_item: impl FnMut(RolloutItem, usize) -> std::io::Result<()>,
+) -> std::io::Result<(Option<ThreadId>, usize)> {
+    let mut thread_id: Option<ThreadId> = None;
+    let mut parse_errors = 0usize;
+    let mut reader = loader::BoundedRolloutReader::open_with_retry(path, limits)?;
+    let mut saw_non_empty_line = false;
+    while let Some(record) = reader.next_record()? {
+        if record.line.trim().is_empty() {
+            continue;
+        }
+        saw_non_empty_line = true;
+        let mut value: Value = serde_json::from_str(&record.line)
+            .map_err(|_| loader::invalid_json(record.ordinal, record.newline_terminated))?;
+        if strip_legacy_ghost_snapshot_rollout_line(&mut value) {
+            trace!("skipping legacy ghost_snapshot rollout record");
+            continue;
+        }
+        if thread_id.is_none() {
+            // The first SessionMeta belongs to this rollout. Later SessionMeta lines
+            // can be copied from fork history, so only validate unknown history modes
+            // before we have parsed the rollout's own SessionMeta.
+            reject_unknown_thread_history_mode(&value)?;
+        }
+
+        let rollout_line = match serde_json::from_value::<RolloutLine>(value) {
+            Ok(rollout_line) => rollout_line,
+            Err(_) => {
+                trace!("skipping unsupported rollout record {}", record.ordinal);
+                parse_errors = parse_errors.saturating_add(1);
+                continue;
+            }
+        };
+
+        let item = rollout_line.item;
+        // Use the FIRST SessionMeta encountered in the file as the canonical
+        // thread id and main session information. Keep all items intact.
+        if thread_id.is_none()
+            && let RolloutItem::SessionMeta(session_meta_line) = &item
+        {
+            thread_id = Some(session_meta_line.meta.id);
+        }
+        visit_item(item, record.ordinal)?;
+    }
+    if !saw_non_empty_line {
+        return Err(loader::empty_session());
+    }
+    Ok((thread_id, parse_errors))
+}
+
+fn is_empty_session_file_error(error: &std::io::Error) -> bool {
+    matches!(
+        loader::rollout_read_error(error),
+        Some(loader::RolloutReadError::EmptySession)
+    )
 }
 
 pub(crate) fn reject_unknown_thread_history_mode(value: &Value) -> std::io::Result<()> {
@@ -1555,6 +1606,7 @@ fn precompute_log_file_info(
 }
 
 fn open_log_file(path: &Path) -> std::io::Result<File> {
+    let had_plain_rollout = compression::plain_rollout_path(path).exists();
     let path = compression::materialize_rollout_for_append_blocking(path)?;
     let Some(parent) = path.parent() else {
         return Err(IoError::other(format!(
@@ -1567,8 +1619,19 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
         .read(true)
         .append(true)
         .create(true)
-        .open(path)?;
-    ensure_rollout_is_newline_terminated(&mut file)?;
+        .open(path.as_path())?;
+    if let Err(error) = ensure_rollout_is_newline_terminated(&mut file) {
+        if !had_plain_rollout {
+            compression::rollback_materialized_rollout(path.as_path());
+        }
+        return Err(error);
+    }
+    if !had_plain_rollout
+        && let Err(error) = compression::commit_materialized_rollout(path.as_path())
+    {
+        compression::rollback_materialized_rollout(path.as_path());
+        return Err(error);
+    }
     Ok(file)
 }
 
@@ -1822,19 +1885,35 @@ pub async fn append_rollout_item_to_path(
 async fn open_rollout_for_append(
     path: &Path,
 ) -> std::io::Result<(PathBuf, tokio::fs::File, RolloutOrdinalState)> {
+    let had_plain_rollout = compression::plain_rollout_path(path).exists();
     let path = compression::materialize_rollout_for_append(path).await?;
     let path_for_open = path.clone();
-    let (file, ordinal_state) = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let mut file = File::options()
             .read(true)
             .append(true)
             .open(path_for_open.as_path())?;
-        ensure_rollout_is_newline_terminated(&mut file)?;
         let ordinal_state = ordinal_state_for_rollout(&mut file, path_for_open.as_path())?;
+        ensure_rollout_is_newline_terminated(&mut file)?;
         Ok::<_, std::io::Error>((file, ordinal_state))
     })
     .await
-    .map_err(IoError::other)??;
+    .map_err(IoError::other)?;
+    let (file, ordinal_state) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            if !had_plain_rollout {
+                compression::rollback_materialized_rollout(path.as_path());
+            }
+            return Err(error);
+        }
+    };
+    if !had_plain_rollout
+        && let Err(error) = compression::commit_materialized_rollout(path.as_path())
+    {
+        compression::rollback_materialized_rollout(path.as_path());
+        return Err(error);
+    }
     Ok((path, tokio::fs::File::from_std(file), ordinal_state))
 }
 

@@ -2,7 +2,6 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::Permissions;
 use std::io;
-use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -104,11 +103,6 @@ pub(crate) fn materialize_rollout_for_append_blocking(path: &Path) -> io::Result
             Err(_) => persist_temp_file_noclobber(temp_path.as_path(), plain_path.as_path())?,
         }
         let _ = std::fs::remove_file(temp_path.as_path());
-        match std::fs::remove_file(compressed_path.as_path()) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
         Ok(())
     })();
     if result.is_err() {
@@ -118,6 +112,21 @@ pub(crate) fn materialize_rollout_for_append_blocking(path: &Path) -> io::Result
     result?;
     metrics::materialize("decompressed");
     Ok(plain_path)
+}
+
+pub(crate) fn commit_materialized_rollout(path: &Path) -> io::Result<()> {
+    let compressed_path = path::compressed_rollout_path(path);
+    match std::fs::remove_file(compressed_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn rollback_materialized_rollout(path: &Path) {
+    if path::compressed_rollout_path(path).exists() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn persist_temp_file_noclobber(temp_path: &Path, destination: &Path) -> io::Result<()> {
@@ -192,35 +201,15 @@ impl RolloutFile {
 
 /// Line-oriented rollout reader returned by [`open_rollout_line_reader`].
 pub struct RolloutLineReader {
-    inner: RolloutLineReaderInner,
-}
-
-enum RolloutLineReaderInner {
-    Plain(tokio::io::Lines<tokio::io::BufReader<tokio::fs::File>>),
-    Blocking(Option<BlockingLineReader>),
+    inner: reader::WorkerLineReader,
 }
 
 impl RolloutLineReader {
     /// Reads the next JSONL record from the rollout.
     pub async fn next_line(&mut self) -> io::Result<Option<String>> {
-        match &mut self.inner {
-            RolloutLineReaderInner::Plain(lines) => lines.next_line().await,
-            RolloutLineReaderInner::Blocking(slot) => {
-                let Some(mut reader) = slot.take() else {
-                    return Err(io::Error::other("compressed rollout reader is busy"));
-                };
-                let (line, reader) =
-                    tokio::task::spawn_blocking(move || (reader.next().transpose(), reader))
-                        .await
-                        .map_err(io::Error::other)?;
-                *slot = Some(reader);
-                line
-            }
-        }
+        self.inner.next_line().await
     }
 }
-
-type BlockingLineReader = std::io::Lines<std::io::BufReader<Box<dyn Read + Send>>>;
 
 mod worker {
     use std::ffi::OsStr;
@@ -971,39 +960,159 @@ mod file_name {
 }
 
 mod reader {
-    use std::fs::File;
+    use std::collections::HashMap;
     use std::io;
-    use std::io::BufRead;
-    use std::io::Read;
     use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::sync::mpsc;
 
     use super::RolloutLineReader;
-    use super::RolloutLineReaderInner;
     use super::path;
-    use tokio::io::AsyncBufReadExt;
+    use crate::loader::BoundedRolloutReader;
+    use crate::loader::RolloutReadLimits;
+    use tokio::sync::oneshot;
+
+    /// Handle to a rollout owned by the single process-wide reader worker. A
+    /// fixed worker avoids creating Tokio blocking tasks per file refill or
+    /// JSONL line while retaining line-at-a-time memory use and async callers.
+    pub(super) struct WorkerLineReader {
+        id: u64,
+    }
+
+    impl WorkerLineReader {
+        async fn open(path: PathBuf) -> io::Result<Self> {
+            let id = rollout_reader_worker()?.open(path).await?;
+            Ok(Self { id })
+        }
+
+        pub(super) async fn next_line(&mut self) -> io::Result<Option<String>> {
+            rollout_reader_worker()?.next_line(self.id).await
+        }
+    }
+
+    impl Drop for WorkerLineReader {
+        fn drop(&mut self) {
+            if let Ok(worker) = rollout_reader_worker() {
+                worker.close(self.id);
+            }
+        }
+    }
+
+    struct RolloutReaderWorker {
+        commands: mpsc::Sender<RolloutReaderCommand>,
+    }
+
+    enum RolloutReaderCommand {
+        Open {
+            path: PathBuf,
+            response: oneshot::Sender<io::Result<u64>>,
+        },
+        NextLine {
+            id: u64,
+            response: oneshot::Sender<io::Result<Option<String>>>,
+        },
+        Close {
+            id: u64,
+        },
+    }
+
+    impl RolloutReaderWorker {
+        fn start() -> io::Result<Self> {
+            let (commands, receiver) = mpsc::channel();
+            std::thread::Builder::new()
+                .name("codex-rollout-reader".to_string())
+                .spawn(move || run_rollout_reader_worker(receiver))?;
+            Ok(Self { commands })
+        }
+
+        async fn open(&self, path: PathBuf) -> io::Result<u64> {
+            let (response, result) = oneshot::channel();
+            self.commands
+                .send(RolloutReaderCommand::Open { path, response })
+                .map_err(|_| io::Error::other("rollout reader worker stopped"))?;
+            result
+                .await
+                .map_err(|_| io::Error::other("rollout reader worker stopped"))?
+        }
+
+        async fn next_line(&self, id: u64) -> io::Result<Option<String>> {
+            let (response, result) = oneshot::channel();
+            self.commands
+                .send(RolloutReaderCommand::NextLine { id, response })
+                .map_err(|_| io::Error::other("rollout reader worker stopped"))?;
+            result
+                .await
+                .map_err(|_| io::Error::other("rollout reader worker stopped"))?
+        }
+
+        fn close(&self, id: u64) {
+            let _ = self.commands.send(RolloutReaderCommand::Close { id });
+        }
+    }
+
+    fn rollout_reader_worker() -> io::Result<&'static RolloutReaderWorker> {
+        static WORKER: OnceLock<Result<RolloutReaderWorker, io::ErrorKind>> = OnceLock::new();
+        match WORKER.get_or_init(|| RolloutReaderWorker::start().map_err(|error| error.kind())) {
+            Ok(worker) => Ok(worker),
+            Err(kind) => Err(io::Error::new(
+                *kind,
+                "failed to start rollout reader worker",
+            )),
+        }
+    }
+
+    fn run_rollout_reader_worker(receiver: mpsc::Receiver<RolloutReaderCommand>) {
+        #[cfg(test)]
+        ROLLOUT_READER_WORKER_STARTS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+        let mut readers = HashMap::<u64, BoundedRolloutReader>::new();
+        let mut next_id = 1u64;
+        while let Ok(command) = receiver.recv() {
+            match command {
+                RolloutReaderCommand::Open { path, response } => {
+                    let result = (|| {
+                        let reader = BoundedRolloutReader::open(
+                            path.as_path(),
+                            RolloutReadLimits::default(),
+                        )?;
+                        let id = next_id;
+                        next_id = next_id
+                            .checked_add(1)
+                            .ok_or_else(|| io::Error::other("rollout reader id exhausted"))?;
+                        readers.insert(id, reader);
+                        Ok(id)
+                    })();
+                    let _ = response.send(result);
+                }
+                RolloutReaderCommand::NextLine { id, response } => {
+                    let result = readers
+                        .get_mut(&id)
+                        .ok_or_else(|| io::Error::other("rollout reader is closed"))
+                        .and_then(|reader| {
+                            reader
+                                .next_record()
+                                .map(|record| record.map(|record| record.line))
+                        });
+                    let _ = response.send(result);
+                }
+                RolloutReaderCommand::Close { id } => {
+                    readers.remove(&id);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) static ROLLOUT_READER_WORKER_STARTS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     pub(super) async fn open_once(path: &Path) -> io::Result<RolloutLineReader> {
         let path = path::existing_rollout_path(path)
             .await
             .unwrap_or_else(|| path.to_path_buf());
-        if path::is_compressed_rollout_path(path.as_path()) {
-            let reader = tokio::task::spawn_blocking(move || {
-                let input = File::open(path.as_path())?;
-                let decoder = zstd::stream::read::Decoder::new(input)?;
-                Ok::<_, io::Error>(
-                    io::BufReader::new(Box::new(decoder) as Box<dyn Read + Send>).lines(),
-                )
-            })
-            .await
-            .map_err(io::Error::other)??;
-            return Ok(RolloutLineReader {
-                inner: RolloutLineReaderInner::Blocking(Some(reader)),
-            });
-        }
-        let file = tokio::fs::File::open(path).await?;
-        Ok(RolloutLineReader {
-            inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file).lines()),
-        })
+        let reader = WorkerLineReader::open(path).await?;
+        Ok(RolloutLineReader { inner: reader })
     }
 }
 

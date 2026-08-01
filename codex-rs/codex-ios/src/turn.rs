@@ -278,6 +278,8 @@ const POST_DYNAMIC_IMAGE_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
 const DYNAMIC_IMAGE_RESPONSE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_IMAGE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(45);
 const PROMPT_IMAGE_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
+const TURN_RUNTIME_MAX_BLOCKING_THREADS: usize = 16;
+const TURN_RUNTIME_BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_secs(1);
 
 /// Highest content-free discovery-event payload contract this library emits.
 /// Additive ABI query: older libraries simply lack the symbol and never emit
@@ -289,14 +291,18 @@ pub extern "C" fn codex_ios_tool_discovery_contract_version() -> u32 {
 
 fn turn_runtime() -> &'static tokio::runtime::Runtime {
     static TURN_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    TURN_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .thread_stack_size(16 * 1024 * 1024)
-            .build()
-            .expect("failed to build shared codex turn runtime")
-    })
+    TURN_RUNTIME.get_or_init(build_turn_runtime)
+}
+
+fn build_turn_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .max_blocking_threads(TURN_RUNTIME_MAX_BLOCKING_THREADS)
+        .thread_keep_alive(TURN_RUNTIME_BLOCKING_THREAD_KEEP_ALIVE)
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("failed to build shared codex turn runtime")
 }
 
 fn tool_discovery_event_json(event: &str) -> String {
@@ -305,6 +311,27 @@ fn tool_discovery_event_json(event: &str) -> String {
         "event": event,
     })
     .to_string()
+}
+
+fn model_context_resume_error_class(error: &codex_protocol::error::CodexErr) -> &'static str {
+    let codex_protocol::error::CodexErr::Io(error) = error else {
+        return "invalid_or_unavailable";
+    };
+    let Some(error) = codex_rollout::rollout_read_error(error) else {
+        return "invalid_or_unavailable";
+    };
+    match error {
+        codex_rollout::RolloutReadError::ResourceExhausted { .. } => "resource_exhausted",
+        codex_rollout::RolloutReadError::RecordTooLarge { .. } => "record_size_limit",
+        codex_rollout::RolloutReadError::DecodedBytesTooLarge { .. } => "decoded_bytes_limit",
+        codex_rollout::RolloutReadError::TooManyRecords { .. } => "record_count_limit",
+        codex_rollout::RolloutReadError::TruncatedRecord { .. } => "truncated_record",
+        codex_rollout::RolloutReadError::InvalidUtf8 { .. } => "invalid_utf8",
+        codex_rollout::RolloutReadError::MalformedJson { .. } => "malformed_json",
+        codex_rollout::RolloutReadError::CompressedData { .. } => "compressed_data",
+        codex_rollout::RolloutReadError::EmptySession
+        | codex_rollout::RolloutReadError::WorkerFailed => "invalid_or_unavailable",
+    }
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -1003,8 +1030,8 @@ pub(crate) async fn run_turn_async(
             .await
             .map_err(|error| {
                 format!(
-                    "failed to resume model context from {}: {error}",
-                    rollout_path.display()
+                    "failed to resume persistent model context [{}]",
+                    model_context_resume_error_class(&error)
                 )
             })?;
         resumed = true;

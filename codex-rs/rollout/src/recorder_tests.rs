@@ -21,9 +21,13 @@ use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::fs::File;
+use std::io::BufWriter;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -130,6 +134,43 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
     });
     writeln!(file, "{user_event}")?;
     Ok(path)
+}
+
+fn append_generated_history(path: &Path, decoded_bytes: usize) -> std::io::Result<()> {
+    let mut file = BufWriter::new(fs::OpenOptions::new().append(true).open(path)?);
+    let message = "generated-rollout-record-".repeat(192);
+    let mut written = 0usize;
+    let mut index = 0usize;
+    while written < decoded_bytes {
+        let line = RolloutLine {
+            timestamp: format!("2026-07-31T00:{:02}:{:02}Z", index / 60 % 60, index % 60),
+            ordinal: None,
+            item: agent_message_item(format!("{index}:{message}").as_str()),
+        };
+        let serialized = serde_json::to_vec(&line)?;
+        file.write_all(&serialized)?;
+        file.write_all(b"\n")?;
+        written = written.saturating_add(serialized.len() + 1);
+        index = index.saturating_add(1);
+    }
+    file.flush()
+}
+
+fn compress_rollout(path: &Path) -> std::io::Result<PathBuf> {
+    let compressed = PathBuf::from(format!("{}.zst", path.display()));
+    let input = File::open(path)?;
+    let output = File::create(&compressed)?;
+    let mut encoder = zstd::stream::write::Encoder::new(output, 1)?;
+    std::io::copy(&mut std::io::BufReader::new(input), &mut encoder)?;
+    encoder.finish()?;
+    fs::remove_file(path)?;
+    Ok(compressed)
+}
+
+fn typed_rollout_error(error: &std::io::Error) -> crate::RolloutReadError {
+    crate::rollout_read_error(error)
+        .expect("typed rollout read error")
+        .clone()
 }
 
 #[test]
@@ -303,6 +344,190 @@ async fn load_rollout_items_defaults_legacy_session_id() -> std::io::Result<()> 
         RolloutItem::ResponseItem(ResponseItem::Message { .. })
     ));
 
+    Ok(())
+}
+
+#[test]
+fn four_concurrent_long_resumes_use_at_most_one_blocking_worker_each() -> anyhow::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let mut paths = Vec::new();
+    for index in 0..4u128 {
+        let path = write_session_file(
+            home.path(),
+            format!("2025-01-03T12-00-0{index}").as_str(),
+            Uuid::from_u128(10_000 + index),
+        )?;
+        append_generated_history(&path, 3 * 1024 * 1024)?;
+        if index % 2 == 1 {
+            compress_rollout(&path)?;
+        }
+        paths.push(path);
+    }
+
+    let started_threads = Arc::new(AtomicUsize::new(0));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .max_blocking_threads(16)
+        .thread_keep_alive(Duration::from_secs(1))
+        .on_thread_start({
+            let started_threads = Arc::clone(&started_threads);
+            move || {
+                started_threads.fetch_add(1, Ordering::AcqRel);
+            }
+        })
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started_threads.load(Ordering::Acquire) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime workers should start");
+    });
+    let runtime_workers = started_threads.load(Ordering::Acquire);
+    let (peak_blocking_threads, item_counts) = runtime.block_on(async move {
+        let tasks = paths
+            .into_iter()
+            .map(|path| {
+                tokio::spawn(async move {
+                    RolloutRecorder::load_rollout_items(path.as_path())
+                        .await
+                        .map(|(items, _, _)| items.len())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut peak_blocking_threads = 0usize;
+        while tasks.iter().any(|task| !task.is_finished()) {
+            peak_blocking_threads = peak_blocking_threads
+                .max(started_threads.load(Ordering::Acquire) - runtime_workers);
+            tokio::task::yield_now().await;
+        }
+        peak_blocking_threads =
+            peak_blocking_threads.max(started_threads.load(Ordering::Acquire) - runtime_workers);
+        let mut item_counts = Vec::new();
+        for task in tasks {
+            item_counts.push(task.await.expect("resume task should join")?);
+        }
+        Ok::<_, std::io::Error>((peak_blocking_threads, item_counts))
+    })?;
+
+    assert_eq!(item_counts.len(), 4);
+    assert!(item_counts.iter().all(|count| *count > 500));
+    assert!(
+        (1..=4).contains(&peak_blocking_threads),
+        "four reads should use no more than four blocking workers, measured {peak_blocking_threads}"
+    );
+    eprintln!(
+        "rollout_read_worker_evidence concurrent_resumes=4 peak_workers={peak_blocking_threads}"
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_failures_preserve_plain_and_compressed_rollouts_then_retry() -> anyhow::Result<()> {
+    for compressed in [false, true] {
+        let home = TempDir::new().expect("temp dir");
+        let path = write_session_file(
+            home.path(),
+            "2025-01-03T12-00-00",
+            Uuid::from_u128(if compressed { 20_001 } else { 20_000 }),
+        )?;
+        append_generated_history(&path, 128 * 1024)?;
+        let physical_path = if compressed {
+            compress_rollout(&path)?
+        } else {
+            path.clone()
+        };
+        let pointer_path = home.path().join("agentapp-thread.json");
+        let pointer_bytes = br#"{"version":1,"thread_id":"generated","rollout_path":"generated"}"#;
+        fs::write(&pointer_path, pointer_bytes)?;
+        let rollout_bytes = fs::read(&physical_path)?;
+        let restrictive = loader::RolloutReadLimits {
+            max_record_bytes: 32 * 1024,
+            max_decoded_bytes: 64 * 1024,
+            max_records: 100_000,
+        };
+
+        let error = load_rollout_items_blocking(&path, restrictive)
+            .expect_err("restrictive decoded limit should fail");
+        assert_eq!(
+            typed_rollout_error(&error),
+            crate::RolloutReadError::DecodedBytesTooLarge { limit: 64 * 1024 }
+        );
+        assert_eq!(fs::read(&physical_path)?, rollout_bytes);
+        assert_eq!(fs::read(&pointer_path)?, pointer_bytes);
+        assert_eq!(path.exists(), !compressed);
+
+        let (items, _, parse_errors) =
+            load_rollout_items_blocking(&path, loader::RolloutReadLimits::default())?;
+        assert!(items.len() > 20);
+        assert_eq!(parse_errors, 0);
+        assert_eq!(fs::read(&physical_path)?, rollout_bytes);
+        assert_eq!(fs::read(&pointer_path)?, pointer_bytes);
+        assert_eq!(path.exists(), !compressed);
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_middle_and_truncated_tail_are_typed_and_non_mutating() -> anyhow::Result<()> {
+    for compressed in [false, true] {
+        let home = TempDir::new().expect("temp dir");
+        let malformed = write_session_file(
+            home.path(),
+            "2025-01-03T12-00-00",
+            Uuid::from_u128(if compressed { 30_001 } else { 30_000 }),
+        )?;
+        let mut file = fs::OpenOptions::new().append(true).open(&malformed)?;
+        file.write_all(b"{malformed json}\n")?;
+        file.write_all(
+            serde_json::to_string(&RolloutLine {
+                timestamp: "2025-01-03T12:00:02Z".to_string(),
+                ordinal: None,
+                item: agent_message_item("after malformed"),
+            })?
+            .as_bytes(),
+        )?;
+        file.write_all(b"\n")?;
+        drop(file);
+        let malformed_physical = if compressed {
+            compress_rollout(&malformed)?
+        } else {
+            malformed.clone()
+        };
+        let malformed_bytes = fs::read(&malformed_physical)?;
+        let error = load_rollout_items_blocking(&malformed, loader::RolloutReadLimits::default())
+            .expect_err("malformed middle should fail");
+        assert_eq!(
+            typed_rollout_error(&error),
+            crate::RolloutReadError::MalformedJson { record: 3 }
+        );
+        assert_eq!(fs::read(&malformed_physical)?, malformed_bytes);
+
+        let truncated = write_session_file(
+            home.path(),
+            "2025-01-03T12-00-01",
+            Uuid::from_u128(if compressed { 30_003 } else { 30_002 }),
+        )?;
+        let mut file = fs::OpenOptions::new().append(true).open(&truncated)?;
+        file.write_all(br#"{"timestamp":"truncated""#)?;
+        drop(file);
+        let truncated_physical = if compressed {
+            compress_rollout(&truncated)?
+        } else {
+            truncated.clone()
+        };
+        let truncated_bytes = fs::read(&truncated_physical)?;
+        let error = load_rollout_items_blocking(&truncated, loader::RolloutReadLimits::default())
+            .expect_err("truncated tail should fail");
+        assert_eq!(
+            typed_rollout_error(&error),
+            crate::RolloutReadError::TruncatedRecord { record: 3 }
+        );
+        assert_eq!(fs::read(&truncated_physical)?, truncated_bytes);
+    }
     Ok(())
 }
 
@@ -759,53 +984,53 @@ async fn resumed_paginated_rollout_continues_after_ordinal_gap() -> std::io::Res
 }
 
 #[tokio::test]
-async fn resumed_paginated_rollout_repairs_unsafe_tail() -> std::io::Result<()> {
+async fn resumed_paginated_rollout_repairs_valid_tail_but_rejects_truncation_without_mutation()
+-> std::io::Result<()> {
     let valid_unterminated = serde_json::to_string(&RolloutLine {
         timestamp: "2026-07-09T00:00:05Z".to_string(),
         ordinal: Some(5),
         item: agent_message_item("valid unterminated"),
     })?;
-    for (name, tail, expected_ordinals) in [
-        (
-            "valid unterminated",
-            valid_unterminated,
-            vec![Some(0), Some(4), Some(5), Some(6)],
-        ),
-        (
-            "invalid unterminated",
-            "{\"timestamp\":\"unterminated\"".to_string(),
-            vec![Some(0), Some(4), Some(5)],
-        ),
-    ] {
-        let home = TempDir::new().expect("temp dir");
-        let config = test_config(home.path());
-        let rollout_path = home.path().join("rollout.jsonl");
-        write_paginated_rollout(&rollout_path, ThreadId::new(), &[4])?;
-        let mut file = fs::OpenOptions::new().append(true).open(&rollout_path)?;
-        write!(file, "{tail}")?;
-        drop(file);
 
-        let recorder =
-            RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone()))
-                .await?;
-        recorder
-            .record_canonical_items(&[agent_message_item("after-tail-repair")])
-            .await?;
-        recorder.flush().await?;
+    let valid_home = TempDir::new().expect("temp dir");
+    let valid_config = test_config(valid_home.path());
+    let valid_path = valid_home.path().join("rollout.jsonl");
+    write_paginated_rollout(&valid_path, ThreadId::new(), &[4])?;
+    let mut valid_file = fs::OpenOptions::new().append(true).open(&valid_path)?;
+    write!(valid_file, "{valid_unterminated}")?;
+    drop(valid_file);
+    let mut expected = fs::read(&valid_path)?;
+    expected.push(b'\n');
+    let recorder = RolloutRecorder::new(
+        &valid_config,
+        RolloutRecorderParams::resume(valid_path.clone()),
+    )
+    .await?;
+    assert_eq!(fs::read(&valid_path)?, expected);
+    recorder.shutdown().await?;
 
-        let contents = fs::read_to_string(&rollout_path)?;
-        assert!(contents.ends_with('\n'), "{name} tail should be terminated");
-        let ordinals = contents
-            .lines()
-            .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
-            .map(|line| line.ordinal)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            ordinals, expected_ordinals,
-            "unexpected ordinals after repairing {name} tail"
-        );
-        recorder.shutdown().await?;
-    }
+    let invalid_home = TempDir::new().expect("temp dir");
+    let invalid_config = test_config(invalid_home.path());
+    let invalid_path = invalid_home.path().join("rollout.jsonl");
+    write_paginated_rollout(&invalid_path, ThreadId::new(), &[4])?;
+    let mut invalid_file = fs::OpenOptions::new().append(true).open(&invalid_path)?;
+    write!(invalid_file, "{{\"timestamp\":\"unterminated\"")?;
+    drop(invalid_file);
+    let before = fs::read(&invalid_path)?;
+    let error = match RolloutRecorder::new(
+        &invalid_config,
+        RolloutRecorderParams::resume(invalid_path.clone()),
+    )
+    .await
+    {
+        Ok(_) => panic!("invalid unterminated tail should fail before append"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        crate::rollout_read_error(&error),
+        Some(&crate::RolloutReadError::TruncatedRecord { record: 3 })
+    );
+    assert_eq!(fs::read(&invalid_path)?, before);
     Ok(())
 }
 
@@ -833,41 +1058,55 @@ async fn paginated_ordinal_overflow_fails_without_appending() -> std::io::Result
 
 #[tokio::test]
 async fn resumed_paginated_subagent_rollout_rejects_incomplete_prefix() -> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let config = test_config(home.path());
-    let rollout_path = home.path().join("rollout.jsonl");
-    let thread_id = ThreadId::new();
-    let mut session_meta = paginated_session_meta_item(thread_id, home.path());
-    let RolloutItem::SessionMeta(meta_line) = &mut session_meta else {
-        panic!("fixture should be session metadata");
-    };
-    meta_line.meta.subagent_history_start_ordinal = Some(3);
-    let lines = [
-        RolloutLine {
-            timestamp: "2026-07-09T00:00:00Z".to_string(),
-            ordinal: Some(0),
-            item: session_meta,
-        },
-        RolloutLine {
-            timestamp: "2026-07-09T00:00:01Z".to_string(),
-            ordinal: Some(1),
-            item: agent_message_item("partial inherited prefix"),
-        },
-    ];
-    let jsonl = lines
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()?
-        .join("\n");
-    fs::write(&rollout_path, format!("{jsonl}\n"))?;
+    for compressed in [false, true] {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let rollout_path = home.path().join("rollout.jsonl");
+        let thread_id = ThreadId::new();
+        let mut session_meta = paginated_session_meta_item(thread_id, home.path());
+        let RolloutItem::SessionMeta(meta_line) = &mut session_meta else {
+            panic!("fixture should be session metadata");
+        };
+        meta_line.meta.subagent_history_start_ordinal = Some(3);
+        let lines = [
+            RolloutLine {
+                timestamp: "2026-07-09T00:00:00Z".to_string(),
+                ordinal: Some(0),
+                item: session_meta,
+            },
+            RolloutLine {
+                timestamp: "2026-07-09T00:00:01Z".to_string(),
+                ordinal: Some(1),
+                item: agent_message_item("partial inherited prefix"),
+            },
+        ];
+        let jsonl = lines
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n");
+        fs::write(&rollout_path, format!("{jsonl}\n"))?;
+        let physical_path = if compressed {
+            compress_rollout(&rollout_path)?
+        } else {
+            rollout_path.clone()
+        };
+        let before = fs::read(&physical_path)?;
 
-    let err = match RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path)).await
-    {
-        Ok(_) => panic!("incomplete prefix should fail resume"),
-        Err(err) => err,
-    };
+        let err = match RolloutRecorder::new(
+            &config,
+            RolloutRecorderParams::resume(rollout_path.clone()),
+        )
+        .await
+        {
+            Ok(_) => panic!("incomplete prefix should fail resume"),
+            Err(err) => err,
+        };
 
-    assert!(err.to_string().contains("incomplete"));
+        assert!(err.to_string().contains("incomplete"));
+        assert_eq!(fs::read(&physical_path)?, before);
+        assert_eq!(rollout_path.exists(), !compressed);
+    }
     Ok(())
 }
 

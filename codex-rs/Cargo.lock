@@ -3303,6 +3303,7 @@ dependencies = [
  "codex-model-provider-info",
  "codex-models-manager",
  "codex-protocol",
+ "codex-rollout",
  "futures",
  "http 1.4.0",
  "libc",

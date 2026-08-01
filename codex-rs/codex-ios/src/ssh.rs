@@ -328,7 +328,8 @@ pub async fn ssh_download_workspace_file(
 
     // Bound memory use and also enforce the limit if the server omitted or
     // changed the file size after the metadata check.
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     let mut bounded_remote = remote_file.take(max_bytes.saturating_add(1));
     let copied = match tokio::io::copy(&mut bounded_remote, &mut local_file).await {
         Ok(copied) => copied,
