@@ -29,6 +29,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_core::CodexThread;
+use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
 use codex_core::test_support::default_http_client_factory;
@@ -1005,8 +1006,7 @@ pub(crate) async fn run_turn_async(
     //   - Collab       (feature `multi_agent`)    → the V1 (`multi_agent_v1__…`)
     // Missing the Collab one let the model fall back to the V1 built-ins, which
     // spawned invisible, capped sub-agents instead of our graph nodes.
-    let _ = config.features.disable(Feature::MultiAgentV2);
-    let _ = config.features.disable(Feature::Collab);
+    disable_upstream_multi_agent(&mut config);
 
     // Orchestration tools are supplied by the client (Swift) as dynamic tool
     // specs and executed on-device. The bridge, rather than client JSON, owns
@@ -1451,6 +1451,17 @@ pub(crate) async fn run_turn_async(
             _ => {}
         }
     }
+}
+
+fn disable_upstream_multi_agent(config: &mut Config) {
+    // AgentApp owns the visible, durable graph and supplies its orchestration
+    // tools dynamically from Swift. `agents_enabled = false` is required in
+    // addition to disabling both feature flags: without the explicit override,
+    // a model's advertised MultiAgentV2 default can still select V2 and inject
+    // upstream `/root` identity guidance into every independently hosted node.
+    config.agents_enabled = false;
+    let _ = config.features.disable(Feature::MultiAgentV2);
+    let _ = config.features.disable(Feature::Collab);
 }
 
 fn is_supported_image_upload(relative_path: &str) -> bool {
