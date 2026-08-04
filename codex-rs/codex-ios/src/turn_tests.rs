@@ -43,6 +43,7 @@ use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
 use super::read_thread_pointer;
 use super::register_starting_turn;
+use super::startup_interrupt_requested;
 use super::tool_discovery_event_json;
 use super::validate_relative_rollout_path;
 use super::write_thread_pointer;
@@ -60,13 +61,15 @@ extern "C" fn capture_event(ctx: *mut c_void, kind: c_int, text: *const c_char) 
 }
 
 #[test]
-fn startup_interrupt_is_idempotent_and_registry_guard_cleans_up() {
+fn pre_submit_interrupt_gate_is_idempotent_and_registry_guard_cleans_up() {
     let mut events = Vec::new();
     let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
     let (handle, guard) = register_starting_turn(capture_event, ctx).expect("register turn");
 
     assert_eq!(events, vec![(KIND_TURN_READY, handle.to_string())]);
+    assert!(!startup_interrupt_requested(handle).expect("startup state"));
     assert_eq!(codex_interrupt_turn(handle), 0);
+    assert!(startup_interrupt_requested(handle).expect("interrupted startup state"));
     assert_eq!(codex_interrupt_turn(handle), 0);
     {
         let registry = active_turn_registry().lock().expect("registry lock");

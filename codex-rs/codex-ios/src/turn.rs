@@ -605,6 +605,19 @@ fn activate_turn(
     Ok((response_receiver, interrupt_requested))
 }
 
+fn startup_interrupt_requested(turn_handle: u64) -> Result<bool, String> {
+    let registry = active_turn_registry()
+        .lock()
+        .map_err(|_| "active turn registry poisoned".to_string())?;
+    match registry.get(&turn_handle) {
+        Some(TurnBridge::Starting {
+            interrupt_requested,
+        }) => Ok(*interrupt_requested),
+        Some(TurnBridge::Active { .. }) => Err("turn handle was already activated".to_string()),
+        None => Err("unknown or finished turn handle".to_string()),
+    }
+}
+
 async fn request_interrupt(turn_handle: u64) -> Result<(), String> {
     let thread = {
         let mut registry = active_turn_registry()
@@ -1141,15 +1154,6 @@ pub(crate) async fn run_turn_async(
     let thread = new_thread.thread;
     let session_model = new_thread.session_configured.model.clone();
 
-    // Publish the live thread as soon as it exists. If cancellation arrived
-    // during setup, terminate without ever submitting the user's turn.
-    let (mut resp_rx, interrupted_during_startup) =
-        activate_turn(turn_handle, Arc::clone(&thread))?;
-    if interrupted_during_startup {
-        emit(callback, ctx, KIND_TURN_ABORTED, "");
-        return Ok(());
-    }
-
     // `history_json` is retained for legacy bridge callers that still need to
     // bootstrap a genuinely new context. AgentApp passes it empty: resumed
     // threads load Codex's own native rollout and are never reconstructed from
@@ -1227,7 +1231,15 @@ pub(crate) async fn run_turn_async(
             ..Default::default()
         },
     };
-    let mut interrupting_after_timeout = false;
+    // Keep the registry in Starting until the user operation has been submitted.
+    // An interrupt observed before this check skips input entirely. An interrupt
+    // racing after the check is preserved by activate_turn below, after input is
+    // already ordered, and is then submitted and drained.
+    if startup_interrupt_requested(turn_handle)? {
+        emit(callback, ctx, KIND_TURN_ABORTED, "");
+        return Ok(());
+    }
+    let mut submit_timed_out = false;
     if prompt_contains_images {
         emit_debug_stage(callback, ctx, "prompt_image_submit_begin");
         match timeout(PROMPT_IMAGE_SUBMIT_TIMEOUT, thread.submit(user_input_op)).await {
@@ -1242,8 +1254,7 @@ pub(crate) async fn run_turn_async(
                     KIND_ERROR,
                     "timed out submitting prompt image input to the model",
                 );
-                request_interrupt(turn_handle).await?;
-                interrupting_after_timeout = true;
+                submit_timed_out = true;
             }
         }
     } else {
@@ -1253,6 +1264,17 @@ pub(crate) async fn run_turn_async(
             .await
             .map_err(|e| format!("failed to submit user input: {e}"))?;
         emit_debug_stage(callback, ctx, "prompt_submit_end");
+    }
+    let (mut resp_rx, interrupted_during_submit) = activate_turn(turn_handle, Arc::clone(&thread))?;
+    let mut interrupting_after_submit = submit_timed_out || interrupted_during_submit;
+    if interrupting_after_submit {
+        // The input operation is already ordered (or its submit future timed
+        // out and may still have taken effect), so cancellation cannot be
+        // overtaken by a later UserInput submission.
+        thread
+            .submit(Op::Interrupt)
+            .await
+            .map_err(|error| format!("failed to interrupt submitted turn: {error}"))?;
     }
     // Drain events until the turn completes (or errors).
     // Track the reasoning summary section so we can signal bubble boundaries:
@@ -1273,7 +1295,7 @@ pub(crate) async fn run_turn_async(
     let mut awaiting_event_after_dynamic_image = false;
     let mut awaiting_first_event_after_prompt_image = prompt_contains_images;
     loop {
-        let event = if interrupting_after_timeout {
+        let event = if interrupting_after_submit {
             thread
                 .next_event()
                 .await
@@ -1290,7 +1312,7 @@ pub(crate) async fn run_turn_async(
                         "model did not produce an event after receiving prompt image input",
                     );
                     request_interrupt(turn_handle).await?;
-                    interrupting_after_timeout = true;
+                    interrupting_after_submit = true;
                     continue;
                 }
             }
@@ -1305,7 +1327,7 @@ pub(crate) async fn run_turn_async(
                         "model did not continue after receiving image tool output",
                     );
                     request_interrupt(turn_handle).await?;
-                    interrupting_after_timeout = true;
+                    interrupting_after_submit = true;
                     continue;
                 }
             }
@@ -1520,7 +1542,7 @@ pub(crate) async fn run_turn_async(
                                         "timed out submitting image tool output to the model",
                                     );
                                     request_interrupt(turn_handle).await?;
-                                    interrupting_after_timeout = true;
+                                    interrupting_after_submit = true;
                                 }
                             }
                         } else {
@@ -1550,7 +1572,7 @@ pub(crate) async fn run_turn_async(
                 return Ok(());
             }
             EventMsg::TurnComplete(_) => {
-                if interrupting_after_timeout {
+                if interrupting_after_submit {
                     return Ok(());
                 }
                 // Keep the legacy history event small. The durable model context
