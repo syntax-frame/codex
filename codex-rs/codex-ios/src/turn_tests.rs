@@ -26,6 +26,7 @@ use super::KIND_ERROR;
 use super::KIND_ITEM_STARTED;
 use super::KIND_TURN_READY;
 use super::PersistedThreadPointer;
+use super::ServerFileUpload;
 use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
 use super::TurnBridge;
 use super::active_turn_registry;
@@ -41,6 +42,7 @@ use super::parse_agentapp_dynamic_tools_json;
 use super::parse_reasoning_effort;
 use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
+use super::prompt_image_uploads;
 use super::read_thread_pointer;
 use super::register_starting_turn;
 use super::startup_interrupt_requested;
@@ -83,6 +85,32 @@ fn pre_submit_interrupt_gate_is_idempotent_and_registry_guard_cleans_up() {
 
     drop(guard);
     assert_eq!(codex_interrupt_turn(handle), 6);
+}
+
+#[test]
+fn prompt_image_limit_matches_agentapp_picker_without_silent_truncation() {
+    let uploads = (0..10)
+        .map(|index| ServerFileUpload {
+            local_path: format!("/tmp/image-{index}.png"),
+            relative_path: format!("uploads/image-{index}.png"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prompt_image_uploads(&uploads)
+            .expect("picker-sized image batch")
+            .len(),
+        10
+    );
+
+    let mut overflow = uploads;
+    overflow.push(ServerFileUpload {
+        local_path: "/tmp/image-10.png".to_string(),
+        relative_path: "uploads/image-10.png".to_string(),
+    });
+    assert_eq!(
+        prompt_image_uploads(&overflow).expect_err("overflow must be explicit"),
+        "too many prompt images: received 11, maximum is 10"
+    );
 }
 
 fn run_apikey_turn(context_home: &Path) -> Vec<(c_int, String)> {

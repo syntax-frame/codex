@@ -282,6 +282,9 @@ const POST_DYNAMIC_IMAGE_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
 const DYNAMIC_IMAGE_RESPONSE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_IMAGE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(45);
 const PROMPT_IMAGE_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Matches AgentApp's ordered photo-picker limit. Overflow is rejected instead
+/// of silently claiming images are attached after their bytes were dropped.
+const MAX_PROMPT_IMAGE_UPLOADS: usize = 10;
 const TURN_RUNTIME_MAX_BLOCKING_THREADS: usize = 16;
 const TURN_RUNTIME_BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_secs(1);
 
@@ -1185,11 +1188,7 @@ pub(crate) async fn run_turn_async(
     // Image uploads go in as normal prompt images instead of dynamic-tool output:
     // this uses Codex's upstream multimodal path and avoids wedging after a
     // tool-returned input_image.
-    let image_uploads = uploads
-        .iter()
-        .filter(|upload| is_supported_image_upload(&upload.relative_path))
-        .take(4)
-        .collect::<Vec<_>>();
+    let image_uploads = prompt_image_uploads(&uploads)?;
     let prompt_contains_images = !image_uploads.is_empty();
     let mut user_items = vec![UserInput::Text {
         text: prompt,
@@ -1619,6 +1618,20 @@ fn is_supported_image_upload(relative_path: &str) -> bool {
         return false;
     };
     matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp")
+}
+
+fn prompt_image_uploads(uploads: &[ServerFileUpload]) -> Result<Vec<&ServerFileUpload>, String> {
+    let images = uploads
+        .iter()
+        .filter(|upload| is_supported_image_upload(&upload.relative_path))
+        .collect::<Vec<_>>();
+    if images.len() > MAX_PROMPT_IMAGE_UPLOADS {
+        return Err(format!(
+            "too many prompt images: received {}, maximum is {MAX_PROMPT_IMAGE_UPLOADS}",
+            images.len()
+        ));
+    }
+    Ok(images)
 }
 
 /// Drive ONE user turn through the real Codex turn loop and stream events to
