@@ -271,6 +271,9 @@ const KIND_CONTEXT_COMPACTION_STARTED: c_int = 14;
 /// Search queries, matching schemas, call IDs, and tool arguments deliberately
 /// never cross this boundary.
 const KIND_TOOL_DISCOVERY: c_int = 15;
+/// The native Codex turn was aborted. This is terminal and is never followed
+/// by KIND_DONE for the same handle.
+const KIND_TURN_ABORTED: c_int = 16;
 const TOOL_DISCOVERY_CONTRACT_VERSION: u32 = 1;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
@@ -532,19 +535,109 @@ static NEXT_TURN_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 type ResponseSender = tokio::sync::mpsc::UnboundedSender<(String, DynamicToolResponse)>;
 
-/// Everything the C ABI may address on an active turn. Dynamic-tool responses
-/// use the sender while user steering calls directly into the same CodexThread.
-#[derive(Clone)]
-struct ActiveTurnBridge {
-    dynamic_response_sender: ResponseSender,
-    thread: Arc<CodexThread>,
+/// Atomic lifecycle for a registered streaming call. A handle is visible before
+/// setup starts, so an interrupt cannot be lost in auth or thread construction.
+enum TurnBridge {
+    Starting {
+        interrupt_requested: bool,
+    },
+    Active {
+        dynamic_response_sender: ResponseSender,
+        thread: Arc<CodexThread>,
+        interrupt_requested: bool,
+    },
 }
 
-/// Global registry mapping a short-lived numeric handle to an active turn.
-/// Entries exist only for the duration of `run_turn_async`.
-fn active_turn_registry() -> &'static Mutex<HashMap<u64, ActiveTurnBridge>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<u64, ActiveTurnBridge>>> = OnceLock::new();
+/// Global registry mapping a short-lived numeric handle to a streaming call.
+/// Entries exist from the entry-point callback through worker completion.
+fn active_turn_registry() -> &'static Mutex<HashMap<u64, TurnBridge>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u64, TurnBridge>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_starting_turn(
+    callback: EventCallback,
+    ctx: *mut c_void,
+) -> Result<(u64, RegistryGuard), String> {
+    let turn_handle = NEXT_TURN_HANDLE.fetch_add(1, Ordering::Relaxed);
+    active_turn_registry()
+        .lock()
+        .map_err(|_| "active turn registry poisoned".to_string())?
+        .insert(
+            turn_handle,
+            TurnBridge::Starting {
+                interrupt_requested: false,
+            },
+        );
+    emit(callback, ctx, KIND_TURN_READY, &turn_handle.to_string());
+    Ok((turn_handle, RegistryGuard(turn_handle)))
+}
+
+fn activate_turn(
+    turn_handle: u64,
+    thread: Arc<CodexThread>,
+) -> Result<
+    (
+        tokio::sync::mpsc::UnboundedReceiver<(String, DynamicToolResponse)>,
+        bool,
+    ),
+    String,
+> {
+    let (response_sender, response_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut registry = active_turn_registry()
+        .lock()
+        .map_err(|_| "active turn registry poisoned".to_string())?;
+    let entry = registry
+        .get_mut(&turn_handle)
+        .ok_or_else(|| "turn handle was removed during startup".to_string())?;
+    let TurnBridge::Starting {
+        interrupt_requested,
+    } = entry
+    else {
+        return Err("turn handle was already activated".to_string());
+    };
+    let interrupt_requested = *interrupt_requested;
+    *entry = TurnBridge::Active {
+        dynamic_response_sender: response_sender,
+        thread,
+        interrupt_requested,
+    };
+    Ok((response_receiver, interrupt_requested))
+}
+
+async fn request_interrupt(turn_handle: u64) -> Result<(), String> {
+    let thread = {
+        let mut registry = active_turn_registry()
+            .lock()
+            .map_err(|_| "active turn registry poisoned".to_string())?;
+        match registry.get_mut(&turn_handle) {
+            Some(TurnBridge::Starting {
+                interrupt_requested,
+            }) => {
+                *interrupt_requested = true;
+                None
+            }
+            Some(TurnBridge::Active {
+                thread,
+                interrupt_requested,
+                ..
+            }) => {
+                if *interrupt_requested {
+                    return Ok(());
+                }
+                *interrupt_requested = true;
+                Some(Arc::clone(thread))
+            }
+            None => return Err("unknown or finished turn handle".to_string()),
+        }
+    };
+    if let Some(thread) = thread {
+        thread
+            .submit(Op::Interrupt)
+            .await
+            .map_err(|error| format!("failed to interrupt turn: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Removes a turn's registry entry when the turn's async body returns, on ANY
@@ -819,6 +912,7 @@ pub(crate) enum ProviderAuthConfig {
 }
 
 pub(crate) async fn run_turn_async(
+    turn_handle: u64,
     provider_config: ProviderAuthConfig,
     model: String,
     reasoning_effort: String,
@@ -1047,23 +1141,14 @@ pub(crate) async fn run_turn_async(
     let thread = new_thread.thread;
     let session_model = new_thread.session_configured.model.clone();
 
-    // Allocate a turn handle and register the channel the event loop will await
-    // a dynamic tool response on. The drop guard removes the entry on every
-    // return path so the handle never outlives the turn.
-    let turn_handle = NEXT_TURN_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let (resp_tx, mut resp_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, DynamicToolResponse)>();
-    active_turn_registry()
-        .lock()
-        .map_err(|_| "active turn registry poisoned".to_string())?
-        .insert(
-            turn_handle,
-            ActiveTurnBridge {
-                dynamic_response_sender: resp_tx,
-                thread: Arc::clone(&thread),
-            },
-        );
-    let _registry_guard = RegistryGuard(turn_handle);
+    // Publish the live thread as soon as it exists. If cancellation arrived
+    // during setup, terminate without ever submitting the user's turn.
+    let (mut resp_rx, interrupted_during_startup) =
+        activate_turn(turn_handle, Arc::clone(&thread))?;
+    if interrupted_during_startup {
+        emit(callback, ctx, KIND_TURN_ABORTED, "");
+        return Ok(());
+    }
 
     // `history_json` is retained for legacy bridge callers that still need to
     // bootstrap a genuinely new context. AgentApp passes it empty: resumed
@@ -1142,6 +1227,7 @@ pub(crate) async fn run_turn_async(
             ..Default::default()
         },
     };
+    let mut interrupting_after_timeout = false;
     if prompt_contains_images {
         emit_debug_stage(callback, ctx, "prompt_image_submit_begin");
         match timeout(PROMPT_IMAGE_SUBMIT_TIMEOUT, thread.submit(user_input_op)).await {
@@ -1156,7 +1242,8 @@ pub(crate) async fn run_turn_async(
                     KIND_ERROR,
                     "timed out submitting prompt image input to the model",
                 );
-                return Ok(());
+                request_interrupt(turn_handle).await?;
+                interrupting_after_timeout = true;
             }
         }
     } else {
@@ -1167,8 +1254,6 @@ pub(crate) async fn run_turn_async(
             .map_err(|e| format!("failed to submit user input: {e}"))?;
         emit_debug_stage(callback, ctx, "prompt_submit_end");
     }
-    emit(callback, ctx, KIND_TURN_READY, &turn_handle.to_string());
-
     // Drain events until the turn completes (or errors).
     // Track the reasoning summary section so we can signal bubble boundaries:
     // Codex streams reasoning as multiple summary sections (each its own thought),
@@ -1188,7 +1273,12 @@ pub(crate) async fn run_turn_async(
     let mut awaiting_event_after_dynamic_image = false;
     let mut awaiting_first_event_after_prompt_image = prompt_contains_images;
     loop {
-        let event = if awaiting_first_event_after_prompt_image {
+        let event = if interrupting_after_timeout {
+            thread
+                .next_event()
+                .await
+                .map_err(|e| format!("event stream error while interrupting: {e}"))?
+        } else if awaiting_first_event_after_prompt_image {
             emit_debug_stage(callback, ctx, "prompt_image_first_event_wait");
             match timeout(PROMPT_IMAGE_FIRST_EVENT_TIMEOUT, thread.next_event()).await {
                 Ok(result) => result.map_err(|e| format!("event stream error: {e}"))?,
@@ -1199,7 +1289,9 @@ pub(crate) async fn run_turn_async(
                         KIND_ERROR,
                         "model did not produce an event after receiving prompt image input",
                     );
-                    return Ok(());
+                    request_interrupt(turn_handle).await?;
+                    interrupting_after_timeout = true;
+                    continue;
                 }
             }
         } else if awaiting_event_after_dynamic_image {
@@ -1212,7 +1304,9 @@ pub(crate) async fn run_turn_async(
                         KIND_ERROR,
                         "model did not continue after receiving image tool output",
                     );
-                    return Ok(());
+                    request_interrupt(turn_handle).await?;
+                    interrupting_after_timeout = true;
+                    continue;
                 }
             }
         } else {
@@ -1366,7 +1460,29 @@ pub(crate) async fn run_turn_async(
                 if let Ok(json) = serde_json::to_string(&payload) {
                     emit(callback, ctx, KIND_DYNAMIC_TOOL_CALL, &json);
                 }
-                match resp_rx.recv().await {
+                let response = loop {
+                    tokio::select! {
+                        biased;
+                        event = thread.next_event() => {
+                            let event = event.map_err(|error| {
+                                format!("event stream error while awaiting tool: {error}")
+                            })?;
+                            match event.msg {
+                                EventMsg::TurnAborted(_) => {
+                                    emit(callback, ctx, KIND_TURN_ABORTED, "");
+                                    return Ok(());
+                                }
+                                EventMsg::Error(error) => {
+                                    emit(callback, ctx, KIND_ERROR, &error.message);
+                                    return Ok(());
+                                }
+                                _ => continue,
+                            }
+                        },
+                        response = resp_rx.recv() => break response,
+                    }
+                };
+                match response {
                     Some((call_id, response)) => {
                         let response_contains_image = response.content_items.iter().any(|item| {
                             matches!(item, DynamicToolCallOutputContentItem::InputImage { .. })
@@ -1403,7 +1519,8 @@ pub(crate) async fn run_turn_async(
                                         KIND_ERROR,
                                         "timed out submitting image tool output to the model",
                                     );
-                                    return Ok(());
+                                    request_interrupt(turn_handle).await?;
+                                    interrupting_after_timeout = true;
                                 }
                             }
                         } else {
@@ -1428,7 +1545,14 @@ pub(crate) async fn run_turn_async(
                 emit(callback, ctx, KIND_ERROR, &ev.message);
                 return Ok(());
             }
+            EventMsg::TurnAborted(_) => {
+                emit(callback, ctx, KIND_TURN_ABORTED, "");
+                return Ok(());
+            }
             EventMsg::TurnComplete(_) => {
+                if interrupting_after_timeout {
+                    return Ok(());
+                }
                 // Keep the legacy history event small. The durable model context
                 // is Codex's rollout; this projection exists only for consumers
                 // that recover a non-streamed final assistant message.
@@ -1506,6 +1630,13 @@ pub extern "C" fn codex_run_turn_streaming(
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
+    let (turn_handle, _registry_guard) = match register_starting_turn(callback, ctx) {
+        Ok(registered) => registered,
+        Err(message) => {
+            emit(callback, ctx, KIND_ERROR, &message);
+            return;
+        }
+    };
     let result = std::panic::catch_unwind(move || {
         // Parse the C strings on the calling thread (the pointers are only valid
         // for the duration of this call), then move the owned data into a worker.
@@ -1561,6 +1692,7 @@ pub extern "C" fn codex_run_turn_streaming(
             .spawn(move || -> Result<(), String> {
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(run_turn_async(
+                    turn_handle,
                     ProviderAuthConfig::ChatgptOAuth {
                         access_token: token,
                         id_token: id_tok,
@@ -1627,6 +1759,13 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
+    let (turn_handle, _registry_guard) = match register_starting_turn(callback, ctx) {
+        Ok(registered) => registered,
+        Err(message) => {
+            emit(callback, ctx, KIND_ERROR, &message);
+            return;
+        }
+    };
     let result = std::panic::catch_unwind(move || {
         // Parse the C strings on the calling thread (the pointers are only valid
         // for the duration of this call), then move the owned data into a worker.
@@ -1681,6 +1820,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
             .spawn(move || -> Result<(), String> {
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(run_turn_async(
+                    turn_handle,
                     ProviderAuthConfig::ApiKey {
                         base_url,
                         api_key,
@@ -1747,6 +1887,13 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
+    let (turn_handle, _registry_guard) = match register_starting_turn(callback, ctx) {
+        Ok(registered) => registered,
+        Err(message) => {
+            emit(callback, ctx, KIND_ERROR, &message);
+            return;
+        }
+    };
     let result = std::panic::catch_unwind(move || {
         let base_url = c_str_to_string(base_url, "base_url")?;
         let api_key = c_str_to_string(api_key, "api_key")?;
@@ -1866,6 +2013,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
                     }
 
                     run_turn_async(
+                        turn_handle,
                         ProviderAuthConfig::ApiKey {
                             base_url,
                             api_key,
@@ -1947,6 +2095,13 @@ pub extern "C" fn codex_run_turn_streaming_server(
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
+    let (turn_handle, _registry_guard) = match register_starting_turn(callback, ctx) {
+        Ok(registered) => registered,
+        Err(message) => {
+            emit(callback, ctx, KIND_ERROR, &message);
+            return;
+        }
+    };
     let result = std::panic::catch_unwind(move || {
         // Parse the C strings on the calling thread (the pointers are only valid
         // for the duration of this call), then move the owned data into a worker.
@@ -2071,6 +2226,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
                     }
 
                     run_turn_async(
+                        turn_handle,
                         ProviderAuthConfig::ChatgptOAuth {
                             access_token: token,
                             id_token: id_tok,
@@ -2135,6 +2291,13 @@ pub unsafe fn run_turn_streaming(
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
+    let (turn_handle, _registry_guard) = match register_starting_turn(callback, ctx) {
+        Ok(registered) => registered,
+        Err(message) => {
+            emit(callback, ctx, KIND_ERROR, &message);
+            return;
+        }
+    };
     let result = std::panic::catch_unwind(move || {
         std::thread::Builder::new()
             .name("codex-turn".to_string())
@@ -2142,6 +2305,7 @@ pub unsafe fn run_turn_streaming(
             .spawn(move || -> Result<(), String> {
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(run_turn_async(
+                    turn_handle,
                     ProviderAuthConfig::ChatgptOAuth {
                         access_token,
                         id_token,
@@ -2237,8 +2401,19 @@ pub extern "C" fn codex_respond_dynamic_tool(
             Ok(m) => m,
             Err(_) => return 4,
         };
-        map.get(&turn_handle)
-            .map(|bridge| bridge.dynamic_response_sender.clone())
+        match map.get(&turn_handle) {
+            Some(TurnBridge::Active {
+                dynamic_response_sender,
+                interrupt_requested: false,
+                ..
+            }) => Some(dynamic_response_sender.clone()),
+            Some(TurnBridge::Starting { .. })
+            | Some(TurnBridge::Active {
+                interrupt_requested: true,
+                ..
+            })
+            | None => None,
+        }
     };
     match sender {
         Some(tx) => match tx.send((call_id, response)) {
@@ -2272,8 +2447,19 @@ pub extern "C" fn codex_steer_turn(turn_handle: u64, text: *const c_char) -> c_i
             Ok(map) => map,
             Err(_) => return 4,
         };
-        map.get(&turn_handle)
-            .map(|bridge| Arc::clone(&bridge.thread))
+        match map.get(&turn_handle) {
+            Some(TurnBridge::Active {
+                thread,
+                interrupt_requested: false,
+                ..
+            }) => Some(Arc::clone(thread)),
+            Some(TurnBridge::Starting { .. })
+            | Some(TurnBridge::Active {
+                interrupt_requested: true,
+                ..
+            })
+            | None => None,
+        }
     };
     let Some(thread) = thread else {
         return 6;
@@ -2291,6 +2477,51 @@ pub extern "C" fn codex_steer_turn(turn_handle: u64, text: *const c_char) -> c_i
             /*client_user_message_id*/ None,
             /*responsesapi_client_metadata*/ None,
         ))
+    }));
+    match result {
+        Ok(Ok(_)) => 0,
+        Ok(Err(_)) | Err(_) => 7,
+    }
+}
+
+/// Interrupt a registered streaming turn, including one still in setup.
+///
+/// Returns 0 when the request is recorded (also for repeats), 4 when the
+/// registry lock is poisoned, 6 for an unknown/finished handle, and 7 when an
+/// active thread rejected the interrupt submission.
+#[unsafe(no_mangle)]
+pub extern "C" fn codex_interrupt_turn(turn_handle: u64) -> c_int {
+    let thread = {
+        let mut registry = match active_turn_registry().lock() {
+            Ok(registry) => registry,
+            Err(_) => return 4,
+        };
+        match registry.get_mut(&turn_handle) {
+            Some(TurnBridge::Starting {
+                interrupt_requested,
+            }) => {
+                *interrupt_requested = true;
+                None
+            }
+            Some(TurnBridge::Active {
+                thread,
+                interrupt_requested,
+                ..
+            }) => {
+                if *interrupt_requested {
+                    return 0;
+                }
+                *interrupt_requested = true;
+                Some(Arc::clone(thread))
+            }
+            None => return 6,
+        }
+    };
+    let Some(thread) = thread else {
+        return 0;
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        turn_runtime().block_on(thread.submit(Op::Interrupt))
     }));
     match result {
         Ok(Ok(_)) => 0,

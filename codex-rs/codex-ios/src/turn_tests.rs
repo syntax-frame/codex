@@ -24,9 +24,13 @@ use super::CONTEXT_POINTER_FILE;
 use super::KIND_CONTEXT_COMPACTION_STARTED;
 use super::KIND_ERROR;
 use super::KIND_ITEM_STARTED;
+use super::KIND_TURN_READY;
 use super::PersistedThreadPointer;
 use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
+use super::TurnBridge;
+use super::active_turn_registry;
 use super::build_turn_runtime;
+use super::codex_interrupt_turn;
 use super::codex_ios_tool_discovery_contract_version;
 use super::codex_run_turn_streaming_apikey;
 use super::codex_steer_turn;
@@ -38,6 +42,7 @@ use super::parse_reasoning_effort;
 use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
 use super::read_thread_pointer;
+use super::register_starting_turn;
 use super::tool_discovery_event_json;
 use super::validate_relative_rollout_path;
 use super::write_thread_pointer;
@@ -52,6 +57,29 @@ extern "C" fn capture_event(ctx: *mut c_void, kind: c_int, text: *const c_char) 
         .to_string_lossy()
         .into_owned();
     events.push((kind, text));
+}
+
+#[test]
+fn startup_interrupt_is_idempotent_and_registry_guard_cleans_up() {
+    let mut events = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+    let (handle, guard) = register_starting_turn(capture_event, ctx).expect("register turn");
+
+    assert_eq!(events, vec![(KIND_TURN_READY, handle.to_string())]);
+    assert_eq!(codex_interrupt_turn(handle), 0);
+    assert_eq!(codex_interrupt_turn(handle), 0);
+    {
+        let registry = active_turn_registry().lock().expect("registry lock");
+        assert!(matches!(
+            registry.get(&handle),
+            Some(TurnBridge::Starting {
+                interrupt_requested: true
+            })
+        ));
+    }
+
+    drop(guard);
+    assert_eq!(codex_interrupt_turn(handle), 6);
 }
 
 fn run_apikey_turn(context_home: &Path) -> Vec<(c_int, String)> {
@@ -503,9 +531,9 @@ fn malformed_model_context_pointer_surfaces_error_without_replacement() {
 
     assert_eq!(
         events.iter().map(|event| event.0).collect::<Vec<_>>(),
-        vec![KIND_ERROR]
+        vec![KIND_TURN_READY, KIND_ERROR]
     );
-    assert!(events[0].1.contains("invalid model-context pointer"));
+    assert!(events[1].1.contains("invalid model-context pointer"));
     assert_eq!(
         std::fs::read(pointer_path).expect("preserved pointer"),
         pointer_bytes
@@ -534,15 +562,15 @@ fn failed_model_context_resume_preserves_pointer_and_rollout() {
 
     assert_eq!(
         events.iter().map(|event| event.0).collect::<Vec<_>>(),
-        vec![KIND_ERROR]
+        vec![KIND_TURN_READY, KIND_ERROR]
     );
     assert!(
-        events[0]
+        events[1]
             .1
             .contains("failed to resume persistent model context")
     );
     assert!(
-        !events[0].1.contains(relative_rollout),
+        !events[1].1.contains(relative_rollout),
         "public resume errors must not expose the rollout path"
     );
     assert!(

@@ -69,6 +69,8 @@ void codex_free_string(char *s);
  *                   {"contract_version":1,"event":"search_requested"|
  *                   "search_loaded"}. Consumers must ignore unsupported
  *                   versions; older libraries simply never emit kind 15.
+ *              16 = turn aborted. This is terminal and is never followed by
+ *                   event kind 2 (done) for the same turn.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */
@@ -309,6 +311,17 @@ char *codex_download_ssh_workspace_file(const char *ssh_host,
  * 7 = the active turn rejected steering.
  */
 int codex_steer_turn(uint64_t turn_handle, const char *text);
+
+/*
+ * Interrupt a registered streaming turn. The handle is emitted through event
+ * kind 8 before authentication or thread startup begins, so this is safe to
+ * call immediately. Repeated calls are idempotent while the handle is
+ * registered.
+ *
+ * Returns 0 when recorded. Non-zero: 4 = internal lock poisoned,
+ * 6 = unknown/finished turn_handle, 7 = the active turn rejected interruption.
+ */
+int codex_interrupt_turn(uint64_t turn_handle);
 
 /*
  * Resolve an in-flight dynamic tool call (event_kind 7): deliver the client's
