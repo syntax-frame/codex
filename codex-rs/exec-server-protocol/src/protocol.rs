@@ -163,10 +163,26 @@ impl From<DetectedShell> for ShellInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ExecutionIdentity {
+    /// Durable thread identity that owns this execution.
+    pub thread_id: String,
+    /// Original turn identity stamped into rollout items.
+    pub turn_id: String,
+    /// Model function-call identity for this logical execution.
+    pub call_id: String,
+    /// Deterministic generation for repeated launch attempts of the same call.
+    pub attempt_generation: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecParams {
     /// Client-chosen logical process handle scoped to this connection/session.
     /// This is a protocol key, not an OS pid.
     pub process_id: ProcessId,
+    /// Durable logical identity used to reconcile executor-side processes after reconnecting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_identity: Option<ExecutionIdentity>,
     pub argv: Vec<String>,
     /// Working directory URI, interpreted using the exec-server host's path rules at launch time.
     pub cwd: PathUri,

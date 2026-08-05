@@ -229,6 +229,7 @@ pub(crate) async fn execute_user_shell_command(
         windows_sandbox_filesystem_overrides: None,
         arg0: None,
         exec_server_sandbox: None,
+        attempt_generation: 0,
         exec_server_enforce_managed_network: false,
         exec_server_managed_network: None,
         exec_server_network_proxy: None,

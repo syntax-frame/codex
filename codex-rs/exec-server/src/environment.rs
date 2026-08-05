@@ -1621,6 +1621,7 @@ mod tests {
             .get_exec_backend()
             .start(crate::ExecParams {
                 process_id: ProcessId::from("default-env-proc"),
+                execution_identity: None,
                 argv: vec!["true".to_string()],
                 cwd: PathUri::from_host_native_path(
                     std::env::current_dir().expect("read current dir"),
@@ -1662,6 +1663,7 @@ mod tests {
             .get_exec_backend()
             .start(crate::ExecParams {
                 process_id: ProcessId::from("local-sandbox-proc"),
+                execution_identity: None,
                 argv: vec!["true".to_string()],
                 cwd: PathUri::from_host_native_path(
                     std::env::current_dir().expect("read current dir"),

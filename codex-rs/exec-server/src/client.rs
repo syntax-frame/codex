@@ -1662,6 +1662,7 @@ mod tests {
         let session = client
             .start_process(ExecParams {
                 process_id: process_id.clone(),
+                execution_identity: None,
                 argv: vec!["true".to_string()],
                 cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
                     .expect("cwd URI"),

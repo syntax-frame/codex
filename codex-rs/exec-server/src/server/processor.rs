@@ -593,6 +593,7 @@ mod tests {
         }
         ExecParams {
             process_id,
+            execution_identity: None,
             argv: sleep_then_print_argv(),
             cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
                 .expect("cwd URI"),

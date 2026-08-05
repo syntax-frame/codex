@@ -6952,6 +6952,16 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
     );
 }
 
+#[test]
+fn confirmed_termination_failure_emits_error_not_shutdown_complete() {
+    let event = handlers::shutdown_failure_event(
+        "shutdown-1".to_string(),
+        "failed to confirm process termination".to_string(),
+    );
+    assert!(matches!(event.msg, EventMsg::Error(_)));
+    assert!(!matches!(event.msg, EventMsg::ShutdownComplete));
+}
+
 #[tokio::test]
 async fn submission_loop_channel_close_runs_full_thread_teardown() {
     struct SessionStopMarker;

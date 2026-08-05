@@ -995,6 +995,7 @@ mod tests {
     fn test_exec_params(env: HashMap<String, String>) -> ExecParams {
         ExecParams {
             process_id: ProcessId::from("env-test"),
+            execution_identity: None,
             argv: vec!["true".to_string()],
             cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
                 .expect("cwd URI"),

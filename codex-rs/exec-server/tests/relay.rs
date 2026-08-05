@@ -313,6 +313,7 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
     let response = client
         .exec(ExecParams {
             process_id: ProcessId::from("proc-1"),
+            execution_identity: None,
             argv: vec!["true".to_string()],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: None,

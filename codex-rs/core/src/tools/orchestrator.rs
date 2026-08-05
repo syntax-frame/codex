@@ -82,6 +82,7 @@ impl ToolOrchestrator {
             tool_name: tool_ctx.tool_name.clone(),
         };
         let attempt_with_network_approval = SandboxAttempt {
+            attempt_generation: attempt.attempt_generation,
             sandbox: attempt.sandbox,
             sandbox_requested: attempt.sandbox_requested,
             permissions: attempt.permissions,
@@ -261,6 +262,7 @@ impl ToolOrchestrator {
             .cloned()
             .unwrap_or_else(|| PathUri::from_abs_path(&turn_ctx.cwd));
         let initial_attempt = SandboxAttempt {
+            attempt_generation: 0,
             sandbox: initial_sandbox,
             sandbox_requested,
             permissions: &permissions,
@@ -443,6 +445,7 @@ impl ToolOrchestrator {
                     turn_ctx.config.codex_linux_sandbox_exe.as_ref()
                 };
                 let retry_attempt = SandboxAttempt {
+                    attempt_generation: 1,
                     sandbox: retry_sandbox,
                     sandbox_requested: retry_sandbox_requested,
                     permissions: &permissions,

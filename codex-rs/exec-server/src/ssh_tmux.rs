@@ -231,14 +231,12 @@ async fn monitor_pump(
                                 );
                             }
                         }
-                        Some(ChannelCommand::Eof) => {
-                            if let Err(error) = descriptor.terminate(backend.transport()).await {
-                                tracing::debug!(
-                                    session_key = %backend.session_key(),
-                                    error = %error,
-                                    "failed to terminate tmux process"
-                                );
-                            }
+                        Some(ChannelCommand::Terminate { ack }) => {
+                            let result = descriptor
+                                .terminate(backend.transport())
+                                .await
+                                .map_err(|error| error.to_string());
+                            let _ = ack.send(result);
                         }
                         None => commands_open = false,
                     }

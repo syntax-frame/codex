@@ -11,7 +11,6 @@ use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
@@ -86,6 +85,8 @@ const NETWORK_ACCESS_DENIED_MESSAGE: &str =
     "Network access was denied by the Codex sandbox network proxy.";
 const LATE_NETWORK_DENIAL_GRACE_PERIOD: Duration = Duration::from_millis(100);
 const INTERRUPT: &str = "\u{3}";
+const CODEX_EXEC_CALL_ID_ENV_VAR: &str = "CODEX_EXEC_CALL_ID";
+const CODEX_EXEC_TURN_ID_ENV_VAR: &str = "CODEX_EXEC_TURN_ID";
 
 /// Test-only override for deterministic unified exec process IDs.
 ///
@@ -178,14 +179,24 @@ fn exec_server_params_for_request(
     tty: bool,
 ) -> codex_exec_server::ExecParams {
     let (env_policy, env) = exec_server_env_for_request(request);
-    // Sandbox retries reuse the unified-exec ID but start a distinct executor process.
-    let exec_server_process_id = if request.exec_server_sandbox.is_some() {
-        format!("{process_id}-{}", Uuid::new_v4())
-    } else {
-        process_id.to_string()
-    };
+    // Retries reuse the unified-exec ID, but carry an explicit ordinal that is
+    // independent of whether this particular attempt is sandboxed.
+    let attempt_generation = request.attempt_generation;
     codex_exec_server::ExecParams {
-        process_id: exec_server_process_id.into(),
+        process_id: process_id.to_string().into(),
+        execution_identity: request
+            .env
+            .get(CODEX_THREAD_ID_ENV_VAR)
+            .zip(request.env.get(CODEX_EXEC_TURN_ID_ENV_VAR))
+            .zip(request.env.get(CODEX_EXEC_CALL_ID_ENV_VAR))
+            .map(
+                |((thread_id, turn_id), call_id)| codex_exec_server::ExecutionIdentity {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    call_id: call_id.clone(),
+                    attempt_generation,
+                },
+            ),
         argv: request.command.clone(),
         cwd: request.cwd.clone(),
         env_policy,
@@ -1102,6 +1113,14 @@ impl UnifiedExecProcessManager {
             CODEX_THREAD_ID_ENV_VAR.to_string(),
             context.session.thread_id.to_string(),
         );
+        env.insert(
+            CODEX_EXEC_CALL_ID_ENV_VAR.to_string(),
+            context.call_id.clone(),
+        );
+        env.insert(
+            CODEX_EXEC_TURN_ID_ENV_VAR.to_string(),
+            context.turn.sub_id.clone(),
+        );
         let active_permission_profile = context.turn.config.permissions.active_permission_profile();
         inject_permission_profile_env(&mut env, active_permission_profile.as_ref());
         let env = apply_unified_exec_env(env);
@@ -1401,6 +1420,49 @@ impl UnifiedExecProcessManager {
         for entry in entries {
             unregister_network_approval_for_entry(&entry).await;
             entry.process.terminate();
+        }
+    }
+
+    pub(crate) async fn terminate_all_processes_confirmed(&self) -> Result<(), UnifiedExecError> {
+        let processes_to_terminate: Vec<(i32, Arc<UnifiedExecProcess>)> = {
+            let processes = self.process_store.lock().await;
+            processes
+                .processes
+                .iter()
+                .map(|(process_id, entry)| (*process_id, Arc::clone(&entry.process)))
+                .collect()
+        };
+
+        let mut failures = Vec::new();
+        for (process_id, process) in processes_to_terminate {
+            if let Err(error) = process.terminate_confirmed().await {
+                // Keep the entry and its reserved ID registered. Until the
+                // remote endpoint acknowledges termination, its descriptor is
+                // still authoritative and must remain available for repair.
+                failures.push(format!("process {process_id}: {error}"));
+                continue;
+            }
+
+            let removed = {
+                let mut store = self.process_store.lock().await;
+                let still_same_process = store
+                    .processes
+                    .get(&process_id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process));
+                if still_same_process {
+                    store.remove(process_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(entry) = removed {
+                unregister_network_approval_for_entry(&entry).await;
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(UnifiedExecError::process_failed(failures.join("; ")))
         }
     }
 

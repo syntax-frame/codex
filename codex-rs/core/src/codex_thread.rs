@@ -212,7 +212,17 @@ impl CodexThread {
     }
 
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
+        self.terminate_all_processes_confirmed().await?;
         self.io.shutdown_and_wait().await
+    }
+
+    pub async fn terminate_all_processes_confirmed(&self) -> CodexResult<()> {
+        self.session
+            .services
+            .unified_exec_manager
+            .terminate_all_processes_confirmed()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error.to_string())))
     }
 
     /// Wait until the underlying session loop has terminated.

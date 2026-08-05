@@ -459,6 +459,7 @@ pub(crate) async fn execute_exec_request(
         network_environment_id,
         arg0,
         exec_server_sandbox: _,
+        attempt_generation: _,
         exec_server_enforce_managed_network: _,
         exec_server_managed_network: _,
         exec_server_network_proxy: _,

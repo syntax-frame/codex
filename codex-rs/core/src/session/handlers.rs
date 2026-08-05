@@ -594,7 +594,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
-async fn shutdown_session_runtime(sess: &Arc<Session>) {
+async fn shutdown_session_runtime(sess: &Arc<Session>) -> Result<(), String> {
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
@@ -602,8 +602,9 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
     sess.services
         .unified_exec_manager
-        .terminate_all_processes()
-        .await;
+        .terminate_all_processes_confirmed()
+        .await
+        .map_err(|error| format!("failed to confirm process termination: {error}"))?;
     #[cfg(feature = "code-mode")]
     if let Err(err) = sess.services.code_mode_service.shutdown().await {
         warn!("failed to shutdown code mode session: {err}");
@@ -612,6 +613,7 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     sess.guardian_review_session.shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    Ok(())
 }
 
 async fn emit_thread_stop_lifecycle(sess: &Session) {
@@ -625,8 +627,22 @@ async fn emit_thread_stop_lifecycle(sess: &Session) {
     }
 }
 
+pub(super) fn shutdown_failure_event(sub_id: String, message: String) -> Event {
+    Event {
+        id: sub_id,
+        msg: EventMsg::Error(ErrorEvent {
+            message,
+            codex_error_info: Some(CodexErrorInfo::Other),
+        }),
+    }
+}
+
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-    shutdown_session_runtime(sess).await;
+    if let Err(message) = shutdown_session_runtime(sess).await {
+        sess.send_event_raw(shutdown_failure_event(sub_id, message))
+            .await;
+        return true;
+    }
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
     let turn_count = history
@@ -857,7 +873,9 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        shutdown_session_runtime(&sess).await;
+        if let Err(err) = shutdown_session_runtime(&sess).await {
+            warn!("failed to confirm process termination during session teardown: {err}");
+        }
         emit_thread_stop_lifecycle(sess.as_ref()).await;
         if let Some(live_thread) = sess.live_thread()
             && let Err(err) = live_thread.shutdown().await

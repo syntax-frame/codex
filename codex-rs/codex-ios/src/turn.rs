@@ -15,6 +15,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
@@ -27,6 +30,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use codex_core::CodexThread;
 use codex_core::config::Config;
@@ -69,6 +73,20 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use tokio::time::timeout;
+
+const CONTEXT_LOCK_FILE: &str = ".agentapp-context.lock";
+const CONTEXT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTEXT_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+struct ContextFileLock(File);
+
+impl Drop for ContextFileLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
 
 /// Steers the model toward the on-device tools. This build runs on a phone with
 /// no shell and no patch environment, so `apply_patch` and any shell/exec tool
@@ -363,6 +381,38 @@ fn context_turn_lock(codex_home: &Path) -> Result<Arc<tokio::sync::Mutex<()>>, S
             .entry(codex_home.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
     ))
+}
+
+async fn acquire_context_file_lock(codex_home: &Path) -> Result<ContextFileLock, String> {
+    let lock_path = codex_home.join(CONTEXT_LOCK_FILE);
+    tokio::task::spawn_blocking(move || {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("failed to open model-context lock: {error}"))?;
+        let deadline = Instant::now() + CONTEXT_LOCK_TIMEOUT;
+        loop {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(ContextFileLock(file));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(format!("failed to acquire model-context lock: {error}"));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out acquiring model-context lock at {}",
+                    lock_path.display()
+                ));
+            }
+            std::thread::sleep(CONTEXT_LOCK_RETRY_DELAY);
+        }
+    })
+    .await
+    .map_err(|error| format!("model-context lock task failed: {error}"))?
 }
 
 fn validate_relative_rollout_path(path: &Path) -> Result<(), String> {
@@ -959,11 +1009,22 @@ pub(crate) async fn run_turn_async(
         .as_ref()
         .map(|home| home.path().to_path_buf())
         .unwrap_or_else(|| PathBuf::from(&context_home));
-    tokio::fs::create_dir_all(&codex_home)
+    // Directory creation is the sole pre-lock filesystem operation. If the
+    // context is brand new, there are no rollout or pointer bytes to race with;
+    // if it already exists, create_dir_all is an idempotent no-op. No read,
+    // reconciliation, materialization, recorder creation, or mutation of an
+    // existing context occurs until both locks below are held.
+    if !tokio::fs::try_exists(&codex_home)
         .await
-        .map_err(|error| format!("failed to create model-context home: {error}"))?;
+        .map_err(|error| format!("failed to inspect model-context home: {error}"))?
+    {
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .map_err(|error| format!("failed to create model-context home: {error}"))?;
+    }
     let turn_lock = context_turn_lock(&codex_home)?;
     let _turn_guard = turn_lock.lock().await;
+    let _context_file_lock = acquire_context_file_lock(&codex_home).await?;
 
     // Build auth and provider independently from the persistent context home.
     // Credentials remain in memory and are never written beside the rollout.
@@ -1156,6 +1217,7 @@ pub(crate) async fn run_turn_async(
     emit_debug_stage(callback, ctx, "thread_ready");
     let thread = new_thread.thread;
     let session_model = new_thread.session_configured.model.clone();
+    let turn_result: Result<(), String> = async {
 
     // `history_json` is retained for legacy bridge callers that still need to
     // bootstrap a genuinely new context. AgentApp passes it empty: resumed
@@ -1595,6 +1657,33 @@ pub(crate) async fn run_turn_async(
             }
             _ => {}
         }
+    }
+    }
+    .await;
+    let termination_result = thread
+        .terminate_all_processes_confirmed()
+        .await
+        .map_err(|error| format!("failed to terminate remote processes: {error}"));
+    let shutdown_result = thread
+        .shutdown_and_wait()
+        .await
+        .map_err(|error| format!("failed to flush model context during shutdown: {error}"));
+    combine_turn_lifecycle_results(turn_result, termination_result, shutdown_result)
+}
+
+fn combine_turn_lifecycle_results(
+    turn_result: Result<(), String>,
+    termination_result: Result<(), String>,
+    shutdown_result: Result<(), String>,
+) -> Result<(), String> {
+    let errors = [turn_result, termination_result, shutdown_result]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; additionally: "))
     }
 }
 

@@ -127,6 +127,7 @@ pub use protocol::ExecOutputDeltaNotification;
 pub use protocol::ExecOutputStream;
 pub use protocol::ExecParams;
 pub use protocol::ExecResponse;
+pub use protocol::ExecutionIdentity;
 pub use protocol::FsCanonicalizeParams;
 pub use protocol::FsCanonicalizeResponse;
 pub use protocol::FsCloseParams;

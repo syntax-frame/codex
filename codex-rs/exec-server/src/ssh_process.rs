@@ -56,6 +56,7 @@ mod tmux;
 const RETAINED_OUTPUT_BYTES_PER_PROCESS: usize = 1024 * 1024;
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const SSH_START_ATTEMPTS: usize = 2;
+const SSH_TERMINATE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_PATH_EXPORT: &str = "export PATH=\"$HOME/bin:$HOME/.local/bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}\"";
 
 /// Whether server-mode process execution requires tmux continuity.
@@ -64,6 +65,27 @@ pub enum SshTmuxMode {
     Required,
     Preferred,
     Disabled,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SshLaunchMode {
+    Tmux,
+    PreferredWithLegacyFallback,
+    Direct,
+}
+
+fn launch_mode(
+    tmux_mode: SshTmuxMode,
+    has_execution_identity: bool,
+) -> Result<SshLaunchMode, ExecServerError> {
+    match (tmux_mode, has_execution_identity) {
+        (SshTmuxMode::Required, _) | (SshTmuxMode::Preferred, true) => Ok(SshLaunchMode::Tmux),
+        (SshTmuxMode::Preferred, false) => Ok(SshLaunchMode::PreferredWithLegacyFallback),
+        (SshTmuxMode::Disabled, false) => Ok(SshLaunchMode::Direct),
+        (SshTmuxMode::Disabled, true) => Err(ExecServerError::Protocol(
+            "durable execution identity requires tmux; tmux mode is disabled".to_string(),
+        )),
+    }
 }
 
 /// Connection + auth material for opening SSH sessions.
@@ -75,6 +97,18 @@ pub struct SshProcessBackend {
     transport: SshTransport,
     session_key: String,
     tmux_mode: SshTmuxMode,
+    #[cfg(test)]
+    test_launchers: Option<TestLaunchers>,
+}
+
+#[cfg(test)]
+type TestLauncher = Arc<dyn Fn(ExecParams) -> ExecBackendFuture<'static> + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestLaunchers {
+    tmux: TestLauncher,
+    direct: TestLauncher,
 }
 
 impl SshProcessBackend {
@@ -180,24 +214,36 @@ impl SshProcessBackend {
             transport,
             session_key: session_key.into(),
             tmux_mode,
+            #[cfg(test)]
+            test_launchers: None,
         }
     }
 
+    async fn start_tmux(&self, params: ExecParams) -> Result<StartedExecProcess, ExecServerError> {
+        #[cfg(test)]
+        if let Some(launchers) = &self.test_launchers {
+            return (launchers.tmux)(params).await;
+        }
+        tmux::start(self.clone(), params).await
+    }
+
     async fn start(&self, params: ExecParams) -> Result<StartedExecProcess, ExecServerError> {
-        match self.tmux_mode {
-            SshTmuxMode::Required => tmux::start(self.clone(), params).await,
-            SshTmuxMode::Preferred => match tmux::start(self.clone(), params.clone()).await {
-                Ok(process) => Ok(process),
-                Err(error) if tmux::is_unavailable(&error) => {
-                    tracing::warn!(
-                        session_key = %self.session_key,
-                        "tmux unavailable; falling back to direct ssh execution"
-                    );
-                    self.start_direct(params).await
+        match launch_mode(self.tmux_mode, params.execution_identity.is_some())? {
+            SshLaunchMode::Tmux => self.start_tmux(params).await,
+            SshLaunchMode::PreferredWithLegacyFallback => {
+                match self.start_tmux(params.clone()).await {
+                    Ok(process) => Ok(process),
+                    Err(error) if tmux::is_unavailable(&error) => {
+                        tracing::warn!(
+                            session_key = %self.session_key,
+                            "tmux unavailable; falling back to direct ssh execution"
+                        );
+                        self.start_direct(params).await
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
-            SshTmuxMode::Disabled => self.start_direct(params).await,
+            }
+            SshLaunchMode::Direct => self.start_direct(params).await,
         }
     }
 
@@ -205,6 +251,10 @@ impl SshProcessBackend {
         &self,
         params: ExecParams,
     ) -> Result<StartedExecProcess, ExecServerError> {
+        #[cfg(test)]
+        if let Some(launchers) = &self.test_launchers {
+            return (launchers.direct)(params).await;
+        }
         let (channel, stream) = {
             let mut result = None;
             for attempt in 0..SSH_START_ATTEMPTS {
@@ -313,6 +363,10 @@ impl ExecBackend for SshProcessBackend {
     }
 }
 
+#[cfg(test)]
+#[path = "ssh_process_tests.rs"]
+mod tests;
+
 /// Build the remote command line, honoring cwd and env from [`ExecParams`].
 ///
 /// `argv` is joined with shell quoting and prefixed with a `cd` (best effort)
@@ -400,7 +454,9 @@ enum ChannelCommand {
         ack: oneshot::Sender<Result<(), String>>,
     },
     Signal(Sig),
-    Eof,
+    Terminate {
+        ack: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 struct SshProcess {
@@ -544,10 +600,31 @@ impl ExecProcessImpl for SshProcess {
     }
 
     async fn terminate(&self) -> Result<(), ExecServerError> {
-        // Send EOF to close stdin; the pump task closes the channel when the
-        // remote side finishes. Best effort.
-        let _ = self.cmd_tx.send(ChannelCommand::Eof).await;
-        Ok(())
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ChannelCommand::Terminate { ack: ack_tx })
+            .await
+            .map_err(|_| {
+                ExecServerError::Protocol(
+                    "ssh terminate failed: process command pump is unavailable".to_string(),
+                )
+            })?;
+        tokio::time::timeout(SSH_TERMINATE_ACK_TIMEOUT, ack_rx)
+            .await
+            .map_err(|_| {
+                ExecServerError::Protocol(
+                    "ssh terminate failed: timed out awaiting remote acknowledgement".to_string(),
+                )
+            })?
+            .map_err(|_| {
+                ExecServerError::Protocol(
+                    "ssh terminate failed: process command pump dropped acknowledgement"
+                        .to_string(),
+                )
+            })?
+            .map_err(|message| {
+                ExecServerError::Protocol(format!("ssh terminate failed: {message}"))
+            })
     }
 }
 
@@ -613,6 +690,7 @@ async fn channel_pump(
     mut cmd_rx: mpsc::Receiver<ChannelCommand>,
 ) {
     let mut exit_code: Option<i32> = None;
+    let mut termination_ack: Option<oneshot::Sender<Result<(), String>>> = None;
 
     loop {
         tokio::select! {
@@ -660,8 +738,20 @@ async fn channel_pump(
                     Some(ChannelCommand::Signal(sig)) => {
                         let _ = channel.channel().signal(sig).await;
                     }
-                    Some(ChannelCommand::Eof) => {
-                        let _ = channel.channel().eof().await;
+                    Some(ChannelCommand::Terminate { ack }) => {
+                        if termination_ack.is_some() {
+                            let _ = ack.send(Err("termination is already pending".to_string()));
+                            continue;
+                        }
+                        if let Err(error) = channel.channel().signal(Sig::TERM).await {
+                            let _ = ack.send(Err(error.to_string()));
+                            continue;
+                        }
+                        if let Err(error) = channel.channel().eof().await {
+                            let _ = ack.send(Err(error.to_string()));
+                            continue;
+                        }
+                        termination_ack = Some(ack);
                     }
                     None => {
                         // All process handles dropped; nothing left to drive
@@ -676,6 +766,9 @@ async fn channel_pump(
     // readers observe an `Exited` before `Closed`.
     if exit_code.is_none() {
         publish_exit(&state, &events, &wake_tx, &output_notify, 0);
+    }
+    if let Some(ack) = termination_ack {
+        let _ = ack.send(Ok(()));
     }
     publish_closed(&state, &events, &wake_tx, &output_notify);
 }

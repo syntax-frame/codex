@@ -214,6 +214,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd));
     let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
+        attempt_generation: 7,
         sandbox: SandboxType::None,
         sandbox_requested: true,
         permissions: &permissions,
@@ -258,6 +259,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         ]
     );
     assert_eq!(request.arg0, None);
+    assert_eq!(request.attempt_generation, 7);
     assert_eq!(request.sandbox, SandboxType::None);
     assert_eq!(
         request.exec_server_sandbox,
@@ -282,6 +284,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         .expect("prepare unsandboxed remote exec request");
 
     assert_eq!(request.exec_server_sandbox, None);
+    assert_eq!(request.attempt_generation, 7);
     assert!(!request.exec_server_enforce_managed_network);
     assert_eq!(request.exec_server_managed_network, Some(managed_network));
 }

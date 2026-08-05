@@ -1,5 +1,6 @@
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::os::fd::AsRawFd;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
@@ -20,6 +21,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::ItemStartedEvent;
 
 use super::AGENTAPP_BROWSER_TOOL_NAMES;
+use super::CONTEXT_LOCK_FILE;
 use super::CONTEXT_POINTER_FILE;
 use super::KIND_CONTEXT_COMPACTION_STARTED;
 use super::KIND_ERROR;
@@ -29,8 +31,87 @@ use super::PersistedThreadPointer;
 use super::ServerFileUpload;
 use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
 use super::TurnBridge;
+use super::acquire_context_file_lock;
 use super::active_turn_registry;
 use super::build_turn_runtime;
+use super::combine_turn_lifecycle_results;
+
+#[tokio::test]
+async fn context_file_lock_excludes_other_os_lock_holders_and_releases_on_drop() {
+    let home = tempfile::tempdir().expect("context home");
+    let first = acquire_context_file_lock(home.path())
+        .await
+        .expect("first lock");
+    let second = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.path().join(CONTEXT_LOCK_FILE))
+        .expect("second descriptor");
+
+    assert_ne!(
+        unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    drop(first);
+    assert_eq!(
+        unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    unsafe {
+        libc::flock(second.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+#[tokio::test]
+async fn context_file_lock_spans_turn_termination_and_recorder_shutdown() {
+    let home = tempfile::tempdir().expect("context home");
+    let lifecycle_lock = acquire_context_file_lock(home.path())
+        .await
+        .expect("lifecycle lock");
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.path().join(CONTEXT_LOCK_FILE))
+        .expect("contender descriptor");
+
+    for phase in [
+        "turn execution",
+        "confirmed termination",
+        "recorder shutdown",
+    ] {
+        tokio::task::yield_now().await;
+        assert_ne!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "context lock released during {phase}"
+        );
+    }
+
+    drop(lifecycle_lock);
+    assert_eq!(
+        unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "context lock must release only after lifecycle return"
+    );
+    unsafe {
+        libc::flock(contender.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+#[test]
+fn turn_and_shutdown_failures_are_combined_without_masking() {
+    let error = combine_turn_lifecycle_results(
+        Err("turn failed".to_string()),
+        Err("termination uncertain".to_string()),
+        Err("rollout flush failed".to_string()),
+    )
+    .expect_err("all lifecycle failures must escape");
+
+    assert_eq!(
+        error,
+        "turn failed; additionally: termination uncertain; additionally: rollout flush failed"
+    );
+}
 use super::codex_interrupt_turn;
 use super::codex_ios_tool_discovery_contract_version;
 use super::codex_run_turn_streaming_apikey;

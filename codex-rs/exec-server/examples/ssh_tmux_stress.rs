@@ -56,6 +56,8 @@ impl StressConfig {
 fn exec_params(process_id: &str, cwd: &PathBuf, command: String) -> ExecParams {
     ExecParams {
         process_id: ProcessId::from(process_id),
+        execution_identity: None,
+        network_proxy: None,
         argv: vec!["sh".to_string(), "-lc".to_string(), command],
         cwd: PathUri::from_host_native_path(cwd).expect("cwd URI"),
         env_policy: None,

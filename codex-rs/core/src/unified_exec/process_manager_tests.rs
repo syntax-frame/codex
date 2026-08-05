@@ -67,6 +67,8 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
         HashMap::from([
             ("PATH".to_string(), "/sandbox-path".to_string()),
             ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
+            ("CODEX_EXEC_TURN_ID".to_string(), "turn-1".to_string()),
+            ("CODEX_EXEC_CALL_ID".to_string(), "call-1".to_string()),
             (
                 CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
                 "current-profile".to_string(),
@@ -125,6 +127,8 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
             ("HOME".to_string(), "/client-home".to_string()),
             ("PATH".to_string(), "/sandbox-path".to_string()),
             ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
+            ("CODEX_EXEC_TURN_ID".to_string(), "turn-1".to_string()),
+            ("CODEX_EXEC_CALL_ID".to_string(), "call-1".to_string()),
             (
                 "HTTP_PROXY".to_string(),
                 "http://127.0.0.1:43123".to_string(),
@@ -172,6 +176,7 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         windows_sandbox_filesystem_overrides: None,
         arg0: None,
         exec_server_sandbox: None,
+        attempt_generation: 0,
         exec_server_enforce_managed_network: true,
         exec_server_managed_network: Some(managed_network.clone()),
         exec_server_network_proxy: None,
@@ -190,6 +195,8 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         HashMap::from([
             ("PATH".to_string(), "/sandbox-path".to_string()),
             ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
+            ("CODEX_EXEC_TURN_ID".to_string(), "turn-1".to_string()),
+            ("CODEX_EXEC_CALL_ID".to_string(), "call-1".to_string()),
             (
                 "HTTP_PROXY".to_string(),
                 "http://127.0.0.1:43123".to_string(),
@@ -197,16 +204,30 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
             ("CODEX_NETWORK_PROXY_ACTIVE".to_string(), "1".to_string(),),
         ])
     );
-    request.exec_server_sandbox = Some(
-        codex_exec_server::FileSystemSandboxContext::from_permission_profile(permission_profile),
+    let initial =
+        exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true);
+    request.attempt_generation = 1;
+    let same_mode_retry =
+        exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true);
+    assert_eq!(initial.process_id.as_str(), "123");
+    assert_eq!(same_mode_retry.process_id.as_str(), "123");
+    assert_eq!(
+        initial
+            .execution_identity
+            .as_ref()
+            .expect("initial durable identity")
+            .attempt_generation,
+        0
     );
-    let first =
-        exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true);
-    let second =
-        exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true);
-    assert!(first.process_id.as_str().starts_with("123-"));
-    assert!(second.process_id.as_str().starts_with("123-"));
-    assert_ne!(first.process_id, second.process_id);
+    assert_eq!(
+        same_mode_retry
+            .execution_identity
+            .as_ref()
+            .expect("retry durable identity")
+            .attempt_generation,
+        1
+    );
+    assert_eq!(initial.sandbox, same_mode_retry.sandbox);
 }
 
 #[cfg(windows)]
@@ -548,5 +569,88 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
     assert_eq!(
         (pruned.map(|entry| entry.process_id), store.processes.len()),
         (None, MAX_UNIFIED_EXEC_PROCESSES)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn confirmed_shutdown_propagates_remote_termination_failure() {
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            Some("remote termination rejected".to_string()),
+        )
+        .await,
+    );
+    let manager = UnifiedExecProcessManager::default();
+    manager.process_store.lock().await.processes.insert(
+        7,
+        ProcessEntry {
+            process,
+            call_id: "call-7".to_string(),
+            process_id: 7,
+            cwd: PathUri::parse("file:///tmp").expect("test cwd"),
+            initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+            hook_command: "command-7".to_string(),
+            tty: false,
+            network_approval: None,
+            session: std::sync::Weak::new(),
+            last_used: Instant::now(),
+        },
+    );
+
+    let error = manager
+        .terminate_all_processes_confirmed()
+        .await
+        .expect_err("termination failure must escape shutdown");
+
+    assert!(error.to_string().contains("remote termination rejected"));
+    let store = manager.process_store.lock().await;
+    assert!(
+        store.processes.contains_key(&7),
+        "uncertain remote process must remain registered for repair"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn confirmed_shutdown_removes_entry_only_after_remote_acknowledgement() {
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+        )
+        .await,
+    );
+    let manager = UnifiedExecProcessManager::default();
+    manager.process_store.lock().await.processes.insert(
+        8,
+        ProcessEntry {
+            process,
+            call_id: "call-8".to_string(),
+            process_id: 8,
+            cwd: PathUri::parse("file:///tmp").expect("test cwd"),
+            initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+            hook_command: "command-8".to_string(),
+            tty: false,
+            network_approval: None,
+            session: std::sync::Weak::new(),
+            last_used: Instant::now(),
+        },
+    );
+
+    manager
+        .terminate_all_processes_confirmed()
+        .await
+        .expect("acknowledged termination succeeds");
+
+    assert!(
+        !manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&8),
+        "acknowledged remote process should be removed"
     );
 }
