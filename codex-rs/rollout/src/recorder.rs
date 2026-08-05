@@ -3,8 +3,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Error as IoError;
-use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
@@ -19,6 +20,8 @@ use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -52,6 +55,7 @@ use super::loader;
 use super::metadata;
 use super::ordinal::RolloutOrdinalState;
 use super::ordinal::ordinal_state_for_rollout;
+use super::rollout_lock::RolloutLock;
 use super::session_index::find_thread_names_by_ids;
 use crate::config::RolloutConfigView;
 use crate::state_db;
@@ -1620,7 +1624,7 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
         .append(true)
         .create(true)
         .open(path.as_path())?;
-    if let Err(error) = ensure_rollout_is_newline_terminated(&mut file) {
+    if let Err(error) = repair_rollout_tail(&mut file) {
         if !had_plain_rollout {
             compression::rollback_materialized_rollout(path.as_path());
         }
@@ -1763,13 +1767,32 @@ impl RolloutWriterState {
     }
 
     async fn write_pending_once(&mut self) -> std::io::Result<()> {
+        let rollout_path = self.rollout_path.clone();
+        let _lock = tokio::task::spawn_blocking(move || RolloutLock::acquire(&rollout_path))
+            .await
+            .map_err(IoError::other)??;
+        if self.writer.is_some() && self.meta.is_none() {
+            self.writer = None;
+        }
         self.ensure_writer_open().await?;
+        if self.meta.is_none()
+            && matches!(self.ordinal_state, RolloutOrdinalState::Paginated { .. })
+        {
+            let rollout_path = self.rollout_path.clone();
+            self.ordinal_state = tokio::task::spawn_blocking(move || {
+                let mut file = File::options().read(true).open(rollout_path.as_path())?;
+                ordinal_state_for_rollout(&mut file, rollout_path.as_path())
+            })
+            .await
+            .map_err(IoError::other)??;
+        }
         self.write_session_meta_if_needed().await?;
 
         self.write_pending_items_once().await?;
 
         if let Some(writer) = self.writer.as_mut() {
             writer.file.flush().await?;
+            writer.file.sync_data().await?;
         }
         Ok(())
     }
@@ -1876,13 +1899,122 @@ pub async fn append_rollout_item_to_path(
     rollout_path: &Path,
     item: &RolloutItem,
 ) -> std::io::Result<()> {
-    let (_rollout_path, file, ordinal_state) = open_rollout_for_append(rollout_path).await?;
+    let lock_path = rollout_path.to_path_buf();
+    let _lock = tokio::task::spawn_blocking(move || RolloutLock::acquire(&lock_path))
+        .await
+        .map_err(IoError::other)??;
+    let (_rollout_path, file, ordinal_state) = open_rollout_for_append_locked(rollout_path).await?;
     let ordinal = ordinal_state.current()?;
     let mut writer = JsonlWriter { file };
-    writer.write_rollout_item(item, ordinal).await
+    writer.write_rollout_item(item, ordinal).await?;
+    writer.file.flush().await?;
+    writer.file.sync_data().await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendFunctionOutputOutcome {
+    Appended,
+    AlreadyPresent,
+}
+
+/// Durably appends a recovered function output exactly once by semantic call id.
+///
+/// The transaction repairs a crash-torn final JSONL record before scanning.
+/// An equivalent existing output is an idempotent success, while a different
+/// output for the same call id fails closed without modifying that record.
+pub async fn append_function_output_if_missing(
+    rollout_path: &Path,
+    call_id: &str,
+    output: &FunctionCallOutputPayload,
+) -> std::io::Result<AppendFunctionOutputOutcome> {
+    let lock_path = rollout_path.to_path_buf();
+    let _lock = tokio::task::spawn_blocking(move || RolloutLock::acquire(&lock_path))
+        .await
+        .map_err(IoError::other)??;
+    let (_rollout_path, file, ordinal_state) = open_rollout_for_append_locked(rollout_path).await?;
+    let scan_file = file.try_clone().await?.into_std().await;
+    let call_id_owned = call_id.to_string();
+    let expected_output = output.clone();
+    let scan = tokio::task::spawn_blocking(move || {
+        scan_function_output(&scan_file, &call_id_owned, &expected_output)
+    })
+    .await
+    .map_err(IoError::other)??;
+    if scan == FunctionOutputScan::ExactMatch {
+        return Ok(AppendFunctionOutputOutcome::AlreadyPresent);
+    }
+
+    let item = RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: output.clone(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let mut writer = JsonlWriter { file };
+    writer
+        .write_rollout_item(&item, ordinal_state.current()?)
+        .await?;
+    writer.file.flush().await?;
+    writer.file.sync_data().await?;
+    Ok(AppendFunctionOutputOutcome::Appended)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionOutputScan {
+    ExactMatch,
+    Missing,
+}
+
+fn scan_function_output(
+    file: &File,
+    call_id: &str,
+    expected_output: &FunctionCallOutputPayload,
+) -> std::io::Result<FunctionOutputScan> {
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(0))?;
+    let mut line = String::new();
+    let mut found_exact_match = false;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(if found_exact_match {
+                FunctionOutputScan::ExactMatch
+            } else {
+                FunctionOutputScan::Missing
+            });
+        }
+        let rollout_line = serde_json::from_str::<RolloutLine>(&line)
+            .map_err(|error| IoError::new(std::io::ErrorKind::InvalidData, error))?;
+        if let RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            call_id: existing_call_id,
+            output,
+            ..
+        }) = rollout_line.item
+            && existing_call_id == call_id
+        {
+            if output == *expected_output {
+                found_exact_match = true;
+                continue;
+            }
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!("conflicting function output already exists for call id {call_id}"),
+            ));
+        }
+    }
 }
 
 async fn open_rollout_for_append(
+    path: &Path,
+) -> std::io::Result<(PathBuf, tokio::fs::File, RolloutOrdinalState)> {
+    let lock_path = path.to_path_buf();
+    let _lock = tokio::task::spawn_blocking(move || RolloutLock::acquire(&lock_path))
+        .await
+        .map_err(IoError::other)??;
+    open_rollout_for_append_locked(path).await
+}
+
+async fn open_rollout_for_append_locked(
     path: &Path,
 ) -> std::io::Result<(PathBuf, tokio::fs::File, RolloutOrdinalState)> {
     let had_plain_rollout = compression::plain_rollout_path(path).exists();
@@ -1893,8 +2025,8 @@ async fn open_rollout_for_append(
             .read(true)
             .append(true)
             .open(path_for_open.as_path())?;
+        repair_rollout_tail(&mut file)?;
         let ordinal_state = ordinal_state_for_rollout(&mut file, path_for_open.as_path())?;
-        ensure_rollout_is_newline_terminated(&mut file)?;
         Ok::<_, std::io::Error>((file, ordinal_state))
     })
     .await
@@ -1917,19 +2049,36 @@ async fn open_rollout_for_append(
     Ok((path, tokio::fs::File::from_std(file), ordinal_state))
 }
 
-fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()> {
+fn repair_rollout_tail(file: &mut File) -> std::io::Result<()> {
     if file.metadata()?.len() == 0 {
         return Ok(());
     }
 
-    file.seek(SeekFrom::End(-1))?;
-    let mut final_byte = [0];
-    file.read_exact(&mut final_byte)?;
-    if final_byte[0] != b'\n' {
-        file.write_all(b"\n")?;
+    let mut reader = BufReader::new(file.try_clone()?);
+    reader.seek(SeekFrom::Start(0))?;
+    let mut offset = 0u64;
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        let record_start = offset;
+        let bytes_read = reader.read_until(b'\n', &mut record)?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+        offset = offset.saturating_add(bytes_read as u64);
+        if record.ends_with(b"\n") {
+            continue;
+        }
+        if serde_json::from_slice::<Value>(&record).is_ok() {
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+        } else {
+            file.set_len(record_start)?;
+        }
         file.flush()?;
+        file.sync_data()?;
+        return Ok(());
     }
-    Ok(())
 }
 
 struct JsonlWriter {
