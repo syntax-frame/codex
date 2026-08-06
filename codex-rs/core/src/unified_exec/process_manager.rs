@@ -396,6 +396,32 @@ fn terminate_process_on_network_denial(
 }
 
 impl UnifiedExecProcessManager {
+    #[cfg(test)]
+    pub(crate) async fn insert_process_for_session_teardown_test(
+        &self,
+        process_id: i32,
+        process: Arc<UnifiedExecProcess>,
+        session: &Arc<crate::session::session::Session>,
+    ) {
+        self.process_store.lock().await.processes.insert(
+            process_id,
+            ProcessEntry {
+                process,
+                call_id: format!("call-{process_id}"),
+                process_id,
+                cwd: PathUri::parse("file:///tmp").expect("valid test cwd"),
+                initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+                hook_command: "sleep 30".to_string(),
+                tty: true,
+                network_approval: None,
+                session: Arc::downgrade(session),
+                last_used: Instant::now(),
+                pending_receipt: None,
+                receipt_frozen: false,
+            },
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn adopt_background_process(
         &self,
@@ -425,7 +451,13 @@ impl UnifiedExecProcessManager {
             .adopt_execution(request)
             .await
             .map_err(|error| UnifiedExecError::create_process(error.to_string()))?;
-        let process = Arc::new(UnifiedExecProcess::from_exec_server_started(started).await?);
+        let process = Arc::new(
+            UnifiedExecProcess::from_exec_server_started(
+                started,
+                environment.supports_durable_remote_exec_recovery(),
+            )
+            .await?,
+        );
         let entry = ProcessEntry {
             process,
             call_id: original_call_id,
@@ -485,7 +517,13 @@ impl UnifiedExecProcessManager {
             .adopt_execution(request)
             .await
             .map_err(|error| UnifiedExecError::create_process(error.to_string()))?;
-        let process = Arc::new(UnifiedExecProcess::from_exec_server_started(started).await?);
+        let process = Arc::new(
+            UnifiedExecProcess::from_exec_server_started(
+                started,
+                environment.supports_durable_remote_exec_recovery(),
+            )
+            .await?,
+        );
         let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
         start_streaming_output(&process, context, Arc::clone(&transcript));
         self.store_process(
@@ -1381,7 +1419,11 @@ impl UnifiedExecProcessManager {
                 .await
                 .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
             spawn_lifecycle.after_spawn();
-            return UnifiedExecProcess::from_exec_server_started(started).await;
+            return UnifiedExecProcess::from_exec_server_started(
+                started,
+                environment.supports_durable_remote_exec_recovery(),
+            )
+            .await;
         }
 
         // TODO(anp): Keep PathUri through the local PTY/process launch boundary.
@@ -1756,6 +1798,27 @@ impl UnifiedExecProcessManager {
         } else {
             Err(uncertain)
         }
+    }
+
+    /// Releases local ownership of restart-recoverable executions without
+    /// signalling their remote process groups. Other processes retain normal
+    /// kill-on-drop behavior because they cannot be safely reattached.
+    pub(crate) async fn detach_durable_processes(&self) {
+        let detached = {
+            let mut store = self.process_store.lock().await;
+            let process_ids = store
+                .processes
+                .iter()
+                .filter_map(|(process_id, entry)| {
+                    entry.process.detaches_on_drop().then_some(*process_id)
+                })
+                .collect::<Vec<_>>();
+            process_ids
+                .into_iter()
+                .filter_map(|process_id| store.remove(process_id))
+                .collect::<Vec<_>>()
+        };
+        drop(detached);
     }
 
     pub(crate) async fn list_processes(&self) -> Vec<BackgroundTerminalInfo> {

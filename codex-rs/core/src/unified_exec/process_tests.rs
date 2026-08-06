@@ -13,7 +13,10 @@ use codex_exec_server::WriteStatus;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::watch;
 
 struct MockExecProcess {
@@ -21,6 +24,9 @@ struct MockExecProcess {
     write_response: WriteResponse,
     read_responses: Mutex<VecDeque<ReadResponse>>,
     terminate_error: Option<String>,
+    terminate_count: Arc<AtomicUsize>,
+    terminate_started: Option<Arc<Notify>>,
+    allow_terminate: Option<Arc<Notify>>,
     wake_tx: watch::Sender<u64>,
 }
 
@@ -43,6 +49,13 @@ impl MockExecProcess {
     }
 
     async fn terminate(&self) -> Result<(), ExecServerError> {
+        self.terminate_count.fetch_add(1, Ordering::SeqCst);
+        if let Some(terminate_started) = &self.terminate_started {
+            terminate_started.notify_one();
+        }
+        if let Some(allow_terminate) = &self.allow_terminate {
+            allow_terminate.notified().await;
+        }
         if let Some(message) = &self.terminate_error {
             return Err(ExecServerError::Protocol(message.clone()));
         }
@@ -89,7 +102,18 @@ pub(super) async fn remote_process(
     write_status: WriteStatus,
     terminate_error: Option<String>,
 ) -> UnifiedExecProcess {
+    remote_process_with_drop_policy(write_status, terminate_error, false)
+        .await
+        .0
+}
+
+pub(crate) async fn remote_process_with_drop_policy(
+    write_status: WriteStatus,
+    terminate_error: Option<String>,
+    detach_on_drop: bool,
+) -> (UnifiedExecProcess, Arc<AtomicUsize>) {
     let (wake_tx, _wake_rx) = watch::channel(0);
+    let terminate_count = Arc::new(AtomicUsize::new(0));
     let started = StartedExecProcess {
         process: Arc::new(MockExecProcess {
             process_id: "test-process".to_string().into(),
@@ -98,13 +122,88 @@ pub(super) async fn remote_process(
             },
             read_responses: Mutex::new(VecDeque::new()),
             terminate_error,
+            terminate_count: Arc::clone(&terminate_count),
+            terminate_started: None,
+            allow_terminate: None,
             wake_tx,
         }),
     };
 
-    UnifiedExecProcess::from_exec_server_started(started)
+    (
+        UnifiedExecProcess::from_exec_server_started(started, detach_on_drop)
+            .await
+            .expect("remote process should start"),
+        terminate_count,
+    )
+}
+
+#[tokio::test]
+async fn durable_remote_process_detaches_without_termination_on_drop() {
+    let (process, terminate_count) =
+        remote_process_with_drop_policy(WriteStatus::Accepted, None, true).await;
+
+    drop(process);
+    tokio::task::yield_now().await;
+
+    assert_eq!(terminate_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn explicit_termination_still_terminates_durable_remote_process() {
+    let (process, terminate_count) =
+        remote_process_with_drop_policy(WriteStatus::Accepted, None, true).await;
+
+    process
+        .terminate_confirmed()
         .await
-        .expect("remote process should start")
+        .expect("explicit termination");
+
+    assert_eq!(terminate_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrent_confirmed_termination_shares_the_same_failure() {
+    let (wake_tx, _wake_rx) = watch::channel(0);
+    let terminate_count = Arc::new(AtomicUsize::new(0));
+    let terminate_started = Arc::new(Notify::new());
+    let allow_terminate = Arc::new(Notify::new());
+    let process = Arc::new(
+        UnifiedExecProcess::from_exec_server_started(
+            StartedExecProcess {
+                process: Arc::new(MockExecProcess {
+                    process_id: "concurrent-terminate".to_string().into(),
+                    write_response: WriteResponse {
+                        status: WriteStatus::Accepted,
+                    },
+                    read_responses: Mutex::new(VecDeque::new()),
+                    terminate_error: Some("terminate unavailable".to_string()),
+                    terminate_count: Arc::clone(&terminate_count),
+                    terminate_started: Some(Arc::clone(&terminate_started)),
+                    allow_terminate: Some(Arc::clone(&allow_terminate)),
+                    wake_tx,
+                }),
+            },
+            false,
+        )
+        .await
+        .expect("remote process should start"),
+    );
+
+    let first_process = Arc::clone(&process);
+    let first = tokio::spawn(async move { first_process.terminate_confirmed().await });
+    terminate_started.notified().await;
+    let second_process = Arc::clone(&process);
+    let second = tokio::spawn(async move { second_process.terminate_confirmed().await });
+    tokio::task::yield_now().await;
+    allow_terminate.notify_one();
+
+    let first_error = first.await.expect("first task").expect_err("first failure");
+    let second_error = second
+        .await
+        .expect("second task")
+        .expect_err("second failure");
+    assert_eq!(first_error.to_string(), second_error.to_string());
+    assert_eq!(terminate_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

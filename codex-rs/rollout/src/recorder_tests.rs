@@ -5,6 +5,7 @@ use crate::config::RolloutConfig;
 use chrono::TimeZone;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
@@ -26,6 +27,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -1771,5 +1773,266 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
         )
         .await
     );
+    Ok(())
+}
+
+fn function_output(output: &str) -> FunctionCallOutputPayload {
+    FunctionCallOutputPayload::from_text(output.to_string())
+}
+
+#[tokio::test]
+async fn recovered_output_truncates_partial_final_record_before_append() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&path, ThreadId::new(), &[])?;
+    let valid_prefix = fs::read(&path)?;
+    let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+    file.write_all(br#"{"timestamp":"torn","type":"response_item""#)?;
+
+    assert_eq!(
+        append_function_output_if_missing(&path, "call-1", &function_output("done")).await?,
+        AppendFunctionOutputOutcome::Appended
+    );
+
+    let bytes = fs::read(&path)?;
+    assert!(bytes.starts_with(&valid_prefix));
+    let lines = read_rollout_lines(&path)?;
+    assert_eq!(lines.len(), 2);
+    assert!(matches!(
+        &lines[1].item,
+        RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, output, .. })
+            if call_id == "call-1" && output == &function_output("done")
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovered_output_preserves_valid_final_record_without_newline() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&path, ThreadId::new(), &[])?;
+    let mut original = fs::read(&path)?;
+    assert_eq!(original.pop(), Some(b'\n'));
+    fs::write(&path, &original)?;
+
+    append_function_output_if_missing(&path, "call-1", &function_output("done")).await?;
+
+    let bytes = fs::read(&path)?;
+    assert!(bytes.starts_with(&original));
+    assert_eq!(bytes[original.len()], b'\n');
+    assert_eq!(read_rollout_lines(&path)?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovered_output_exact_retry_is_idempotent() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&path, ThreadId::new(), &[])?;
+    let output = function_output("done");
+    assert_eq!(
+        append_function_output_if_missing(&path, "call-1", &output).await?,
+        AppendFunctionOutputOutcome::Appended
+    );
+    let after_first = fs::read(&path)?;
+
+    assert_eq!(
+        append_function_output_if_missing(&path, "call-1", &output).await?,
+        AppendFunctionOutputOutcome::AlreadyPresent
+    );
+    assert_eq!(fs::read(&path)?, after_first);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovered_output_conflict_fails_closed() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&path, ThreadId::new(), &[])?;
+    append_function_output_if_missing(&path, "call-1", &function_output("first")).await?;
+    let before_conflict = fs::read(&path)?;
+
+    let error = append_function_output_if_missing(&path, "call-1", &function_output("second"))
+        .await
+        .expect_err("conflicting output must fail");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(fs::read(&path)?, before_conflict);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_recovered_output_writers_append_once() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&path, ThreadId::new(), &[])?;
+    let barrier = Arc::new(Barrier::new(2));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let path = path.clone();
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || barrier.wait())
+                .await
+                .expect("barrier task");
+            append_function_output_if_missing(&path, "call-1", &function_output("done")).await
+        }));
+    }
+
+    let mut outcomes = Vec::new();
+    for task in tasks {
+        outcomes.push(task.await.expect("append task")?);
+    }
+    outcomes.sort_by_key(|outcome| match outcome {
+        AppendFunctionOutputOutcome::Appended => 0,
+        AppendFunctionOutputOutcome::AlreadyPresent => 1,
+    });
+    assert_eq!(
+        outcomes,
+        vec![
+            AppendFunctionOutputOutcome::Appended,
+            AppendFunctionOutputOutcome::AlreadyPresent,
+        ]
+    );
+    assert_eq!(read_rollout_lines(&path)?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plain_and_compressed_aliases_share_recovery_transaction() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&path, ThreadId::new(), &[])?;
+    let compressed_path = compress_rollout(&path)?;
+    let barrier = Arc::new(Barrier::new(2));
+    let mut tasks = Vec::new();
+    for path in [path.clone(), compressed_path] {
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || barrier.wait())
+                .await
+                .expect("barrier task");
+            append_function_output_if_missing(&path, "call-1", &function_output("done")).await
+        }));
+    }
+
+    let mut outcomes = Vec::new();
+    for task in tasks {
+        outcomes.push(task.await.expect("append task")?);
+    }
+    outcomes.sort_by_key(|outcome| match outcome {
+        AppendFunctionOutputOutcome::Appended => 0,
+        AppendFunctionOutputOutcome::AlreadyPresent => 1,
+    });
+    assert_eq!(
+        outcomes,
+        vec![
+            AppendFunctionOutputOutcome::Appended,
+            AppendFunctionOutputOutcome::AlreadyPresent,
+        ]
+    );
+    assert_eq!(read_rollout_lines(&path)?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovered_output_detects_conflict_after_exact_duplicate() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&path, ThreadId::new(), &[])?;
+    append_function_output_if_missing(&path, "call-1", &function_output("expected")).await?;
+    append_rollout_item_to_path(
+        &path,
+        &RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-1".to_string(),
+            output: function_output("conflict"),
+            internal_chat_message_metadata_passthrough: None,
+        }),
+    )
+    .await?;
+    let before = fs::read(&path)?;
+
+    let error = append_function_output_if_missing(&path, "call-1", &function_output("expected"))
+        .await
+        .expect_err("later conflicting duplicate must fail");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(fs::read(&path)?, before);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_writer_and_direct_append_share_ordinal_transaction() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&path, ThreadId::new(), &[])?;
+    let recorder = RolloutRecorder::new(
+        &test_config(home.path()),
+        RolloutRecorderParams::resume(path.clone()),
+    )
+    .await?;
+    recorder
+        .record_canonical_items(&[agent_message_item("live")])
+        .await?;
+
+    let barrier = Arc::new(Barrier::new(2));
+    let flush_recorder = recorder.clone();
+    let flush_barrier = Arc::clone(&barrier);
+    let flush = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || flush_barrier.wait())
+            .await
+            .expect("flush barrier task");
+        flush_recorder.flush().await
+    });
+    let direct_path = path.clone();
+    let direct_barrier = Arc::clone(&barrier);
+    let direct = tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || direct_barrier.wait())
+            .await
+            .expect("direct barrier task");
+        append_rollout_item_to_path(&direct_path, &agent_message_item("direct")).await
+    });
+    flush.await.expect("flush task")?;
+    direct.await.expect("direct append task")?;
+
+    let lines = read_rollout_lines(&path)?;
+    assert_eq!(
+        lines.iter().map(|line| line.ordinal).collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)]
+    );
+    recorder.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_writer_reopens_after_rollout_is_compressed_between_batches() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    write_paginated_rollout(&path, ThreadId::new(), &[])?;
+    let recorder = RolloutRecorder::new(
+        &test_config(home.path()),
+        RolloutRecorderParams::resume(path.clone()),
+    )
+    .await?;
+    recorder
+        .record_canonical_items(&[agent_message_item("before-compression")])
+        .await?;
+    recorder.flush().await?;
+
+    let compressed_path = compress_rollout(&path)?;
+    assert!(compressed_path.exists());
+    recorder
+        .record_canonical_items(&[agent_message_item("after-compression")])
+        .await?;
+    recorder.flush().await?;
+
+    assert!(!compressed_path.exists());
+    let lines = read_rollout_lines(&path)?;
+    assert_eq!(
+        lines.iter().map(|line| line.ordinal).collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)]
+    );
+    recorder.shutdown().await?;
     Ok(())
 }

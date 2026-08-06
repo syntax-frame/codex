@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::OnceCell;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::watch;
@@ -87,6 +88,8 @@ enum ProcessHandle {
 /// processes.
 pub(crate) struct UnifiedExecProcess {
     process_handle: ProcessHandle,
+    detach_on_drop: bool,
+    termination_result: Arc<OnceCell<Result<(), String>>>,
     output_tx: broadcast::Sender<Vec<u8>>,
     output_buffer: OutputBuffer,
     output_notify: Arc<Notify>,
@@ -115,6 +118,7 @@ impl std::fmt::Debug for UnifiedExecProcess {
 impl UnifiedExecProcess {
     fn new(
         process_handle: ProcessHandle,
+        detach_on_drop: bool,
         sandbox_type: SandboxType,
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
     ) -> Self {
@@ -129,6 +133,8 @@ impl UnifiedExecProcess {
 
         Self {
             process_handle,
+            detach_on_drop,
+            termination_result: Arc::new(OnceCell::new()),
             output_tx,
             output_buffer,
             output_notify,
@@ -188,6 +194,10 @@ impl UnifiedExecProcess {
         self.cancellation_token.clone()
     }
 
+    pub(super) fn detaches_on_drop(&self) -> bool {
+        self.detach_on_drop
+    }
+
     pub(super) fn output_drained_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.output_drained)
     }
@@ -226,8 +236,16 @@ impl UnifiedExecProcess {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
                 let process_handle = Arc::clone(process_handle);
+                let termination_result = Arc::clone(&self.termination_result);
                 tokio::spawn(async move {
-                    let _ = process_handle.terminate().await;
+                    termination_result
+                        .get_or_init(|| async {
+                            process_handle
+                                .terminate()
+                                .await
+                                .map_err(|error| error.to_string())
+                        })
+                        .await;
                 });
             }
         }
@@ -238,10 +256,18 @@ impl UnifiedExecProcess {
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
-                process_handle
-                    .terminate()
-                    .await
-                    .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
+                let result = self
+                    .termination_result
+                    .get_or_init(|| async {
+                        process_handle
+                            .terminate()
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                    .await;
+                if let Err(error) = result {
+                    return Err(UnifiedExecError::process_failed(error.clone()));
+                }
             }
         }
         self.signal_exit(self.exit_code());
@@ -344,6 +370,7 @@ impl UnifiedExecProcess {
         let output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
         let mut managed = Self::new(
             ProcessHandle::Local(Box::new(process_handle)),
+            false,
             sandbox_type,
             Some(spawn_lifecycle),
         );
@@ -392,10 +419,12 @@ impl UnifiedExecProcess {
 
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
+        detach_on_drop: bool,
     ) -> Result<Self, UnifiedExecError> {
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
         let mut managed = Self::new(
             process_handle,
+            detach_on_drop,
             SandboxType::None,
             /*spawn_lifecycle*/ None,
         );
@@ -667,6 +696,10 @@ impl UnifiedExecProcess {
 
 impl Drop for UnifiedExecProcess {
     fn drop(&mut self) {
-        self.terminate();
+        if self.detach_on_drop {
+            self.finish_termination();
+        } else {
+            self.terminate();
+        }
     }
 }

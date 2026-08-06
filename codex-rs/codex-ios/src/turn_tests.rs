@@ -1,5 +1,6 @@
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::os::fd::AsRawFd;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
@@ -20,6 +21,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::ItemStartedEvent;
 
 use super::AGENTAPP_BROWSER_TOOL_NAMES;
+use super::CONTEXT_LOCK_FILE;
 use super::CONTEXT_POINTER_FILE;
 use super::KIND_CONTEXT_COMPACTION_STARTED;
 use super::KIND_ERROR;
@@ -29,6 +31,7 @@ use super::PersistedThreadPointer;
 use super::ServerFileUpload;
 use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
 use super::TurnBridge;
+use super::acquire_context_file_lock;
 use super::active_turn_registry;
 use super::build_turn_runtime;
 use super::codex_interrupt_turn;
@@ -49,6 +52,32 @@ use super::startup_interrupt_requested;
 use super::tool_discovery_event_json;
 use super::validate_relative_rollout_path;
 use super::write_thread_pointer;
+
+#[tokio::test]
+async fn context_file_lock_excludes_other_os_lock_holders_and_releases_on_drop() {
+    let home = tempfile::tempdir().expect("context home");
+    let first = acquire_context_file_lock(home.path())
+        .await
+        .expect("first lock");
+    let second = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.path().join(CONTEXT_LOCK_FILE))
+        .expect("second descriptor");
+
+    assert_ne!(
+        unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    drop(first);
+    assert_eq!(
+        unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    unsafe {
+        libc::flock(second.as_raw_fd(), libc::LOCK_UN);
+    }
+}
 
 extern "C" fn capture_event(ctx: *mut c_void, kind: c_int, text: *const c_char) {
     // SAFETY: tests pass a live Vec pointer as `ctx`, and the synchronous bridge

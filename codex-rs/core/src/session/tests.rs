@@ -7874,6 +7874,126 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
     );
 }
 
+async fn session_with_durable_process_and_reconciliation_record() -> (
+    Arc<Session>,
+    TurnContext,
+    Arc<dyn codex_thread_store::ThreadStore>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let store: Arc<dyn codex_thread_store::ThreadStore> =
+        Arc::new(codex_thread_store::InMemoryThreadStore::default());
+    let config = session.get_config().await;
+    let live_thread = LiveThread::create(
+        Arc::clone(&store),
+        CreateThreadParams {
+            session_id: session.session_id(),
+            thread_id: session.thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: Default::default(),
+            subagent_history_start_ordinal: None,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(config.cwd.to_path_buf()),
+                model_provider: config.model_provider_id.clone(),
+                memory_mode: ThreadMemoryMode::Disabled,
+            },
+        },
+    )
+    .await
+    .expect("create thread persistence");
+    let mut prepared = background_prepared(41, "exec-41", 7);
+    if let RolloutItem::RemoteExecutionSessionPrepared(prepared) = &mut prepared {
+        prepared.thread_id = session.thread_id.to_string();
+    }
+    let output = background_output("exec-41");
+    let committed = missing_background_session_commits(&[prepared.clone(), output.clone()])
+        .expect("valid reconciliation metadata")
+        .pop()
+        .expect("one committed record");
+    live_thread
+        .append_items(&[
+            prepared,
+            output,
+            RolloutItem::RemoteExecutionSessionCommitted(committed),
+        ])
+        .await
+        .expect("queue reconciliation metadata");
+    session.services.thread_store = Arc::clone(&store);
+    session.services.live_thread = Some(live_thread);
+    let session = Arc::new(session);
+    let (process, terminate_count) =
+        crate::unified_exec::process_tests::remote_process_with_drop_policy(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+            true,
+        )
+        .await;
+    session
+        .services
+        .unified_exec_manager
+        .insert_process_for_session_teardown_test(41, Arc::new(process), &session)
+        .await;
+    (session, turn_context, store, terminate_count)
+}
+
+#[tokio::test]
+async fn channel_close_detaches_durable_process_and_preserves_reopenable_metadata() {
+    let (session, turn_context, store, terminate_count) =
+        session_with_durable_process_and_reconciliation_record().await;
+    let thread_id = session.thread_id;
+    let (tx_sub, rx_sub) = async_channel::bounded(1);
+    drop(tx_sub);
+
+    submission_loop(session, Arc::clone(&turn_context.config), rx_sub)
+        .await
+        .expect("channel-close teardown should succeed");
+
+    assert_eq!(terminate_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let history = store
+        .load_history(codex_thread_store::LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        })
+        .await
+        .expect("reopen persisted history");
+    assert!(
+        latest_committed_background_session(&history.items, &thread_id.to_string(), 41).is_ok()
+    );
+}
+
+#[tokio::test]
+async fn explicit_shutdown_terminates_durable_process_and_preserves_reconciliation_metadata() {
+    let (session, _turn_context, store, terminate_count) =
+        session_with_durable_process_and_reconciliation_record().await;
+    let thread_id = session.thread_id;
+
+    handlers::shutdown(&session, "shutdown".to_string())
+        .await
+        .expect("explicit shutdown should succeed");
+
+    assert_eq!(terminate_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let history = store
+        .load_history(codex_thread_store::LoadThreadHistoryParams {
+            thread_id,
+            include_archived: true,
+        })
+        .await
+        .expect("reopen persisted history");
+    assert!(
+        latest_committed_background_session(&history.items, &thread_id.to_string(), 41).is_ok()
+    );
+}
+
 #[tokio::test]
 async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lifecycle() {
     struct LifecycleRecorder {

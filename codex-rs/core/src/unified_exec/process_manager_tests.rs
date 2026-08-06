@@ -679,6 +679,63 @@ async fn shutdown_retains_process_when_remote_termination_is_unconfirmed() {
 }
 
 #[tokio::test]
+async fn runtime_loss_detaches_durable_process_and_terminates_non_durable_process() {
+    let manager = UnifiedExecProcessManager::default();
+    let (durable, durable_terminate_count) =
+        crate::unified_exec::process_tests::remote_process_with_drop_policy(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+            true,
+        )
+        .await;
+    let (non_durable, non_durable_terminate_count) =
+        crate::unified_exec::process_tests::remote_process_with_drop_policy(
+            codex_exec_server::WriteStatus::Accepted,
+            None,
+            false,
+        )
+        .await;
+    let cwd = PathUri::parse("file:///tmp").expect("test cwd should be valid");
+    let mut store = manager.process_store.lock().await;
+    for (process_id, process) in [(31, durable), (32, non_durable)] {
+        store.processes.insert(
+            process_id,
+            ProcessEntry {
+                process: Arc::new(process),
+                call_id: format!("call-{process_id}"),
+                process_id,
+                cwd: cwd.clone(),
+                initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+                hook_command: "sleep 30".to_string(),
+                tty: false,
+                network_approval: None,
+                session: std::sync::Weak::new(),
+                last_used: Instant::now(),
+                pending_receipt: None,
+                receipt_frozen: false,
+            },
+        );
+    }
+    drop(store);
+
+    manager.detach_durable_processes().await;
+    manager
+        .terminate_all_processes()
+        .await
+        .expect("remaining non-durable process terminates");
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        (
+            durable_terminate_count.load(Ordering::SeqCst),
+            non_durable_terminate_count.load(Ordering::SeqCst),
+            manager.process_store.lock().await.processes.len(),
+        ),
+        (0, 1, 0)
+    );
+}
+
+#[tokio::test]
 async fn no_live_rollout_freezes_pending_receipt_but_allows_identity_free_output() {
     let manager = UnifiedExecProcessManager::default();
     let process = Arc::new(

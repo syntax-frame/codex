@@ -215,6 +215,24 @@ impl CodexThread {
         self.io.shutdown_and_wait().await
     }
 
+    /// Flushes durable recovery state and releases restart-safe remote
+    /// executions without signalling them. The ordinary session-loop teardown
+    /// will still terminate local and non-recoverable processes.
+    pub async fn prepare_for_host_detach(&self) -> CodexResult<()> {
+        if let Some(live_thread) = self.session.live_thread() {
+            live_thread
+                .flush()
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        }
+        self.session
+            .services
+            .unified_exec_manager
+            .detach_durable_processes()
+            .await;
+        Ok(())
+    }
+
     /// Wait until the underlying session loop has terminated.
     pub async fn wait_until_terminated(&self) {
         let _ = self.io.session_loop_termination.clone().await;

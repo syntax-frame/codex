@@ -3,6 +3,9 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// Cross-process advisory lock for every mutation of one logical rollout.
+///
+/// Plain and compressed representations derive the same stable sidecar path.
 pub(crate) struct RolloutLock {
     _file: File,
 }
@@ -18,6 +21,7 @@ impl RolloutLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(lock_path)?;
         file.lock()?;
         Ok(Self { _file: file })

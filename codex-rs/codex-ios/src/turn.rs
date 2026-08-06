@@ -15,6 +15,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::os::fd::AsRawFd;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
@@ -27,6 +30,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use codex_core::CodexThread;
 use codex_core::config::Config;
@@ -69,6 +73,20 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use tokio::time::timeout;
+
+const CONTEXT_LOCK_FILE: &str = ".agentapp-context.lock";
+const CONTEXT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTEXT_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+struct ContextFileLock(File);
+
+impl Drop for ContextFileLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
 
 /// Steers the model toward the on-device tools. This build runs on a phone with
 /// no shell and no patch environment, so `apply_patch` and any shell/exec tool
@@ -363,6 +381,38 @@ fn context_turn_lock(codex_home: &Path) -> Result<Arc<tokio::sync::Mutex<()>>, S
             .entry(codex_home.to_path_buf())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
     ))
+}
+
+async fn acquire_context_file_lock(codex_home: &Path) -> Result<ContextFileLock, String> {
+    let lock_path = codex_home.join(CONTEXT_LOCK_FILE);
+    tokio::task::spawn_blocking(move || {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("failed to open model-context lock: {error}"))?;
+        let deadline = Instant::now() + CONTEXT_LOCK_TIMEOUT;
+        loop {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(ContextFileLock(file));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(format!("failed to acquire model-context lock: {error}"));
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out acquiring model-context lock at {}",
+                    lock_path.display()
+                ));
+            }
+            std::thread::sleep(CONTEXT_LOCK_RETRY_DELAY);
+        }
+    })
+    .await
+    .map_err(|error| format!("model-context lock task failed: {error}"))?
 }
 
 fn validate_relative_rollout_path(path: &Path) -> Result<(), String> {
@@ -964,6 +1014,7 @@ pub(crate) async fn run_turn_async(
         .map_err(|error| format!("failed to create model-context home: {error}"))?;
     let turn_lock = context_turn_lock(&codex_home)?;
     let _turn_guard = turn_lock.lock().await;
+    let _context_file_lock = acquire_context_file_lock(&codex_home).await?;
 
     // Build auth and provider independently from the persistent context home.
     // Credentials remain in memory and are never written beside the rollout.
@@ -1174,6 +1225,7 @@ pub(crate) async fn run_turn_async(
     emit_debug_stage(callback, ctx, "thread_ready");
     let thread = new_thread.thread;
     let session_model = new_thread.session_configured.model.clone();
+    let turn_result: Result<(), String> = async {
 
     // `history_json` is retained for legacy bridge callers that still need to
     // bootstrap a genuinely new context. AgentApp passes it empty: resumed
@@ -1613,6 +1665,17 @@ pub(crate) async fn run_turn_async(
             }
             _ => {}
         }
+    }
+    }
+    .await;
+    let detach_result = thread
+        .prepare_for_host_detach()
+        .await
+        .map_err(|error| format!("failed to flush model context before host detach: {error}"));
+    match (turn_result, detach_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(detach_error)) => Err(format!("{error}; additionally: {detach_error}")),
     }
 }
 

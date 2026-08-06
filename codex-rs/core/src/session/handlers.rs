@@ -610,12 +610,30 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
-async fn shutdown_session_runtime(sess: &Arc<Session>) -> Result<(), String> {
+#[derive(Clone, Copy)]
+enum ProcessShutdownDisposition {
+    TerminateAll,
+    DetachDurable,
+}
+
+async fn shutdown_session_runtime(
+    sess: &Arc<Session>,
+    process_disposition: ProcessShutdownDisposition,
+) -> Result<(), String> {
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
     let _ = sess.conversation.shutdown().await;
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    if matches!(
+        process_disposition,
+        ProcessShutdownDisposition::DetachDurable
+    ) {
+        sess.services
+            .unified_exec_manager
+            .detach_durable_processes()
+            .await;
+    }
     let termination_result = sess
         .services
         .unified_exec_manager
@@ -646,7 +664,9 @@ async fn emit_thread_stop_lifecycle(sess: &Session) {
 }
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> Result<bool, String> {
-    if let Err(message) = shutdown_session_runtime(sess).await {
+    if let Err(message) =
+        shutdown_session_runtime(sess, ProcessShutdownDisposition::TerminateAll).await
+    {
         warn!("{message}");
         sess.send_event_raw(Event {
             id: sub_id,
@@ -895,7 +915,14 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        if let Err(err) = shutdown_session_runtime(&sess).await {
+        if let Some(live_thread) = sess.live_thread()
+            && let Err(err) = live_thread.flush().await
+        {
+            warn!("failed to flush thread persistence before runtime detachment: {err}");
+        }
+        if let Err(err) =
+            shutdown_session_runtime(&sess, ProcessShutdownDisposition::DetachDurable).await
+        {
             warn!(
                 "session runtime shutdown remains uncertain after submission channel closed: {err}"
             );
