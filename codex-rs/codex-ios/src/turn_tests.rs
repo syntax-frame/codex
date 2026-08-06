@@ -35,6 +35,7 @@ use super::TurnExitDisposition;
 use super::acquire_context_file_lock;
 use super::active_turn_registry;
 use super::build_turn_runtime;
+use super::claim_turn_exit_disposition;
 use super::codex_interrupt_turn;
 use super::codex_ios_tool_discovery_contract_version;
 use super::codex_run_turn_streaming_apikey;
@@ -51,7 +52,6 @@ use super::read_thread_pointer;
 use super::register_starting_turn;
 use super::startup_interrupt_requested;
 use super::tool_discovery_event_json;
-use super::turn_exit_disposition;
 use super::validate_relative_rollout_path;
 use super::write_thread_pointer;
 
@@ -101,14 +101,10 @@ fn pre_submit_interrupt_gate_is_idempotent_and_registry_guard_cleans_up() {
 
     assert_eq!(events, vec![(KIND_TURN_READY, handle.to_string())]);
     assert!(!startup_interrupt_requested(handle).expect("startup state"));
-    assert_eq!(
-        turn_exit_disposition(handle).expect("normal disposition"),
-        TurnExitDisposition::HostDetach
-    );
     assert_eq!(codex_interrupt_turn(handle), 0);
     assert!(startup_interrupt_requested(handle).expect("interrupted startup state"));
     assert_eq!(
-        turn_exit_disposition(handle).expect("interrupt disposition"),
+        claim_turn_exit_disposition(handle).expect("interrupt disposition"),
         TurnExitDisposition::UserInterrupt
     );
     assert_eq!(codex_interrupt_turn(handle), 0);
@@ -117,13 +113,30 @@ fn pre_submit_interrupt_gate_is_idempotent_and_registry_guard_cleans_up() {
         assert!(matches!(
             registry.get(&handle),
             Some(TurnBridge::Starting {
-                interrupt_requested: true
+                interrupt_requested: true,
+                cleanup_claimed: true,
             })
         ));
     }
 
     drop(guard);
     assert_eq!(codex_interrupt_turn(handle), 6);
+}
+
+#[test]
+fn host_detach_claim_rejects_a_late_stop_instead_of_reporting_false_success() {
+    let mut events = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+    let (handle, guard) = register_starting_turn(capture_event, ctx).expect("register turn");
+
+    assert_eq!(
+        claim_turn_exit_disposition(handle).expect("host detach claim"),
+        TurnExitDisposition::HostDetach
+    );
+    assert_eq!(codex_interrupt_turn(handle), 6);
+    assert!(!startup_interrupt_requested(handle).expect("not interrupted"));
+
+    drop(guard);
 }
 
 #[test]

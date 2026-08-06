@@ -593,11 +593,13 @@ type ResponseSender = tokio::sync::mpsc::UnboundedSender<(String, DynamicToolRes
 enum TurnBridge {
     Starting {
         interrupt_requested: bool,
+        cleanup_claimed: bool,
     },
     Active {
         dynamic_response_sender: ResponseSender,
         thread: Arc<CodexThread>,
         interrupt_requested: bool,
+        cleanup_claimed: bool,
     },
 }
 
@@ -626,6 +628,7 @@ fn register_starting_turn(
             turn_handle,
             TurnBridge::Starting {
                 interrupt_requested: false,
+                cleanup_claimed: false,
             },
         );
     emit(callback, ctx, KIND_TURN_READY, &turn_handle.to_string());
@@ -651,15 +654,18 @@ fn activate_turn(
         .ok_or_else(|| "turn handle was removed during startup".to_string())?;
     let TurnBridge::Starting {
         interrupt_requested,
+        cleanup_claimed,
     } = entry
     else {
         return Err("turn handle was already activated".to_string());
     };
     let interrupt_requested = *interrupt_requested;
+    let cleanup_claimed = *cleanup_claimed;
     *entry = TurnBridge::Active {
         dynamic_response_sender: response_sender,
         thread,
         interrupt_requested,
+        cleanup_claimed,
     };
     Ok((response_receiver, interrupt_requested))
 }
@@ -671,27 +677,34 @@ fn startup_interrupt_requested(turn_handle: u64) -> Result<bool, String> {
     match registry.get(&turn_handle) {
         Some(TurnBridge::Starting {
             interrupt_requested,
+            ..
         }) => Ok(*interrupt_requested),
         Some(TurnBridge::Active { .. }) => Err("turn handle was already activated".to_string()),
         None => Err("unknown or finished turn handle".to_string()),
     }
 }
 
-fn turn_exit_disposition(turn_handle: u64) -> Result<TurnExitDisposition, String> {
-    let registry = active_turn_registry()
+fn claim_turn_exit_disposition(turn_handle: u64) -> Result<TurnExitDisposition, String> {
+    let mut registry = active_turn_registry()
         .lock()
         .map_err(|_| "active turn registry poisoned".to_string())?;
-    let interrupt_requested = match registry.get(&turn_handle) {
+    let (interrupt_requested, cleanup_claimed) = match registry.get_mut(&turn_handle) {
         Some(TurnBridge::Starting {
             interrupt_requested,
+            cleanup_claimed,
         })
         | Some(TurnBridge::Active {
             interrupt_requested,
+            cleanup_claimed,
             ..
-        }) => *interrupt_requested,
+        }) => (interrupt_requested, cleanup_claimed),
         None => return Err("unknown or finished turn handle".to_string()),
     };
-    Ok(if interrupt_requested {
+    if *cleanup_claimed {
+        return Err("turn cleanup was already claimed".to_string());
+    }
+    *cleanup_claimed = true;
+    Ok(if *interrupt_requested {
         TurnExitDisposition::UserInterrupt
     } else {
         TurnExitDisposition::HostDetach
@@ -706,17 +719,28 @@ async fn request_interrupt(turn_handle: u64) -> Result<(), String> {
         match registry.get_mut(&turn_handle) {
             Some(TurnBridge::Starting {
                 interrupt_requested,
+                cleanup_claimed,
             }) => {
+                if *interrupt_requested {
+                    return Ok(());
+                }
+                if *cleanup_claimed {
+                    return Err("turn cleanup has already started".to_string());
+                }
                 *interrupt_requested = true;
                 None
             }
             Some(TurnBridge::Active {
                 thread,
                 interrupt_requested,
+                cleanup_claimed,
                 ..
             }) => {
                 if *interrupt_requested {
                     return Ok(());
+                }
+                if *cleanup_claimed {
+                    return Err("turn cleanup has already started".to_string());
                 }
                 *interrupt_requested = true;
                 Some(Arc::clone(thread))
@@ -1695,7 +1719,7 @@ pub(crate) async fn run_turn_async(
     }
     }
     .await;
-    let exit_disposition = turn_exit_disposition(turn_handle)?;
+    let exit_disposition = claim_turn_exit_disposition(turn_handle)?;
     let cleanup_result = match exit_disposition {
         TurnExitDisposition::HostDetach => thread
             .prepare_for_host_detach()
@@ -2649,17 +2673,28 @@ pub extern "C" fn codex_interrupt_turn(turn_handle: u64) -> c_int {
         match registry.get_mut(&turn_handle) {
             Some(TurnBridge::Starting {
                 interrupt_requested,
+                cleanup_claimed,
             }) => {
+                if *interrupt_requested {
+                    return 0;
+                }
+                if *cleanup_claimed {
+                    return 6;
+                }
                 *interrupt_requested = true;
                 None
             }
             Some(TurnBridge::Active {
                 thread,
                 interrupt_requested,
+                cleanup_claimed,
                 ..
             }) => {
                 if *interrupt_requested {
                     return 0;
+                }
+                if *cleanup_claimed {
+                    return 6;
                 }
                 *interrupt_requested = true;
                 Some(Arc::clone(thread))
