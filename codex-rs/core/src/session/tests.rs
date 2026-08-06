@@ -66,6 +66,11 @@ fn background_output_for_turn_with_text(turn_id: &str, call_id: &str, text: &str
     })
 }
 
+fn persisted_rollout_item(item: &RolloutItem) -> RolloutItem {
+    let json = serde_json::to_string(item).expect("serialize rollout item");
+    serde_json::from_str(&json).expect("deserialize rollout item")
+}
+
 #[test]
 fn background_prepared_without_output_is_inactive_but_output_gap_is_finalized() {
     assert!(
@@ -81,6 +86,106 @@ fn background_prepared_without_output_is_inactive_but_output_gap_is_finalized() 
     assert_eq!(commits.len(), 1);
     assert_eq!(commits[0].session_id, 41);
     assert_eq!(commits[0].range_end, 7);
+}
+
+#[test]
+fn background_receipt_commit_survives_rollout_output_round_trip() {
+    let prepared = persisted_rollout_item(&background_prepared(41, "exec-41", 7));
+    let output = persisted_rollout_item(&background_output("exec-41"));
+    let RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        output: payload, ..
+    }) = &output
+    else {
+        panic!("function output");
+    };
+    assert_eq!(payload.success, None);
+
+    let commits = missing_background_session_commits(&[prepared.clone(), output.clone()])
+        .expect("persisted output gap");
+    assert_eq!(commits.len(), 1);
+
+    let history = [
+        prepared,
+        output,
+        RolloutItem::RemoteExecutionSessionCommitted(commits[0].clone()),
+    ]
+    .iter()
+    .map(persisted_rollout_item)
+    .collect::<Vec<_>>();
+    assert!(
+        missing_background_session_commits(&history)
+            .expect("persisted committed receipt")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn background_receipt_finalizes_after_recorder_flush_and_reload() -> std::io::Result<()> {
+    let home = tempfile::tempdir()?;
+    let config = codex_rollout::RolloutConfig {
+        codex_home: home.path().to_path_buf(),
+        sqlite_home: home.path().to_path_buf(),
+        cwd: home.path().to_path_buf(),
+        model_provider_id: "test-provider".to_string(),
+        generate_memories: false,
+    };
+    let recorder = codex_rollout::RolloutRecorder::new(
+        &config,
+        codex_rollout::RolloutRecorderParams::new(
+            ThreadId::new(),
+            /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
+            SessionSource::Exec,
+            /*thread_source*/ None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
+    recorder
+        .record_canonical_items(&[
+            background_prepared(41, "exec-41", 7),
+            background_output("exec-41"),
+        ])
+        .await?;
+    recorder.flush().await?;
+
+    let (history, _, _) =
+        codex_rollout::RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+    let commits =
+        missing_background_session_commits(&history).expect("persisted output should finalize");
+    assert_eq!(commits.len(), 1);
+    recorder
+        .record_canonical_items(&[RolloutItem::RemoteExecutionSessionCommitted(
+            commits[0].clone(),
+        )])
+        .await?;
+    recorder.flush().await?;
+
+    let (history, _, _) =
+        codex_rollout::RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+    assert!(
+        missing_background_session_commits(&history)
+            .expect("persisted commit should validate")
+            .is_empty()
+    );
+    recorder.shutdown().await
+}
+
+#[test]
+fn background_receipt_rejects_explicit_failed_output() {
+    let prepared = background_prepared(41, "exec-41", 7);
+    let mut output = background_output("exec-41");
+    let RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        output: payload, ..
+    }) = &mut output
+    else {
+        unreachable!();
+    };
+    payload.success = Some(false);
+
+    assert!(missing_background_session_commits(&[prepared, output]).is_err());
 }
 
 #[test]
@@ -396,7 +501,7 @@ fn latest_committed_background_session_pairs_the_exact_receipt() {
 }
 
 #[test]
-fn committed_delivery_unknown_write_is_restart_idempotent() {
+fn committed_delivery_unknown_write_round_trip_is_restart_idempotent() {
     let initial = background_prepared(41, "exec-41", 3);
     let initial_output = background_output("exec-41");
     let initial_commit =
@@ -447,20 +552,27 @@ fn committed_delivery_unknown_write_is_restart_idempotent() {
         terminal: true,
     };
 
+    let history = [
+        initial,
+        initial_output,
+        RolloutItem::RemoteExecutionSessionCommitted(initial_commit),
+        RolloutItem::RemoteExecutionSessionPrepared(delivery),
+        background_output_for_turn_with_text("stdin-turn", "stdin-1", text),
+        RolloutItem::RemoteExecutionSessionCommitted(delivery_commit),
+    ]
+    .iter()
+    .map(persisted_rollout_item)
+    .collect::<Vec<_>>();
+    let RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        output: payload, ..
+    }) = &history[4]
+    else {
+        panic!("function output");
+    };
+    assert_eq!(payload.success, None);
     assert!(
-        pending_nonempty_write_already_recovered(
-            &[
-                initial,
-                initial_output,
-                RolloutItem::RemoteExecutionSessionCommitted(initial_commit),
-                RolloutItem::RemoteExecutionSessionPrepared(delivery),
-                background_output_for_turn_with_text("stdin-turn", "stdin-1", text),
-                RolloutItem::RemoteExecutionSessionCommitted(delivery_commit),
-            ],
-            "thread",
-            &pending,
-        )
-        .expect("already recovered")
+        pending_nonempty_write_already_recovered(&history, "thread", &pending)
+            .expect("already recovered")
     );
 }
 
@@ -649,6 +761,30 @@ fn prepared_empty_poll_reuses_exact_stored_output_without_polling() {
             .as_deref(),
         Some("receipt-turn")
     );
+}
+
+#[test]
+fn prepared_empty_poll_accepts_exact_persisted_output_without_repolling() {
+    let RolloutItem::RemoteExecutionSessionPrepared(mut prepared) =
+        background_prepared(41, "poll-1", 7)
+    else {
+        unreachable!();
+    };
+    prepared.receipt_output_text = "exact prepared output".to_string();
+    prepared.receipt_output_digest = remote_receipt_output_digest(&prepared.receipt_output_text);
+    let pending = pending_empty_poll(41, "receipt-turn", "poll-1");
+    let output_text = prepared.receipt_output_text.clone();
+    let prepared = persisted_rollout_item(&RolloutItem::RemoteExecutionSessionPrepared(prepared));
+    let output = persisted_rollout_item(&successful_remote_poll_output(&pending, output_text));
+
+    let repair = prepared_empty_poll_repair(&[prepared, output], "thread", &pending)
+        .expect("persisted exact output should be reusable");
+    assert!(matches!(
+        repair,
+        PreparedEmptyPollRepair::Ready {
+            output_to_append: None
+        }
+    ));
 }
 
 #[test]

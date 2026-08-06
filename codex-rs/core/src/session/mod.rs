@@ -197,6 +197,15 @@ fn remote_receipt_output_digest(text: &str) -> String {
     remote_receipt_bytes_digest(text.as_bytes())
 }
 
+/// `FunctionCallOutputPayload::success` is transient metadata: its custom
+/// serializer writes only the model-visible output body, so a rollout reload
+/// restores it as `None`. Exact prepared-receipt text, digest, identity, and
+/// ordering are the durable authority. An explicit in-memory failure is still
+/// rejected when one is available.
+fn remote_receipt_output_is_success_compatible(success: Option<bool>) -> bool {
+    success != Some(false)
+}
+
 fn terminal_status_observed_exit_code(status: &RemoteExecutionTerminalStatus) -> i32 {
     match status {
         RemoteExecutionTerminalStatus::Exited(exit_code) => *exit_code,
@@ -341,7 +350,7 @@ fn missing_background_session_commits(
                 || output_indices[0].0 <= *prepared_index
                 || output_indices[0].0 >= *commit_index
                 || output_indices[0].1 != prepared.receipt_output_text
-                || output_indices[0].2 != Some(true)
+                || !remote_receipt_output_is_success_compatible(output_indices[0].2)
                 || prepared.session_id != *session_id
                 || prepared.exec_turn_id != commit.exec_turn_id
                 || prepared.exec_call_id != commit.exec_call_id
@@ -423,7 +432,7 @@ fn missing_background_session_commits(
         if output_indices.len() != 1
             || output_indices[0].0 <= *prepared_index
             || output_indices[0].1 != prepared.receipt_output_text
-            || output_indices[0].2 != Some(true)
+            || !remote_receipt_output_is_success_compatible(output_indices[0].2)
             || remote_receipt_output_digest(&output_indices[0].1) != prepared.receipt_output_digest
         {
             return Err(CodexErr::Fatal(format!(
@@ -680,7 +689,7 @@ fn remote_poll_output_matches(
     };
     call_id == &pending.call_id
         && output.body.to_text().as_deref() == Some(text)
-        && output.success == Some(true)
+        && remote_receipt_output_is_success_compatible(output.success)
         && internal_chat_message_metadata_passthrough
             .as_ref()
             .and_then(|metadata| metadata.turn_id.as_deref())
