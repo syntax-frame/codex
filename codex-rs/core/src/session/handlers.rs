@@ -610,10 +610,22 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
-#[derive(Clone, Copy)]
-enum ProcessShutdownDisposition {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ProcessShutdownDisposition {
     TerminateAll,
     DetachDurable,
+}
+
+pub(super) fn runtime_loss_disposition(
+    persistence_flush_succeeded: bool,
+) -> ProcessShutdownDisposition {
+    if persistence_flush_succeeded {
+        ProcessShutdownDisposition::DetachDurable
+    } else {
+        // Detaching after a failed flush could leave a durable remote process
+        // without reopenable recovery identity. Prefer a confirmed kill.
+        ProcessShutdownDisposition::TerminateAll
+    }
 }
 
 async fn shutdown_session_runtime(
@@ -915,13 +927,23 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        if let Some(live_thread) = sess.live_thread()
-            && let Err(err) = live_thread.flush().await
-        {
-            warn!("failed to flush thread persistence before runtime detachment: {err}");
-        }
+        let persistence_flush_succeeded = if let Some(live_thread) = sess.live_thread() {
+            match live_thread.flush().await {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(
+                        "failed to flush thread persistence before runtime detachment; \
+                         terminating durable executions instead: {err}"
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
         if let Err(err) =
-            shutdown_session_runtime(&sess, ProcessShutdownDisposition::DetachDurable).await
+            shutdown_session_runtime(&sess, runtime_loss_disposition(persistence_flush_succeeded))
+                .await
         {
             warn!(
                 "session runtime shutdown remains uncertain after submission channel closed: {err}"

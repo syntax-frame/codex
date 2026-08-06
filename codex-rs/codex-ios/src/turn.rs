@@ -601,6 +601,12 @@ enum TurnBridge {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TurnExitDisposition {
+    HostDetach,
+    UserInterrupt,
+}
+
 /// Global registry mapping a short-lived numeric handle to a streaming call.
 /// Entries exist from the entry-point callback through worker completion.
 fn active_turn_registry() -> &'static Mutex<HashMap<u64, TurnBridge>> {
@@ -669,6 +675,27 @@ fn startup_interrupt_requested(turn_handle: u64) -> Result<bool, String> {
         Some(TurnBridge::Active { .. }) => Err("turn handle was already activated".to_string()),
         None => Err("unknown or finished turn handle".to_string()),
     }
+}
+
+fn turn_exit_disposition(turn_handle: u64) -> Result<TurnExitDisposition, String> {
+    let registry = active_turn_registry()
+        .lock()
+        .map_err(|_| "active turn registry poisoned".to_string())?;
+    let interrupt_requested = match registry.get(&turn_handle) {
+        Some(TurnBridge::Starting {
+            interrupt_requested,
+        })
+        | Some(TurnBridge::Active {
+            interrupt_requested,
+            ..
+        }) => *interrupt_requested,
+        None => return Err("unknown or finished turn handle".to_string()),
+    };
+    Ok(if interrupt_requested {
+        TurnExitDisposition::UserInterrupt
+    } else {
+        TurnExitDisposition::HostDetach
+    })
 }
 
 async fn request_interrupt(turn_handle: u64) -> Result<(), String> {
@@ -1668,14 +1695,21 @@ pub(crate) async fn run_turn_async(
     }
     }
     .await;
-    let detach_result = thread
-        .prepare_for_host_detach()
-        .await
-        .map_err(|error| format!("failed to flush model context before host detach: {error}"));
-    match (turn_result, detach_result) {
+    let exit_disposition = turn_exit_disposition(turn_handle)?;
+    let cleanup_result = match exit_disposition {
+        TurnExitDisposition::HostDetach => thread
+            .prepare_for_host_detach()
+            .await
+            .map_err(|error| format!("failed to flush model context before host detach: {error}")),
+        TurnExitDisposition::UserInterrupt => thread
+            .shutdown_and_wait()
+            .await
+            .map_err(|error| format!("failed to terminate interrupted model turn: {error}")),
+    };
+    match (turn_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(detach_error)) => Err(format!("{error}; additionally: {detach_error}")),
+        (Err(error), Err(cleanup_error)) => Err(format!("{error}; additionally: {cleanup_error}")),
     }
 }
 

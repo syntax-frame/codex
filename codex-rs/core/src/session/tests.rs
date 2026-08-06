@@ -7994,6 +7994,18 @@ async fn explicit_shutdown_terminates_durable_process_and_preserves_reconciliati
     );
 }
 
+#[test]
+fn failed_runtime_loss_flush_uses_terminating_disposition() {
+    assert_eq!(
+        handlers::runtime_loss_disposition(false),
+        handlers::ProcessShutdownDisposition::TerminateAll
+    );
+    assert_eq!(
+        handlers::runtime_loss_disposition(true),
+        handlers::ProcessShutdownDisposition::DetachDurable
+    );
+}
+
 #[tokio::test]
 async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lifecycle() {
     struct LifecycleRecorder {

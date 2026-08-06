@@ -207,6 +207,42 @@ async fn concurrent_confirmed_termination_shares_the_same_failure() {
 }
 
 #[tokio::test]
+async fn fire_and_forget_and_confirmed_termination_share_completion() {
+    let (wake_tx, _wake_rx) = watch::channel(0);
+    let terminate_count = Arc::new(AtomicUsize::new(0));
+    let terminate_started = Arc::new(Notify::new());
+    let allow_terminate = Arc::new(Notify::new());
+    let process = UnifiedExecProcess::from_exec_server_started(
+        StartedExecProcess {
+            process: Arc::new(MockExecProcess {
+                process_id: "mixed-terminate".to_string().into(),
+                write_response: WriteResponse {
+                    status: WriteStatus::Accepted,
+                },
+                read_responses: Mutex::new(VecDeque::new()),
+                terminate_error: Some("terminate unavailable".to_string()),
+                terminate_count: Arc::clone(&terminate_count),
+                terminate_started: Some(Arc::clone(&terminate_started)),
+                allow_terminate: Some(Arc::clone(&allow_terminate)),
+                wake_tx,
+            }),
+        },
+        false,
+    )
+    .await
+    .expect("remote process should start");
+
+    process.terminate();
+    terminate_started.notified().await;
+    let confirmed = process.terminate_confirmed();
+    allow_terminate.notify_one();
+    confirmed
+        .await
+        .expect_err("confirmed caller must observe fire-and-forget failure");
+    assert_eq!(terminate_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn remote_write_unknown_process_marks_process_exited() {
     let process = remote_process(WriteStatus::UnknownProcess, /*terminate_error*/ None).await;
 

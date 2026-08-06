@@ -31,6 +31,7 @@ use super::PersistedThreadPointer;
 use super::ServerFileUpload;
 use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
 use super::TurnBridge;
+use super::TurnExitDisposition;
 use super::acquire_context_file_lock;
 use super::active_turn_registry;
 use super::build_turn_runtime;
@@ -50,6 +51,7 @@ use super::read_thread_pointer;
 use super::register_starting_turn;
 use super::startup_interrupt_requested;
 use super::tool_discovery_event_json;
+use super::turn_exit_disposition;
 use super::validate_relative_rollout_path;
 use super::write_thread_pointer;
 
@@ -99,8 +101,16 @@ fn pre_submit_interrupt_gate_is_idempotent_and_registry_guard_cleans_up() {
 
     assert_eq!(events, vec![(KIND_TURN_READY, handle.to_string())]);
     assert!(!startup_interrupt_requested(handle).expect("startup state"));
+    assert_eq!(
+        turn_exit_disposition(handle).expect("normal disposition"),
+        TurnExitDisposition::HostDetach
+    );
     assert_eq!(codex_interrupt_turn(handle), 0);
     assert!(startup_interrupt_requested(handle).expect("interrupted startup state"));
+    assert_eq!(
+        turn_exit_disposition(handle).expect("interrupt disposition"),
+        TurnExitDisposition::UserInterrupt
+    );
     assert_eq!(codex_interrupt_turn(handle), 0);
     {
         let registry = active_turn_registry().lock().expect("registry lock");
