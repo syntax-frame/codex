@@ -7994,6 +7994,48 @@ async fn explicit_shutdown_terminates_durable_process_and_preserves_reconciliati
     );
 }
 
+#[tokio::test]
+async fn explicit_shutdown_closes_thread_persistence_when_process_termination_is_uncertain() {
+    let (session, _turn_context, store, durable_terminate_count) =
+        session_with_durable_process_and_reconciliation_record().await;
+    let (failing_process, failing_terminate_count) =
+        crate::unified_exec::process_tests::remote_process_with_drop_policy(
+            codex_exec_server::WriteStatus::Accepted,
+            Some("transport lost".to_string()),
+            false,
+        )
+        .await;
+    session
+        .services
+        .unified_exec_manager
+        .insert_process_for_session_teardown_test(17, Arc::new(failing_process), &session)
+        .await;
+
+    let error = handlers::shutdown(&session, "shutdown".to_string())
+        .await
+        .expect_err("uncertain process termination must fail shutdown");
+
+    assert!(
+        error.contains("could not confirm termination of unified exec processes")
+            && error.contains("17")
+    );
+    assert_eq!(
+        durable_terminate_count.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        failing_terminate_count.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let calls = store
+        .as_any()
+        .downcast_ref::<codex_thread_store::InMemoryThreadStore>()
+        .expect("in-memory thread store")
+        .calls()
+        .await;
+    assert_eq!(calls.shutdown_thread, 1);
+}
+
 #[test]
 fn failed_runtime_loss_flush_uses_terminating_disposition() {
     assert_eq!(
@@ -8188,6 +8230,90 @@ async fn shutdown_and_wait_propagates_uncertain_runtime_shutdown() {
     assert!(
         err.to_string()
             .contains("could not confirm termination of unified exec processes")
+    );
+}
+
+#[tokio::test]
+async fn shutdown_and_wait_propagates_thread_persistence_shutdown_failure() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let config = session.get_config().await;
+    let store = Arc::new(codex_thread_store::LocalThreadStore::new(
+        codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
+        /*state_db*/ None,
+    ));
+    let thread_store: Arc<dyn codex_thread_store::ThreadStore> = store.clone();
+    let live_thread = LiveThread::create(
+        Arc::clone(&thread_store),
+        CreateThreadParams {
+            session_id: session.session_id(),
+            thread_id: session.thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: Default::default(),
+            subagent_history_start_ordinal: None,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(config.cwd.to_path_buf()),
+                model_provider: config.model_provider_id.clone(),
+                memory_mode: ThreadMemoryMode::Disabled,
+            },
+        },
+    )
+    .await
+    .expect("create thread persistence");
+    codex_thread_store::ThreadStore::shutdown_thread(store.as_ref(), session.thread_id)
+        .await
+        .expect("close recorder before session shutdown");
+    session.services.thread_store = thread_store;
+    session.services.live_thread = Some(live_thread);
+
+    let (tx_event, rx_event) = async_channel::unbounded();
+    session.tx_event = tx_event;
+    let (tx_sub, rx_sub) = async_channel::bounded(1);
+    let session = Arc::new(session);
+    let session_for_loop = Arc::clone(&session);
+    let loop_config = Arc::clone(&turn_context.config);
+    let session_loop_handle = tokio::spawn(async move {
+        submission_loop(session_for_loop, loop_config, rx_sub)
+            .await
+            .map_err(Arc::<str>::from)
+    });
+    let io = SessionIo {
+        tx_sub,
+        rx_event,
+        agent_status: watch::channel(AgentStatus::PendingInit).1,
+        session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+    };
+
+    let err = io
+        .shutdown_and_wait()
+        .await
+        .expect_err("thread persistence failure must fail shutdown");
+    assert!(
+        err.to_string()
+            .contains("failed to shutdown thread persistence")
+    );
+
+    let events = std::iter::from_fn(|| io.rx_event.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.msg,
+            EventMsg::Error(error) if error.message == "Failed to shutdown thread persistence"
+        )
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(&event.msg, EventMsg::ShutdownComplete)),
+        "persistence failure must not emit false shutdown success"
     );
 }
 

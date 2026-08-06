@@ -1,5 +1,8 @@
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::io::Read;
+use std::io::Write;
+use std::net::TcpListener;
 use std::os::fd::AsRawFd;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
@@ -8,7 +11,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use codex_exec_server::SshAuthentication;
@@ -24,6 +30,7 @@ use super::AGENTAPP_BROWSER_TOOL_NAMES;
 use super::CONTEXT_LOCK_FILE;
 use super::CONTEXT_POINTER_FILE;
 use super::KIND_CONTEXT_COMPACTION_STARTED;
+use super::KIND_DONE;
 use super::KIND_ERROR;
 use super::KIND_ITEM_STARTED;
 use super::KIND_TURN_READY;
@@ -32,6 +39,7 @@ use super::ServerFileUpload;
 use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
 use super::TurnBridge;
 use super::TurnExitDisposition;
+use super::TurnFailure;
 use super::acquire_context_file_lock;
 use super::active_turn_registry;
 use super::build_turn_runtime;
@@ -41,12 +49,16 @@ use super::codex_ios_tool_discovery_contract_version;
 use super::codex_run_turn_streaming_apikey;
 use super::codex_steer_turn;
 use super::disable_upstream_multi_agent;
+use super::emit;
 use super::emit_item_started_events;
+use super::emit_turn_result;
+use super::finish_turn_with_cleanup;
 use super::model_context_resume_error_class;
 use super::parse_agentapp_dynamic_tools_json;
 use super::parse_reasoning_effort;
 use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
+use super::persistent_model_context_storage_error;
 use super::prompt_image_uploads;
 use super::read_thread_pointer;
 use super::register_starting_turn;
@@ -166,13 +178,18 @@ fn prompt_image_limit_matches_agentapp_picker_without_silent_truncation() {
 }
 
 fn run_apikey_turn(context_home: &Path) -> Vec<(c_int, String)> {
-    let base_url = CString::new("http://127.0.0.1:1/v1").expect("base URL");
+    run_apikey_turn_against(context_home, "http://127.0.0.1:1/v1")
+}
+
+fn run_apikey_turn_against(context_home: &Path, base_url: &str) -> Vec<(c_int, String)> {
+    let base_url = CString::new(base_url).expect("base URL");
     let api_key = CString::new("test-key").expect("API key");
     let wire_api = CString::new("responses").expect("wire API");
     let model = CString::new("gpt-5.4").expect("model");
     let prompt = CString::new("test prompt").expect("prompt");
     let context_home =
         CString::new(context_home.to_string_lossy().as_bytes()).expect("context home");
+    let dynamic_tools = CString::new("[]").expect("dynamic tools");
     let mut events = Vec::new();
     let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
 
@@ -187,13 +204,114 @@ fn run_apikey_turn(context_home: &Path) -> Vec<(c_int, String)> {
         /*history_json*/ std::ptr::null(),
         context_home.as_ptr(),
         /*workspace_path*/ std::ptr::null(),
-        /*dynamic_tools_json*/ std::ptr::null(),
+        dynamic_tools.as_ptr(),
         /*uploads_json*/ std::ptr::null(),
         ctx,
         capture_event,
     );
 
     events
+}
+
+struct RejectingResponsesServer {
+    base_url: String,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl RejectingResponsesServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind rejecting server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking rejecting server");
+        let address = listener.local_addr().expect("rejecting server address");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            let body = r#"{"error":{"message":"forced failure","type":"invalid_request_error","code":"invalid_request"}}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            while !worker_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut request = [0_u8; 8192];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/v1"),
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for RejectingResponsesServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("rejecting server worker");
+        }
+    }
+}
+
+#[test]
+fn failed_protected_first_turn_leaves_a_resumable_rollout() {
+    let home = tempfile::tempdir().expect("context home");
+    let server = RejectingResponsesServer::start();
+
+    let first = run_apikey_turn_against(home.path(), &server.base_url);
+    assert_eq!(
+        first
+            .iter()
+            .filter(|(kind, _)| *kind == KIND_ERROR)
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["A protected turn failed."]
+    );
+    assert!(!first.iter().any(|(kind, _)| *kind == KIND_DONE));
+
+    let pointer_path = home.path().join(CONTEXT_POINTER_FILE);
+    let pointer_bytes = std::fs::read(&pointer_path).expect("durable pointer");
+    let pointer: PersistedThreadPointer =
+        serde_json::from_slice(&pointer_bytes).expect("pointer JSON");
+    let rollout_path = home.path().join(pointer.rollout_path);
+    assert!(rollout_path.is_file(), "pointer target must exist");
+    assert!(
+        std::fs::metadata(&rollout_path)
+            .expect("rollout metadata")
+            .len()
+            > 0,
+        "rollout must contain at least SessionMeta"
+    );
+
+    let second = run_apikey_turn_against(home.path(), &server.base_url);
+    assert!(
+        second.iter().any(|(kind, message)| {
+            *kind == KIND_ERROR && message == "A protected turn failed."
+        })
+    );
+    assert!(
+        !second
+            .iter()
+            .any(|(_, message)| { message.contains("failed to resume persistent model context") })
+    );
+    assert_eq!(
+        std::fs::read(pointer_path).expect("stable pointer"),
+        pointer_bytes
+    );
 }
 
 #[test]
@@ -323,6 +441,59 @@ fn model_context_resume_errors_are_content_free_stable_classes() {
         model_context_resume_error_class(&CodexErr::Fatal("private structural detail".to_string())),
         "invalid_or_unavailable"
     );
+}
+
+#[test]
+fn persistent_model_context_storage_errors_hide_internal_details() {
+    let private_detail = "/private/context/sessions/rollout.jsonl: malformed secret record";
+
+    for operation in ["materialize", "validate"] {
+        let public_message = persistent_model_context_storage_error(operation, &private_detail);
+        assert_eq!(
+            public_message,
+            format!("failed to {operation} persistent model context")
+        );
+        assert!(!public_message.contains(private_detail));
+        assert!(!public_message.contains("/private/context"));
+    }
+}
+
+#[test]
+fn protected_turn_post_error_failures_never_cross_ffi() {
+    let private_event_error =
+        "event stream error: /private/context/rollout.jsonl contains secret arguments";
+    let private_cleanup_error =
+        "failed to finish model-context host detach: secret transport detail";
+    let mut events = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+    emit(capture_event, ctx, KIND_ERROR, "A protected turn failed.");
+
+    for (turn_result, cleanup_result) in [
+        (Err(private_event_error.to_string()), Ok(())),
+        (Ok(()), Err(private_cleanup_error.to_string())),
+    ] {
+        let result = finish_turn_with_cleanup(
+            /*protected_error_emitted*/ true,
+            turn_result,
+            cleanup_result,
+        );
+        assert!(
+            matches!(&result, Err(TurnFailure::ProtectedAlreadyReported)),
+            "post-error failure must retain failure semantics"
+        );
+        emit_turn_result(capture_event, ctx, Ok(result));
+    }
+
+    assert_eq!(
+        events,
+        vec![(KIND_ERROR, "A protected turn failed.".to_string())]
+    );
+    assert!(events.iter().all(|(_, message)| {
+        !message.contains(private_event_error)
+            && !message.contains(private_cleanup_error)
+            && !message.contains("/private/context")
+            && !message.contains("secret transport detail")
+    }));
 }
 
 #[test]

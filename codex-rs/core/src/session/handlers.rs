@@ -676,19 +676,19 @@ async fn emit_thread_stop_lifecycle(sess: &Session) {
 }
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> Result<bool, String> {
-    if let Err(message) =
-        shutdown_session_runtime(sess, ProcessShutdownDisposition::TerminateAll).await
-    {
+    let runtime_error = shutdown_session_runtime(sess, ProcessShutdownDisposition::TerminateAll)
+        .await
+        .err();
+    if let Some(message) = runtime_error.as_ref() {
         warn!("{message}");
         sess.send_event_raw(Event {
-            id: sub_id,
+            id: sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
                 message: message.clone(),
                 codex_error_info: Some(CodexErrorInfo::Other),
             }),
         })
         .await;
-        return Err(message);
     }
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
@@ -707,10 +707,11 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> Result<bool, Strin
 
     // Gracefully flush and shutdown thread persistence on session end so tests
     // that inspect durable state do not race with the background writer.
-    if let Some(live_thread) = sess.live_thread()
-        && let Err(e) = live_thread.shutdown().await
+    let persistence_error = if let Some(live_thread) = sess.live_thread()
+        && let Err(error) = live_thread.shutdown().await
     {
-        warn!("failed to shutdown thread persistence: {e}");
+        let message = format!("failed to shutdown thread persistence: {error}");
+        warn!("{message}");
         let event = Event {
             id: sub_id.clone(),
             msg: EventMsg::Error(ErrorEvent {
@@ -719,6 +720,19 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> Result<bool, Strin
             }),
         };
         sess.send_event_raw(event).await;
+        Some(message)
+    } else {
+        None
+    };
+
+    match (runtime_error, persistence_error) {
+        (None, None) => {}
+        (Some(message), None) | (None, Some(message)) => return Err(message),
+        (Some(runtime_error), Some(persistence_error)) => {
+            return Err(format!(
+                "{runtime_error}; additionally: {persistence_error}"
+            ));
+        }
     }
 
     let event = Event {

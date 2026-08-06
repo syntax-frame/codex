@@ -66,6 +66,7 @@ use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
@@ -296,6 +297,7 @@ const TOOL_DISCOVERY_CONTRACT_VERSION: u32 = 1;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
 const CONTEXT_POINTER_FILE: &str = "agentapp-thread.json";
+const ERROR_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const POST_DYNAMIC_IMAGE_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
 const DYNAMIC_IMAGE_RESPONSE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_IMAGE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -305,6 +307,18 @@ const PROMPT_IMAGE_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_PROMPT_IMAGE_UPLOADS: usize = 10;
 const TURN_RUNTIME_MAX_BLOCKING_THREADS: usize = 16;
 const TURN_RUNTIME_BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_secs(1);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TurnFailure {
+    Public(String),
+    ProtectedAlreadyReported,
+}
+
+impl From<String> for TurnFailure {
+    fn from(message: String) -> Self {
+        Self::Public(message)
+    }
+}
 
 /// Highest content-free discovery-event payload contract this library emits.
 /// Additive ABI query: older libraries simply lack the symbol and never emit
@@ -357,6 +371,18 @@ fn model_context_resume_error_class(error: &codex_protocol::error::CodexErr) -> 
         codex_rollout::RolloutReadError::EmptySession
         | codex_rollout::RolloutReadError::WorkerFailed => "invalid_or_unavailable",
     }
+}
+
+fn persistent_model_context_storage_error(
+    operation: &'static str,
+    error: &impl std::fmt::Display,
+) -> String {
+    tracing::warn!(
+        operation,
+        error = %error,
+        "persistent model-context storage operation failed"
+    );
+    format!("failed to {operation} persistent model context")
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -428,6 +454,20 @@ fn validate_relative_rollout_path(path: &Path) -> Result<(), String> {
         return Err("rollout pointer contains an unsafe path component".to_string());
     }
     Ok(())
+}
+
+fn event_matches_turn(event: &Event, expected_turn_id: &str) -> bool {
+    if event.id != expected_turn_id {
+        return false;
+    }
+
+    match &event.msg {
+        EventMsg::TurnComplete(turn_complete) => turn_complete.turn_id == expected_turn_id,
+        EventMsg::TurnAborted(turn_aborted) => {
+            turn_aborted.turn_id.as_deref() == Some(expected_turn_id)
+        }
+        _ => true,
+    }
 }
 
 async fn read_thread_pointer(codex_home: &Path) -> Result<Option<PathBuf>, String> {
@@ -564,6 +604,41 @@ fn emit(callback: EventCallback, ctx: *mut c_void, kind: c_int, text: &str) {
     let sanitized: String = text.chars().filter(|&c| c != '\0').collect();
     if let Ok(cstr) = CString::new(sanitized) {
         callback(ctx, kind, cstr.as_ptr());
+    }
+}
+
+fn finish_turn_with_cleanup(
+    protected_error_emitted: bool,
+    turn_result: Result<(), String>,
+    cleanup_result: Result<(), String>,
+) -> Result<(), TurnFailure> {
+    let result = match (turn_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(format!("{error}; additionally: {cleanup_error}")),
+    };
+    if !protected_error_emitted {
+        return result.map_err(TurnFailure::Public);
+    }
+    result.map_err(|error| {
+        tracing::warn!(
+            error = %error,
+            "turn failed after a protected terminal error was reported"
+        );
+        TurnFailure::ProtectedAlreadyReported
+    })
+}
+
+fn emit_turn_result(
+    callback: EventCallback,
+    ctx: *mut c_void,
+    result: std::thread::Result<Result<(), TurnFailure>>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(TurnFailure::ProtectedAlreadyReported)) => {}
+        Ok(Err(TurnFailure::Public(message))) => emit(callback, ctx, KIND_ERROR, &message),
+        Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
     }
 }
 
@@ -1043,7 +1118,7 @@ pub(crate) async fn run_turn_async(
     server_mode: Option<ServerMode>,
     callback: EventCallback,
     ctx: *mut c_void,
-) -> Result<(), String> {
+) -> Result<(), TurnFailure> {
     emit_debug_stage(callback, ctx, "run_turn_async_entered");
     let reasoning_effort = parse_reasoning_effort(&reasoning_effort)?;
     let service_tier = match service_tier.trim() {
@@ -1276,6 +1351,7 @@ pub(crate) async fn run_turn_async(
     emit_debug_stage(callback, ctx, "thread_ready");
     let thread = new_thread.thread;
     let session_model = new_thread.session_configured.model.clone();
+    let mut protected_error_emitted = false;
     let turn_result: Result<(), String> = async {
 
     // `history_json` is retained for legacy bridge callers that still need to
@@ -1299,9 +1375,25 @@ pub(crate) async fn run_turn_async(
         emit_debug_stage(callback, ctx, "history_inject_end");
     }
     if !context_home.trim().is_empty() {
+        if !resumed {
+            // `rollout_path()` is reserved before the recorder has written its
+            // initial SessionMeta. Materialize that record before publishing
+            // the pointer so an early provider failure or startup interrupt
+            // can never leave AgentApp pointing at a nonexistent rollout.
+            thread
+                .try_ensure_rollout_materialized()
+                .await
+                .map_err(|error| persistent_model_context_storage_error("materialize", &error))?;
+        }
         let rollout_path = thread.rollout_path().ok_or_else(|| {
             "persistent model-context thread did not provide a rollout path".to_string()
         })?;
+        let rollout_meta = codex_core::read_session_meta_line(&rollout_path)
+            .await
+            .map_err(|error| persistent_model_context_storage_error("validate", &error))?;
+        if rollout_meta.meta.id != new_thread.thread_id {
+            return Err("persistent model-context rollout belongs to another thread".to_string());
+        }
         write_thread_pointer(&codex_home, new_thread.thread_id, &rollout_path).await?;
     }
 
@@ -1360,12 +1452,14 @@ pub(crate) async fn run_turn_async(
         return Ok(());
     }
     let mut submit_timed_out = false;
-    if prompt_contains_images {
+    let expected_turn_id = if prompt_contains_images {
         emit_debug_stage(callback, ctx, "prompt_image_submit_begin");
         match timeout(PROMPT_IMAGE_SUBMIT_TIMEOUT, thread.submit(user_input_op)).await {
             Ok(result) => {
-                let _ = result.map_err(|e| format!("failed to submit user input: {e}"))?;
+                let turn_id =
+                    result.map_err(|e| format!("failed to submit user input: {e}"))?;
                 emit_debug_stage(callback, ctx, "prompt_image_submit_end");
+                Some(turn_id)
             }
             Err(_) => {
                 emit(
@@ -1375,16 +1469,18 @@ pub(crate) async fn run_turn_async(
                     "timed out submitting prompt image input to the model",
                 );
                 submit_timed_out = true;
+                None
             }
         }
     } else {
         emit_debug_stage(callback, ctx, "prompt_submit_begin");
-        thread
+        let turn_id = thread
             .submit(user_input_op)
             .await
             .map_err(|e| format!("failed to submit user input: {e}"))?;
         emit_debug_stage(callback, ctx, "prompt_submit_end");
-    }
+        Some(turn_id)
+    };
     let (mut resp_rx, interrupted_during_submit) = activate_turn(turn_handle, Arc::clone(&thread))?;
     let mut interrupting_after_submit = submit_timed_out || interrupted_during_submit;
     if interrupting_after_submit {
@@ -1414,8 +1510,14 @@ pub(crate) async fn run_turn_async(
     // long-running normal tools are not interrupted.
     let mut awaiting_event_after_dynamic_image = false;
     let mut awaiting_first_event_after_prompt_image = prompt_contains_images;
-    loop {
-        let event = if interrupting_after_submit {
+    let mut terminal_error_deadline: Option<tokio::time::Instant> = None;
+    'event_loop: loop {
+        let event = if let Some(deadline) = terminal_error_deadline {
+            match tokio::time::timeout_at(deadline, thread.next_event()).await {
+                Ok(result) => result.map_err(|e| format!("event stream error: {e}"))?,
+                Err(_) => return Ok(()),
+            }
+        } else if interrupting_after_submit {
             thread
                 .next_event()
                 .await
@@ -1457,6 +1559,12 @@ pub(crate) async fn run_turn_async(
                 .await
                 .map_err(|e| format!("event stream error: {e}"))?
         };
+        if expected_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| !event_matches_turn(&event, turn_id))
+        {
+            continue;
+        }
         awaiting_first_event_after_prompt_image = false;
         awaiting_event_after_dynamic_image = false;
         match event.msg {
@@ -1609,14 +1717,27 @@ pub(crate) async fn run_turn_async(
                             let event = event.map_err(|error| {
                                 format!("event stream error while awaiting tool: {error}")
                             })?;
+                            if expected_turn_id
+                                .as_deref()
+                                .is_some_and(|turn_id| !event_matches_turn(&event, turn_id))
+                            {
+                                continue;
+                            }
                             match event.msg {
                                 EventMsg::TurnAborted(_) => {
                                     emit(callback, ctx, KIND_TURN_ABORTED, "");
                                     return Ok(());
                                 }
                                 EventMsg::Error(error) => {
-                                    emit(callback, ctx, KIND_ERROR, &error.message);
-                                    return Ok(());
+                                    if !protected_error_emitted {
+                                        emit(callback, ctx, KIND_ERROR, &error.message);
+                                        protected_error_emitted = true;
+                                        terminal_error_deadline = Some(
+                                            tokio::time::Instant::now()
+                                                + ERROR_TERMINAL_DRAIN_TIMEOUT,
+                                        );
+                                    }
+                                    continue 'event_loop;
                                 }
                                 _ => continue,
                             }
@@ -1684,15 +1805,27 @@ pub(crate) async fn run_turn_async(
                 }
             }
             EventMsg::Error(ev) => {
-                emit(callback, ctx, KIND_ERROR, &ev.message);
-                return Ok(());
+                if !protected_error_emitted {
+                    emit(callback, ctx, KIND_ERROR, &ev.message);
+                    protected_error_emitted = true;
+                    terminal_error_deadline = Some(
+                        tokio::time::Instant::now() + ERROR_TERMINAL_DRAIN_TIMEOUT,
+                    );
+                }
             }
             EventMsg::TurnAborted(_) => {
                 emit(callback, ctx, KIND_TURN_ABORTED, "");
                 return Ok(());
             }
-            EventMsg::TurnComplete(_) => {
-                if interrupting_after_submit {
+            EventMsg::TurnComplete(ev) => {
+                if ev.error.is_some() && !protected_error_emitted {
+                    // Every iOS turn installs the trusted transient browser
+                    // argument policy. Preserve its privacy projection even if
+                    // Core supplies the failure only on the terminal event.
+                    emit(callback, ctx, KIND_ERROR, "A protected turn failed.");
+                    protected_error_emitted = true;
+                }
+                if interrupting_after_submit || protected_error_emitted {
                     return Ok(());
                 }
                 // Keep the legacy history event small. The durable model context
@@ -1719,22 +1852,31 @@ pub(crate) async fn run_turn_async(
     }
     }
     .await;
-    let exit_disposition = claim_turn_exit_disposition(turn_handle)?;
-    let cleanup_result = match exit_disposition {
-        TurnExitDisposition::HostDetach => thread
-            .prepare_for_host_detach()
-            .await
-            .map_err(|error| format!("failed to flush model context before host detach: {error}")),
-        TurnExitDisposition::UserInterrupt => thread
-            .shutdown_and_wait()
-            .await
-            .map_err(|error| format!("failed to terminate interrupted model turn: {error}")),
+    let cleanup_result = match claim_turn_exit_disposition(turn_handle) {
+        Ok(exit_disposition) => match exit_disposition {
+            TurnExitDisposition::HostDetach => {
+                let detach_result = thread.prepare_for_host_detach().await.map_err(|error| {
+                    format!("failed to flush model context before host detach: {error}")
+                });
+                let shutdown_result = thread.shutdown_and_wait().await.map_err(|error| {
+                    format!("failed to finish model-context host detach: {error}")
+                });
+                match (detach_result, shutdown_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                    (Err(error), Err(shutdown_error)) => {
+                        Err(format!("{error}; additionally: {shutdown_error}"))
+                    }
+                }
+            }
+            TurnExitDisposition::UserInterrupt => thread
+                .shutdown_and_wait()
+                .await
+                .map_err(|error| format!("failed to terminate interrupted model turn: {error}")),
+        },
+        Err(error) => Err(error),
     };
-    match (turn_result, cleanup_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(cleanup_error)) => Err(format!("{error}; additionally: {cleanup_error}")),
-    }
+    finish_turn_with_cleanup(protected_error_emitted, turn_result, cleanup_result)
 }
 
 fn disable_upstream_multi_agent(config: &mut Config) {
@@ -1863,7 +2005,7 @@ pub extern "C" fn codex_run_turn_streaming(
         std::thread::Builder::new()
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
-            .spawn(move || -> Result<(), String> {
+            .spawn(move || -> Result<(), TurnFailure> {
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(run_turn_async(
                     turn_handle,
@@ -1891,11 +2033,7 @@ pub extern "C" fn codex_run_turn_streaming(
             .map_err(|_| "worker thread panicked".to_string())?
     });
 
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => emit(callback, ctx, KIND_ERROR, &message),
-        Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
-    }
+    emit_turn_result(callback, ctx, result);
 }
 
 /// Generic API-key counterpart of [`codex_run_turn_streaming`]: drives ONE user
@@ -1991,7 +2129,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
         std::thread::Builder::new()
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
-            .spawn(move || -> Result<(), String> {
+            .spawn(move || -> Result<(), TurnFailure> {
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(run_turn_async(
                     turn_handle,
@@ -2019,11 +2157,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
             .map_err(|_| "worker thread panicked".to_string())?
     });
 
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => emit(callback, ctx, KIND_ERROR, &message),
-        Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
-    }
+    emit_turn_result(callback, ctx, result);
 }
 
 /// Generic API-key + server-mode counterpart: provider selection and SSH tool
@@ -2161,7 +2295,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
         std::thread::Builder::new()
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
-            .spawn(move || -> Result<(), String> {
+            .spawn(move || -> Result<(), TurnFailure> {
                 let _secret_guard = secret_guard;
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(async move {
@@ -2214,11 +2348,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
             .map_err(|_| "worker thread panicked".to_string())?
     });
 
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => emit(callback, ctx, KIND_ERROR, &message),
-        Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
-    }
+    emit_turn_result(callback, ctx, result);
 }
 
 /// Server-mode counterpart of [`codex_run_turn_streaming`]: drives ONE user
@@ -2373,7 +2503,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
         std::thread::Builder::new()
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
-            .spawn(move || -> Result<(), String> {
+            .spawn(move || -> Result<(), TurnFailure> {
                 // Hold a temporary key file alive when private-key auth is used.
                 let _secret_guard = secret_guard;
                 let ctx = ctx_addr as *mut c_void;
@@ -2427,11 +2557,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
             .map_err(|_| "worker thread panicked".to_string())?
     });
 
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => emit(callback, ctx, KIND_ERROR, &message),
-        Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
-    }
+    emit_turn_result(callback, ctx, result);
 }
 
 /// Rust-friendly entry point that drives ONE turn (optionally in server mode)
@@ -2476,7 +2602,7 @@ pub unsafe fn run_turn_streaming(
         std::thread::Builder::new()
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
-            .spawn(move || -> Result<(), String> {
+            .spawn(move || -> Result<(), TurnFailure> {
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(run_turn_async(
                     turn_handle,
@@ -2504,11 +2630,7 @@ pub unsafe fn run_turn_streaming(
             .map_err(|_| "worker thread panicked".to_string())?
     });
 
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => emit(callback, ctx, KIND_ERROR, &message),
-        Err(_) => emit(callback, ctx, KIND_ERROR, "panic during turn"),
-    }
+    emit_turn_result(callback, ctx, result);
 }
 
 /// Resolve an in-flight dynamic tool call: deliver the client's result back to
