@@ -94,6 +94,7 @@ async fn assert_exec_process_starts_and_exits(use_remote: bool) -> Result<()> {
         .backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-1"),
+            execution_identity: None,
             argv: vec!["true".to_string()],
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: /*env_policy*/ None,
@@ -153,6 +154,7 @@ async fn remote_process_keeps_sandbox_helper_visible_with_restricted_reads() -> 
         .backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-restricted-helper"),
+            execution_identity: None,
             argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
             cwd,
             env_policy: /*env_policy*/ None,
@@ -220,6 +222,7 @@ async fn remote_tty_process_uses_configured_sandbox_helper_with_hostile_path() -
         .backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-hostile-helper-path"),
+            execution_identity: None,
             argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
             cwd,
             env_policy: /*env_policy*/ None,
@@ -274,6 +277,7 @@ async fn remote_process_preserves_empty_workspace_roots() -> Result<()> {
         .backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-empty-workspace-roots"),
+            execution_identity: None,
             argv: vec!["/bin/cat".to_string(), file.to_string_lossy().into_owned()],
             cwd,
             env_policy: None,
@@ -415,6 +419,7 @@ async fn assert_exec_process_streams_output(use_remote: bool) -> Result<()> {
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
+            execution_identity: None,
             argv: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -450,6 +455,7 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
+            execution_identity: None,
             argv: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -501,6 +507,7 @@ async fn assert_exec_process_replays_events_after_close(use_remote: bool) -> Res
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
+            execution_identity: None,
             argv: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -553,6 +560,7 @@ async fn assert_exec_process_retains_output_after_exit_until_streams_close(
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
+            execution_identity: None,
             argv: vec![
                 helper_binary.to_string_lossy().into_owned(),
                 DELAYED_OUTPUT_AFTER_EXIT_PARENT_ARG.to_string(),
@@ -627,6 +635,7 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
+            execution_identity: None,
             argv: vec![
                 // Use `/bin/sh` instead of Python so this stdin round-trip test
                 // stays portable across Bazel and non-macOS runners where
@@ -671,6 +680,7 @@ async fn assert_exec_process_write_then_read_without_tty(use_remote: bool) -> Re
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
+            execution_identity: None,
             argv: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -716,6 +726,7 @@ async fn assert_remote_windows_sandbox_process_write() -> Result<()> {
         .backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-windows-sandbox-stdin"),
+            execution_identity: None,
             argv: vec![
                 r"C:\Windows\System32\cmd.exe".to_string(),
                 "/D".to_string(),
@@ -767,6 +778,7 @@ async fn assert_exec_process_rejects_write_without_pipe_stdin(use_remote: bool) 
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
+            execution_identity: None,
             argv: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -805,6 +817,7 @@ async fn assert_exec_process_signal_interrupts_process(use_remote: bool) -> Resu
         .backend
         .start(ExecParams {
             process_id: process_id.clone().into(),
+            execution_identity: None,
             argv: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -862,6 +875,7 @@ async fn assert_exec_process_signal_reports_unsupported_on_windows(use_remote: b
         .backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-windows-signal"),
+            execution_identity: None,
             argv: vec![
                 "cmd".to_string(),
                 "/C".to_string(),
@@ -906,6 +920,7 @@ async fn assert_exec_process_preserves_queued_events_before_subscribe(
         .backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-queued"),
+            execution_identity: None,
             argv: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),
@@ -950,6 +965,7 @@ async fn remote_exec_process_recovers_after_transport_disconnect() -> Result<()>
     let session = backend
         .start(ExecParams {
             process_id: ProcessId::from("proc-recover"),
+            execution_identity: None,
             argv: vec![
                 "/bin/sh".to_string(),
                 "-c".to_string(),

@@ -45,6 +45,7 @@ pub(crate) struct ExecServerEnvConfig {
 
 #[derive(Debug)]
 pub struct ExecRequest {
+    pub(crate) attempt_generation: u32,
     pub command: Vec<String>,
     pub cwd: PathUri,
     pub env: HashMap<String, String>,
@@ -70,6 +71,11 @@ pub struct ExecRequest {
 }
 
 impl ExecRequest {
+    pub(crate) fn with_attempt_generation(mut self, attempt_generation: u32) -> Self {
+        self.attempt_generation = attempt_generation;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         command: Vec<String>,
@@ -91,6 +97,7 @@ impl ExecRequest {
         let (file_system_sandbox_policy, network_sandbox_policy) =
             permission_profile.to_runtime_permissions();
         Self {
+            attempt_generation: 0,
             command,
             cwd,
             env,
@@ -151,6 +158,7 @@ impl ExecRequest {
             env.insert(CODEX_SANDBOX_ENV_VAR.to_string(), "seatbelt".to_string());
         }
         Self {
+            attempt_generation: 0,
             command,
             cwd,
             env,

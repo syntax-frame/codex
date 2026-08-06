@@ -21,6 +21,7 @@ use codex_utils_path_uri::PathUri;
 fn exec_params(process_id: &str, argv: Vec<&str>, tty: bool, pipe_stdin: bool) -> ExecParams {
     ExecParams {
         process_id: ProcessId::from(process_id),
+        execution_identity: None,
         argv: argv.into_iter().map(str::to_string).collect(),
         cwd: PathUri::from_host_native_path(std::env::temp_dir()).expect("cwd URI"),
         env_policy: None,
@@ -31,6 +32,7 @@ fn exec_params(process_id: &str, argv: Vec<&str>, tty: bool, pipe_stdin: bool) -
         sandbox: None,
         enforce_managed_network: false,
         managed_network: None,
+        network_proxy: None,
     }
 }
 

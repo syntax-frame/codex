@@ -1128,14 +1128,32 @@ pub(crate) async fn run_turn_async(
     let resume_path = read_thread_pointer(&codex_home).await?;
     let mut resumed = false;
     let new_thread = if let Some(rollout_path) = resume_path {
+        let reconciliation_request = thread_manager
+            .execution_reconciliation_request_from_rollout(rollout_path.clone())
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to resume persistent model context [{}]",
+                    model_context_resume_error_class(&error)
+                )
+            })?;
+        let pending_writes = reconciliation_request.pending_writes.clone();
+        let recovered_executions = thread_manager
+            .environment_manager()
+            .reconcile_default_environment(reconciliation_request)
+            .await
+            .map_err(|error| format!("failed to reconcile exact remote executions: {error}"))?;
+        emit_debug_stage(callback, ctx, "exact_execution_reconciled");
         let thread = thread_manager
-            .resume_thread_from_rollout_with_tools(
+            .resume_thread_from_rollout_with_tools_and_recovered_executions(
                 config.clone(),
                 rollout_path.clone(),
                 thread_manager.auth_manager(),
                 /*parent_trace*/ None,
                 /*supports_openai_form_elicitation*/ false,
                 dynamic_tools.clone(),
+                recovered_executions,
+                pending_writes,
             )
             .await
             .map_err(|error| {

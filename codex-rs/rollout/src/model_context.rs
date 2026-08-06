@@ -152,6 +152,10 @@ impl ModelContextScan {
             RolloutItem::EventMsg(_)
             | RolloutItem::SessionMeta(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::RemoteExecutionProtocolMarker(_)
+            | RolloutItem::RemoteExecutionLaunchIntent(_)
+            | RolloutItem::RemoteExecutionSessionPrepared(_)
+            | RolloutItem::RemoteExecutionSessionCommitted(_)
             | RolloutItem::WorldState(_) => {}
         }
 

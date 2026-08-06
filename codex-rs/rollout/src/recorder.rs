@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Error as IoError;
 use std::io::Read;
 use std::io::Seek;
@@ -19,6 +21,8 @@ use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -52,6 +56,7 @@ use super::loader;
 use super::metadata;
 use super::ordinal::RolloutOrdinalState;
 use super::ordinal::ordinal_state_for_rollout;
+use super::rollout_lock::RolloutLock;
 use super::session_index::find_thread_names_by_ids;
 use crate::config::RolloutConfigView;
 use crate::state_db;
@@ -1763,6 +1768,10 @@ impl RolloutWriterState {
     }
 
     async fn write_pending_once(&mut self) -> std::io::Result<()> {
+        let rollout_path = self.rollout_path.clone();
+        let lock = tokio::task::spawn_blocking(move || RolloutLock::acquire(&rollout_path))
+            .await
+            .map_err(IoError::other)??;
         self.ensure_writer_open().await?;
         self.write_session_meta_if_needed().await?;
 
@@ -1770,7 +1779,9 @@ impl RolloutWriterState {
 
         if let Some(writer) = self.writer.as_mut() {
             writer.file.flush().await?;
+            writer.file.sync_data().await?;
         }
+        drop(lock);
         Ok(())
     }
 
@@ -1876,10 +1887,108 @@ pub async fn append_rollout_item_to_path(
     rollout_path: &Path,
     item: &RolloutItem,
 ) -> std::io::Result<()> {
+    let lock_path = rollout_path.to_path_buf();
+    let lock = tokio::task::spawn_blocking(move || RolloutLock::acquire(&lock_path))
+        .await
+        .map_err(IoError::other)??;
     let (_rollout_path, file, ordinal_state) = open_rollout_for_append(rollout_path).await?;
     let ordinal = ordinal_state.current()?;
     let mut writer = JsonlWriter { file };
-    writer.write_rollout_item(item, ordinal).await
+    writer.write_rollout_item(item, ordinal).await?;
+    writer.file.flush().await?;
+    writer.file.sync_data().await?;
+    drop(lock);
+    Ok(())
+}
+
+/// Durably appends a recovered function output exactly once by semantic call id.
+///
+/// An existing byte-for-byte equivalent output is an idempotent success. A
+/// different output for the same call id is rejected without changing the
+/// rollout.
+pub async fn append_function_output_if_missing(
+    rollout_path: &Path,
+    call_id: &str,
+    output: &FunctionCallOutputPayload,
+) -> std::io::Result<()> {
+    let lock_path = rollout_path.to_path_buf();
+    let lock = tokio::task::spawn_blocking(move || RolloutLock::acquire(&lock_path))
+        .await
+        .map_err(IoError::other)??;
+    let (_rollout_path, file, ordinal_state) = open_rollout_for_append(rollout_path).await?;
+    let scan_file = file.try_clone().await?.into_std().await;
+    let call_id = call_id.to_string();
+    let output = output.clone();
+    let scan_call_id = call_id.clone();
+    let scan_output = output.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        scan_function_output(&scan_file, &scan_call_id, &scan_output)
+    })
+    .await
+    .map_err(IoError::other)??;
+    if outcome == FunctionOutputScan::ExactMatch {
+        drop(lock);
+        return Ok(());
+    }
+
+    let item = RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id,
+        output,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let mut writer = JsonlWriter { file };
+    writer
+        .write_rollout_item(&item, ordinal_state.current()?)
+        .await?;
+    writer.file.flush().await?;
+    writer.file.sync_data().await?;
+    drop(lock);
+    Ok(())
+}
+
+fn scan_function_output(
+    file: &File,
+    call_id: &str,
+    expected_output: &FunctionCallOutputPayload,
+) -> std::io::Result<FunctionOutputScan> {
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(0))?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            return Ok(FunctionOutputScan::Missing);
+        }
+        let complete = line.ends_with('\n');
+        let rollout_line = match serde_json::from_str::<RolloutLine>(&line) {
+            Ok(line) => line,
+            Err(_) if !complete => return Ok(FunctionOutputScan::Missing),
+            Err(err) => return Err(IoError::new(std::io::ErrorKind::InvalidData, err)),
+        };
+        if let RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            call_id: existing_call_id,
+            output,
+            ..
+        }) = rollout_line.item
+            && existing_call_id == call_id
+        {
+            if output == *expected_output {
+                return Ok(FunctionOutputScan::ExactMatch);
+            }
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!("conflicting function output already exists for call id {call_id}"),
+            ));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionOutputScan {
+    ExactMatch,
+    Missing,
 }
 
 async fn open_rollout_for_append(
@@ -2070,6 +2179,10 @@ async fn resume_candidate_matches_cwd(
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::RemoteExecutionProtocolMarker(_)
+            | RolloutItem::RemoteExecutionLaunchIntent(_)
+            | RolloutItem::RemoteExecutionSessionPrepared(_)
+            | RolloutItem::RemoteExecutionSessionCommitted(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::EventMsg(_) => None,

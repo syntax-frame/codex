@@ -146,6 +146,7 @@ pub(super) async fn try_run_zsh_fork(
         )
         .map_err(ToolError::Codex)?;
     let crate::sandboxing::ExecRequest {
+        attempt_generation: _,
         command,
         cwd: sandbox_cwd,
         env: sandbox_env,
@@ -847,6 +848,7 @@ impl CoreShellCommandExecutor {
 
         let result = crate::sandboxing::execute_exec_request_with_after_spawn(
             crate::sandboxing::ExecRequest {
+                attempt_generation: 0,
                 command: self.command.clone(),
                 cwd: self.cwd.clone().into(),
                 env: exec_env,

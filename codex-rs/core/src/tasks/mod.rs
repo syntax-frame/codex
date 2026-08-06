@@ -833,11 +833,11 @@ impl Session {
         active.take()
     }
 
-    pub(crate) async fn close_unified_exec_processes(&self) {
+    pub(crate) async fn close_unified_exec_processes(&self) -> Result<(), Vec<i32>> {
         self.services
             .unified_exec_manager
             .terminate_all_processes()
-            .await;
+            .await
     }
 
     pub(crate) async fn list_background_terminals(&self) -> Vec<BackgroundTerminalInfo> {

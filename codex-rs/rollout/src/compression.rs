@@ -575,6 +575,7 @@ mod worker {
     }
 
     fn compress_rollout_if_cold_blocking(path: &Path) -> io::Result<CompressionMeasurement> {
+        let _lock = crate::rollout_lock::RolloutLock::acquire(path)?;
         let before = match cold_file_state(path)? {
             ColdFileState::Cold(state) => state,
             ColdFileState::NotCold(state) => {

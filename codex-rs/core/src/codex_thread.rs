@@ -217,7 +217,7 @@ impl CodexThread {
 
     /// Wait until the underlying session loop has terminated.
     pub async fn wait_until_terminated(&self) {
-        self.io.session_loop_termination.clone().await;
+        let _ = self.io.session_loop_termination.clone().await;
     }
 
     pub(crate) async fn emit_thread_resume_lifecycle(&self) {

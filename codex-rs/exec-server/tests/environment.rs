@@ -3,6 +3,7 @@ mod common;
 use std::time::Duration;
 
 use anyhow::Context;
+use codex_exec_server::Environment;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::REMOTE_ENVIRONMENT_ID;
 use codex_exec_server::SelectedCapabilityRootsStatus;
@@ -38,6 +39,30 @@ fn ssh_environment_routes_exec_through_its_backend() -> anyhow::Result<()> {
 
     assert!(!environment.is_remote());
     assert!(environment.uses_backend_exec());
+    assert!(environment.supports_durable_remote_exec_recovery());
+
+    let direct = Environment::ssh(
+        "example.com",
+        22,
+        "test",
+        "/tmp/nonexistent-test-key",
+        None,
+        Some("node-direct".to_string()),
+    );
+    assert!(direct.uses_backend_exec());
+    assert!(!direct.supports_durable_remote_exec_recovery());
+
+    let preferred = Environment::ssh_with_config(SshEnvironmentConfig {
+        connection_key: "test@example.com:22".to_string(),
+        agent_key: "node-preferred".to_string(),
+        host: "example.com".to_string(),
+        port: 22,
+        user: "test".to_string(),
+        authentication: SshAuthentication::PrivateKeyPath("/tmp/nonexistent-test-key".to_string()),
+        host_fingerprint: None,
+        tmux_mode: SshTmuxMode::Preferred,
+    });
+    assert!(preferred.supports_durable_remote_exec_recovery());
 
     Ok(())
 }

@@ -57,6 +57,7 @@ struct SelectedTurnEnvironment {
 #[derive(Clone)]
 pub(crate) struct StartingTurnEnvironment {
     pub(crate) selection: TurnEnvironmentSelection,
+    durable_remote_exec_recovery: bool,
     resolution: TurnEnvironmentResolution,
 }
 
@@ -73,6 +74,10 @@ impl fmt::Debug for StartingTurnEnvironment {
 impl StartingTurnEnvironment {
     pub(crate) async fn wait_until_ready(&self) -> Result<(), Arc<ExecServerError>> {
         self.resolution.clone().await.map(|_| ())
+    }
+
+    pub(crate) fn supports_durable_remote_exec_recovery(&self) -> bool {
+        self.durable_remote_exec_recovery
     }
 }
 
@@ -325,6 +330,9 @@ impl ThreadEnvironments {
             if let Some(environment) = TurnEnvironmentState::from_resolution(
                 StartingTurnEnvironment {
                     selection: environment.selection.clone(),
+                    durable_remote_exec_recovery: environment
+                        .environment
+                        .supports_durable_remote_exec_recovery(),
                     resolution: environment.resolution.clone(),
                 },
                 resolved,

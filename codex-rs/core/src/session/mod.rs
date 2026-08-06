@@ -124,6 +124,12 @@ use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::RawResponseItemEvent;
+use codex_protocol::protocol::RemoteExecutionLaunchIntent;
+use codex_protocol::protocol::RemoteExecutionProtocolMarker;
+use codex_protocol::protocol::RemoteExecutionReceiptKind;
+use codex_protocol::protocol::RemoteExecutionSessionCommitted;
+use codex_protocol::protocol::RemoteExecutionSessionPrepared;
+use codex_protocol::protocol::RemoteExecutionTerminalStatus;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -165,6 +171,8 @@ use futures::future::Shared;
 use futures::prelude::*;
 use rmcp::model::RequestId;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot;
@@ -179,6 +187,596 @@ use tracing::info;
 use tracing::info_span;
 use tracing::instrument;
 use tracing::warn;
+
+fn remote_receipt_bytes_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn remote_receipt_output_digest(text: &str) -> String {
+    remote_receipt_bytes_digest(text.as_bytes())
+}
+
+fn terminal_status_observed_exit_code(status: &RemoteExecutionTerminalStatus) -> i32 {
+    match status {
+        RemoteExecutionTerminalStatus::Exited(exit_code) => *exit_code,
+        RemoteExecutionTerminalStatus::Terminated => 143,
+    }
+}
+
+fn prepared_remote_receipt_digest(
+    prepared: &RemoteExecutionSessionPrepared,
+) -> CodexResult<String> {
+    let bytes = serde_json::to_vec(prepared).map_err(|error| {
+        CodexErr::Fatal(format!(
+            "failed to serialize prepared remote receipt: {error}"
+        ))
+    })?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub(crate) async fn freeze_pending_remote_receipts_without_live_rollout(
+    manager: &UnifiedExecProcessManager,
+    receipt_ids: &[(String, String)],
+) -> CodexResult<()> {
+    let mut froze_remote_receipt = false;
+    for (turn_id, call_id) in receipt_ids {
+        froze_remote_receipt |= manager.freeze_output_receipt(turn_id, call_id).await;
+    }
+    if froze_remote_receipt {
+        return Err(CodexErr::Fatal(
+            "pending remote output receipt requires live rollout persistence".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn missing_background_session_commits(
+    history: &[RolloutItem],
+) -> CodexResult<Vec<RemoteExecutionSessionCommitted>> {
+    let mut outputs = HashMap::<(String, String), Vec<(usize, String, Option<bool>)>>::new();
+    let mut output_turns_by_call = HashMap::<String, HashSet<String>>::new();
+    let mut outputs_without_turn = HashSet::<String>::new();
+    let mut prepared_by_receipt =
+        HashMap::<(String, String, String), (usize, RemoteExecutionSessionPrepared)>::new();
+    let mut committed_by_session =
+        HashMap::<(String, i32), Vec<(usize, RemoteExecutionSessionCommitted)>>::new();
+    for (index, item) in history.iter().enumerate() {
+        match item {
+            RolloutItem::ResponseItem(
+                output @ ResponseItem::FunctionCallOutput {
+                    call_id,
+                    output: payload,
+                    ..
+                },
+            ) => {
+                if let Some(turn_id) = output.turn_id() {
+                    output_turns_by_call
+                        .entry(call_id.clone())
+                        .or_default()
+                        .insert(turn_id.to_string());
+                    outputs
+                        .entry((turn_id.to_string(), call_id.clone()))
+                        .or_default()
+                        .push((
+                            index,
+                            payload.body.to_text().unwrap_or_default(),
+                            payload.success,
+                        ));
+                } else {
+                    outputs_without_turn.insert(call_id.clone());
+                }
+            }
+            RolloutItem::RemoteExecutionSessionPrepared(prepared) => {
+                let key = (
+                    prepared.thread_id.clone(),
+                    prepared.receipt_turn_id.clone(),
+                    prepared.receipt_call_id.clone(),
+                );
+                if prepared_by_receipt
+                    .insert(key, (index, prepared.clone()))
+                    .is_some()
+                {
+                    return Err(CodexErr::Fatal(format!(
+                        "duplicate background session preparation for operation {}",
+                        prepared.receipt_call_id
+                    )));
+                }
+            }
+            RolloutItem::RemoteExecutionSessionCommitted(committed) => {
+                committed_by_session
+                    .entry((committed.thread_id.clone(), committed.session_id))
+                    .or_default()
+                    .push((index, committed.clone()));
+            }
+            _ => {}
+        }
+    }
+    let mut missing = Vec::new();
+    let mut committed_session_state = HashMap::<(String, i32), (u64, bool)>::new();
+    for ((thread_id, session_id), commits) in &mut committed_by_session {
+        commits.sort_by_key(|(index, _)| *index);
+        let mut previous_cursor = None;
+        let mut terminal = false;
+        let mut committed_receipts = HashSet::new();
+        for (commit_index, commit) in commits.iter() {
+            if !committed_receipts.insert((
+                commit.receipt_turn_id.clone(),
+                commit.receipt_call_id.clone(),
+            )) {
+                return Err(CodexErr::Fatal(format!(
+                    "duplicate background session commit for receipt {}",
+                    commit.receipt_call_id
+                )));
+            }
+            if terminal
+                || commit.range_end < commit.range_start
+                || previous_cursor
+                    .map(|cursor| commit.range_start != cursor)
+                    .unwrap_or(commit.range_start != 0)
+            {
+                return Err(CodexErr::Fatal(format!(
+                    "invalid background session commit sequence for session {session_id}"
+                )));
+            }
+            let key = (
+                thread_id.clone(),
+                commit.receipt_turn_id.clone(),
+                commit.receipt_call_id.clone(),
+            );
+            let Some((prepared_index, prepared)) = prepared_by_receipt.get(&key) else {
+                return Err(CodexErr::Fatal(format!(
+                    "background session commit lacks durable prepared output for session {session_id}"
+                )));
+            };
+            let output_indices = outputs
+                .get(&(
+                    prepared.receipt_turn_id.clone(),
+                    prepared.receipt_call_id.clone(),
+                ))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if output_indices.len() != 1
+                || output_indices[0].0 <= *prepared_index
+                || output_indices[0].0 >= *commit_index
+                || output_indices[0].1 != prepared.receipt_output_text
+                || output_indices[0].2 != Some(true)
+                || prepared.session_id != *session_id
+                || prepared.exec_turn_id != commit.exec_turn_id
+                || prepared.exec_call_id != commit.exec_call_id
+                || prepared.attempt_generation != commit.attempt_generation
+                || prepared.command_digest != commit.command_digest
+                || prepared.receipt_kind != commit.receipt_kind
+                || prepared.range_start != commit.range_start
+                || prepared.range_end != commit.range_end
+                || prepared.receipt_output_digest != commit.receipt_output_digest
+                || prepared_remote_receipt_digest(prepared)? != commit.prepared_receipt_digest
+                || remote_receipt_output_digest(&prepared.receipt_output_text)
+                    != prepared.receipt_output_digest
+                || prepared.terminal_acknowledgement_token != commit.terminal_acknowledgement_token
+                || prepared.terminal_output_digest != commit.terminal_output_digest
+                || prepared.terminal_status != commit.terminal_status
+                || prepared.terminal_candidate != prepared.terminal_acknowledgement_token.is_some()
+                || prepared.terminal_candidate != prepared.terminal_output_digest.is_some()
+                || prepared.terminal_candidate != prepared.terminal_status.is_some()
+                || commit.terminal != commit.terminal_acknowledgement_token.is_some()
+                || commit.terminal != commit.terminal_output_digest.is_some()
+                || commit.terminal != commit.terminal_status.is_some()
+                || prepared.terminal_candidate != commit.terminal
+            {
+                return Err(CodexErr::Fatal(format!(
+                    "background session commit lacks one ordered exact receipt for session {session_id}"
+                )));
+            }
+            previous_cursor = Some(commit.range_end);
+            terminal = commit.terminal;
+        }
+        committed_session_state.insert(
+            (thread_id.clone(), *session_id),
+            (previous_cursor.unwrap_or(0), terminal),
+        );
+    }
+    let mut prepared_receipts = prepared_by_receipt.values().collect::<Vec<_>>();
+    prepared_receipts.sort_by_key(|(index, _)| *index);
+    for (prepared_index, prepared) in prepared_receipts {
+        if prepared.range_end < prepared.range_start {
+            return Err(CodexErr::Fatal(format!(
+                "background receipt {} has an invalid backend range",
+                prepared.receipt_call_id
+            )));
+        }
+        if prepared.terminal_candidate != prepared.terminal_acknowledgement_token.is_some()
+            || prepared.terminal_candidate != prepared.terminal_output_digest.is_some()
+            || prepared.terminal_candidate != prepared.terminal_status.is_some()
+        {
+            return Err(CodexErr::Fatal(format!(
+                "background receipt {} has inconsistent terminal acknowledgement authority",
+                prepared.receipt_call_id
+            )));
+        }
+        if outputs_without_turn.contains(&prepared.receipt_call_id) {
+            return Err(CodexErr::Fatal(format!(
+                "background session output {} lacks exact turn identity",
+                prepared.receipt_call_id
+            )));
+        }
+        if output_turns_by_call
+            .get(&prepared.receipt_call_id)
+            .is_some_and(|turns| turns.len() != 1 || !turns.contains(&prepared.receipt_turn_id))
+        {
+            return Err(CodexErr::Fatal(format!(
+                "background receipt {} has conflicting turn identity",
+                prepared.receipt_call_id
+            )));
+        }
+        let output_indices = outputs
+            .get(&(
+                prepared.receipt_turn_id.clone(),
+                prepared.receipt_call_id.clone(),
+            ))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if output_indices.is_empty() {
+            continue;
+        }
+        if output_indices.len() != 1
+            || output_indices[0].0 <= *prepared_index
+            || output_indices[0].1 != prepared.receipt_output_text
+            || output_indices[0].2 != Some(true)
+            || remote_receipt_output_digest(&output_indices[0].1) != prepared.receipt_output_digest
+        {
+            return Err(CodexErr::Fatal(format!(
+                "background receipt {} is duplicate or precedes its preparation",
+                prepared.receipt_call_id
+            )));
+        }
+        let key = (prepared.thread_id.clone(), prepared.session_id);
+        let commits = committed_by_session.get(&key);
+        if commits.is_some_and(|commits| {
+            commits.iter().any(|(_, commit)| {
+                commit.receipt_turn_id == prepared.receipt_turn_id
+                    && commit.receipt_call_id == prepared.receipt_call_id
+            })
+        }) {
+            continue;
+        }
+        let state = committed_session_state.entry(key).or_insert((0, false));
+        if state.1 {
+            return Err(CodexErr::Fatal(format!(
+                "background session {} has output after terminal retirement",
+                prepared.session_id
+            )));
+        }
+        if prepared.range_start != state.0 {
+            return Err(CodexErr::Fatal(format!(
+                "background session {} receipt cursor is not contiguous",
+                prepared.session_id
+            )));
+        }
+        missing.push(RemoteExecutionSessionCommitted {
+            thread_id: prepared.thread_id.clone(),
+            exec_turn_id: prepared.exec_turn_id.clone(),
+            exec_call_id: prepared.exec_call_id.clone(),
+            receipt_turn_id: prepared.receipt_turn_id.clone(),
+            receipt_call_id: prepared.receipt_call_id.clone(),
+            receipt_kind: prepared.receipt_kind.clone(),
+            attempt_generation: prepared.attempt_generation,
+            session_id: prepared.session_id,
+            command_digest: prepared.command_digest.clone(),
+            range_start: prepared.range_start,
+            range_end: prepared.range_end,
+            receipt_output_digest: prepared.receipt_output_digest.clone(),
+            prepared_receipt_digest: prepared_remote_receipt_digest(prepared)?,
+            terminal_acknowledgement_token: prepared.terminal_acknowledgement_token.clone(),
+            terminal_output_digest: prepared.terminal_output_digest.clone(),
+            terminal_status: prepared.terminal_status.clone(),
+            terminal: prepared.terminal_candidate,
+        });
+        state.0 = prepared.range_end;
+        state.1 = prepared.terminal_candidate;
+    }
+    missing.sort_by(|left, right| {
+        left.thread_id
+            .cmp(&right.thread_id)
+            .then(left.session_id.cmp(&right.session_id))
+            .then(left.range_end.cmp(&right.range_end))
+    });
+    Ok(missing)
+}
+
+fn latest_committed_background_session<'a>(
+    history: &'a [RolloutItem],
+    thread_id: &str,
+    session_id: i32,
+) -> CodexResult<(
+    &'a RemoteExecutionSessionCommitted,
+    &'a RemoteExecutionSessionPrepared,
+)> {
+    let committed = history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::RemoteExecutionSessionCommitted(committed)
+                if committed.thread_id == thread_id && committed.session_id == session_id =>
+            {
+                Some(committed)
+            }
+            _ => None,
+        })
+        .last()
+        .ok_or_else(|| {
+            CodexErr::Fatal(format!(
+                "pending nonempty write targets unrecoverable session {session_id}"
+            ))
+        })?;
+    if committed.terminal {
+        return Err(CodexErr::Fatal(format!(
+            "pending nonempty write targets retired background session {session_id}"
+        )));
+    }
+    let prepared = history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::RemoteExecutionSessionPrepared(prepared)
+                if prepared.thread_id == committed.thread_id
+                    && prepared.session_id == committed.session_id
+                    && prepared.exec_call_id == committed.exec_call_id
+                    && prepared.receipt_turn_id == committed.receipt_turn_id
+                    && prepared.receipt_call_id == committed.receipt_call_id
+                    && prepared.attempt_generation == committed.attempt_generation =>
+            {
+                Some(prepared)
+            }
+            _ => None,
+        })
+        .last()
+        .ok_or_else(|| {
+            CodexErr::Fatal(format!(
+                "committed background session {session_id} lacks preparation metadata"
+            ))
+        })?;
+    if prepared.command_digest != committed.command_digest
+        || prepared.exec_turn_id != committed.exec_turn_id
+        || prepared.exec_call_id != committed.exec_call_id
+    {
+        return Err(CodexErr::Fatal(format!(
+            "committed background session {session_id} conflicts with preparation metadata"
+        )));
+    }
+    Ok((committed, prepared))
+}
+
+fn pending_nonempty_write_already_recovered(
+    history: &[RolloutItem],
+    thread_id: &str,
+    pending: &codex_exec_server::PendingWriteInteraction,
+) -> CodexResult<bool> {
+    let matching_prepared = history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::RemoteExecutionSessionPrepared(prepared)
+                if prepared.thread_id == thread_id
+                    && prepared.receipt_turn_id == pending.turn_id
+                    && prepared.receipt_call_id == pending.call_id =>
+            {
+                Some(prepared)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(prepared) = matching_prepared.first().copied() else {
+        return Ok(false);
+    };
+    if matching_prepared.len() != 1
+        || prepared.receipt_kind != RemoteExecutionReceiptKind::DeliveryUnknownWrite
+        || prepared.session_id != pending.session_id
+        || !prepared.terminal_candidate
+        || prepared.terminal_acknowledgement_token.is_none()
+        || prepared.terminal_output_digest.is_none()
+        || prepared.terminal_status.is_none()
+        || remote_receipt_output_digest(&prepared.receipt_output_text)
+            != prepared.receipt_output_digest
+    {
+        return Err(CodexErr::Fatal(format!(
+            "pending nonempty write {} has conflicting delivery-unknown preparation",
+            pending.call_id
+        )));
+    }
+    let matching_commits = history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::RemoteExecutionSessionCommitted(committed)
+                if committed.thread_id == prepared.thread_id
+                    && committed.receipt_turn_id == prepared.receipt_turn_id
+                    && committed.receipt_call_id == prepared.receipt_call_id =>
+            {
+                Some(committed)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if matching_commits.len() != 1 {
+        return Ok(false);
+    }
+    let committed = matching_commits[0];
+    if committed.receipt_kind != RemoteExecutionReceiptKind::DeliveryUnknownWrite
+        || !committed.terminal
+        || committed.session_id != prepared.session_id
+        || committed.exec_turn_id != prepared.exec_turn_id
+        || committed.exec_call_id != prepared.exec_call_id
+        || committed.attempt_generation != prepared.attempt_generation
+        || committed.command_digest != prepared.command_digest
+        || committed.range_start != prepared.range_start
+        || committed.range_end != prepared.range_end
+        || committed.receipt_output_digest != prepared.receipt_output_digest
+        || prepared_remote_receipt_digest(prepared)? != committed.prepared_receipt_digest
+        || committed.terminal_acknowledgement_token != prepared.terminal_acknowledgement_token
+        || committed.terminal_output_digest != prepared.terminal_output_digest
+        || committed.terminal_status != prepared.terminal_status
+    {
+        return Err(CodexErr::Fatal(format!(
+            "pending nonempty write {} has conflicting delivery-unknown commit",
+            pending.call_id
+        )));
+    }
+    let matching_outputs = history
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. })
+                    if call_id == &pending.call_id
+            )
+        })
+        .collect::<Vec<_>>();
+    if matching_outputs.len() != 1
+        || !remote_poll_output_matches(matching_outputs[0], pending, &prepared.receipt_output_text)
+    {
+        return Err(CodexErr::Fatal(format!(
+            "pending nonempty write {} lacks exact delivery-unknown output",
+            pending.call_id
+        )));
+    }
+    Ok(true)
+}
+
+fn successful_remote_poll_output(
+    pending: &codex_exec_server::PendingWriteInteraction,
+    text: String,
+) -> RolloutItem {
+    RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: pending.call_id.clone(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(text),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some(pending.turn_id.clone()),
+        }),
+    })
+}
+
+fn delivery_unknown_remote_write_output(
+    pending: &codex_exec_server::PendingWriteInteraction,
+    text: String,
+) -> RolloutItem {
+    successful_remote_poll_output(pending, text)
+}
+
+fn remote_poll_output_matches(
+    item: &RolloutItem,
+    pending: &codex_exec_server::PendingWriteInteraction,
+    text: &str,
+) -> bool {
+    let RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        call_id,
+        output,
+        internal_chat_message_metadata_passthrough,
+        ..
+    }) = item
+    else {
+        return false;
+    };
+    call_id == &pending.call_id
+        && output.body.to_text().as_deref() == Some(text)
+        && output.success == Some(true)
+        && internal_chat_message_metadata_passthrough
+            .as_ref()
+            .and_then(|metadata| metadata.turn_id.as_deref())
+            == Some(pending.turn_id.as_str())
+}
+
+enum PreparedEmptyPollRepair {
+    Missing,
+    Ready {
+        output_to_append: Option<RolloutItem>,
+    },
+}
+
+fn prepared_empty_poll_repair(
+    history: &[RolloutItem],
+    thread_id: &str,
+    pending: &codex_exec_server::PendingWriteInteraction,
+) -> CodexResult<PreparedEmptyPollRepair> {
+    let matching_prepared = history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::RemoteExecutionSessionPrepared(prepared)
+                if prepared.receipt_turn_id == pending.turn_id
+                    && prepared.receipt_call_id == pending.call_id =>
+            {
+                Some(prepared)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(prepared) = matching_prepared.first().copied() else {
+        return Ok(PreparedEmptyPollRepair::Missing);
+    };
+    if matching_prepared.len() != 1
+        || prepared.thread_id != thread_id
+        || prepared.receipt_kind != RemoteExecutionReceiptKind::EmptyPoll
+        || prepared.session_id != pending.session_id
+        || prepared.range_end < prepared.range_start
+        || remote_receipt_output_digest(&prepared.receipt_output_text)
+            != prepared.receipt_output_digest
+    {
+        return Err(CodexErr::Fatal(format!(
+            "pending empty poll {} has conflicting durable preparation",
+            pending.call_id
+        )));
+    }
+
+    let expected_output =
+        successful_remote_poll_output(pending, prepared.receipt_output_text.clone());
+    let existing_outputs = history
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. })
+                    if call_id == &pending.call_id
+            )
+        })
+        .collect::<Vec<_>>();
+    let output_to_append = match existing_outputs.as_slice() {
+        [] => Some(expected_output.clone()),
+        [existing]
+            if remote_poll_output_matches(existing, pending, &prepared.receipt_output_text) =>
+        {
+            None
+        }
+        _ => {
+            return Err(CodexErr::Fatal(format!(
+                "pending empty poll {} has a duplicate or conflicting output",
+                pending.call_id
+            )));
+        }
+    };
+
+    let mut projected = history.to_vec();
+    if let Some(output) = output_to_append.as_ref() {
+        projected.push(output.clone());
+    }
+    let matching_commits = missing_background_session_commits(&projected)?
+        .into_iter()
+        .filter(|committed| {
+            committed.thread_id == thread_id
+                && committed.receipt_turn_id == pending.turn_id
+                && committed.receipt_call_id == pending.call_id
+                && committed.session_id == pending.session_id
+        })
+        .count();
+    if matching_commits != 1 {
+        return Err(CodexErr::Fatal(format!(
+            "pending empty poll {} does not form one exact durable receipt",
+            pending.call_id
+        )));
+    }
+    Ok(PreparedEmptyPollRepair::Ready { output_to_append })
+}
+
 use uuid::Uuid;
 
 use crate::client::ModelClient;
@@ -348,6 +946,9 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::LocalImagePreparation;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -387,6 +988,7 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_tools::UnifiedExecShellMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_output_truncation::TruncationPolicy;
 #[cfg(test)]
 use codex_utils_stream_parser::ProposedPlanSegment;
 
@@ -405,7 +1007,7 @@ pub(crate) struct SessionIo {
     pub(crate) session_loop_termination: SessionLoopTermination,
 }
 
-pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
+pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, Result<(), Arc<str>>>>;
 
 pub(crate) struct SessionSpawnArgs {
     pub(crate) config: Config,
@@ -422,6 +1024,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
     pub(crate) extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
     pub(crate) conversation_history: InitialHistory,
+    pub(crate) pending_remote_writes: Vec<codex_exec_server::PendingWriteInteraction>,
     pub(crate) requested_history_mode: Option<ThreadHistoryMode>,
     pub(crate) session_source: SessionSource,
     pub(crate) forked_from_thread_id: Option<ThreadId>,
@@ -562,6 +1165,7 @@ impl Session {
             code_mode_session_provider,
             extensions,
             conversation_history,
+            pending_remote_writes,
             requested_history_mode,
             session_source,
             forked_from_thread_id,
@@ -756,6 +1360,7 @@ impl Session {
             tx_event.clone(),
             agent_status_tx.clone(),
             conversation_history,
+            pending_remote_writes,
             session_source_clone,
             skills_service,
             plugins_manager,
@@ -795,7 +1400,8 @@ impl Session {
         let session_loop_handle = tokio::spawn(async move {
             submission_loop(session_for_loop, config, rx_sub)
                 .instrument(info_span!("session_loop", thread_id = %thread_id))
-                .await;
+                .await
+                .map_err(Arc::<str>::from)
         });
         let io = SessionIo {
             tx_sub,
@@ -867,8 +1473,9 @@ impl SessionIo {
             Err(CodexErr::InternalAgentDied) => {}
             Err(err) => return Err(err),
         }
-        session_loop_termination.await;
-        Ok(())
+        session_loop_termination
+            .await
+            .map_err(|err| CodexErr::Fatal(err.to_string()))
     }
 
     pub(crate) async fn next_event(&self) -> CodexResult<Event> {
@@ -932,14 +1539,38 @@ fn session_permission_profile_state_from_config(
 
 #[cfg(test)]
 pub(crate) fn completed_session_loop_termination() -> SessionLoopTermination {
-    futures::future::ready(()).boxed().shared()
+    futures::future::ready(Ok(())).boxed().shared()
 }
 
-pub(crate) fn session_loop_termination_from_handle(
-    handle: JoinHandle<()>,
-) -> SessionLoopTermination {
+pub(crate) trait IntoSessionLoopResult {
+    fn into_session_loop_result(self) -> Result<(), Arc<str>>;
+}
+
+impl IntoSessionLoopResult for () {
+    fn into_session_loop_result(self) -> Result<(), Arc<str>> {
+        Ok(())
+    }
+}
+
+impl IntoSessionLoopResult for Result<(), Arc<str>> {
+    fn into_session_loop_result(self) -> Result<(), Arc<str>> {
+        self
+    }
+}
+
+pub(crate) fn session_loop_termination_from_handle<T>(
+    handle: JoinHandle<T>,
+) -> SessionLoopTermination
+where
+    T: IntoSessionLoopResult + Send + 'static,
+{
     async move {
-        let _ = handle.await;
+        match handle.await {
+            Ok(result) => result.into_session_loop_result(),
+            Err(err) => Err(Arc::<str>::from(format!(
+                "session loop task failed before shutdown completed: {err}"
+            ))),
+        }
     }
     .boxed()
     .shared()
@@ -1194,6 +1825,1329 @@ impl Session {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) async fn persist_remote_execution_protocol_marker(
+        &self,
+        turn_context: &TurnContext,
+    ) -> CodexResult<()> {
+        self.finalize_background_session_receipts().await?;
+        let requires_durable_marker = turn_context.config.features.enabled(Feature::UnifiedExec)
+            && (turn_context
+                .environments
+                .turn_environments()
+                .any(|environment| {
+                    environment
+                        .environment
+                        .supports_durable_remote_exec_recovery()
+                })
+                || turn_context
+                    .environments
+                    .starting()
+                    .any(|environment| environment.supports_durable_remote_exec_recovery()));
+        if !requires_durable_marker {
+            return Ok(());
+        }
+        let live_thread = self.live_thread().ok_or_else(|| {
+            CodexErr::Fatal(
+                "durable-v2 remote execution requires live rollout persistence".to_string(),
+            )
+        })?;
+        let turn_id = &turn_context.sub_id;
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let request = crate::thread_manager::ThreadManager::scan_active_remote_calls(
+            self.thread_id.to_string(),
+            &history.items,
+        )?;
+        if !request.incomplete_executions.is_empty() || !request.pending_writes.is_empty() {
+            return Err(CodexErr::Fatal(
+                "cannot begin a marked v2 turn while a supported remote call is incomplete"
+                    .to_string(),
+            ));
+        }
+        let matching_markers = history
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::RemoteExecutionProtocolMarker(marker)
+                    if marker.turn_id == turn_id.as_str() =>
+                {
+                    Some(marker)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if matching_markers.len() == 1 {
+            let marker = matching_markers[0];
+            if marker.thread_id == self.thread_id.to_string()
+                && marker.protocol_version == 2
+                && marker.identity_schema == "thread-turn-call-generation"
+                && marker.descriptor_before_go
+            {
+                return live_thread
+                    .flush()
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)));
+            }
+        }
+        if !matching_markers.is_empty() {
+            return Err(CodexErr::Fatal(format!(
+                "conflicting remote execution protocol marker for turn {turn_id}"
+            )));
+        }
+        let marker = RolloutItem::RemoteExecutionProtocolMarker(RemoteExecutionProtocolMarker {
+            thread_id: self.thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            protocol_version: 2,
+            identity_schema: "thread-turn-call-generation".to_string(),
+            descriptor_before_go: true,
+        });
+        live_thread
+            .append_items(&[marker])
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))
+    }
+
+    pub(crate) async fn finalize_background_session_receipts(&self) -> CodexResult<()> {
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(());
+        };
+        let mut history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let commits = missing_background_session_commits(&history.items)?;
+        if !commits.is_empty() {
+            let items = commits
+                .into_iter()
+                .map(RolloutItem::RemoteExecutionSessionCommitted)
+                .collect::<Vec<_>>();
+            live_thread
+                .append_items(&items)
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+            live_thread
+                .flush()
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+            history = live_thread
+                .load_history(/*include_archived*/ true)
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        }
+        if !missing_background_session_commits(&history.items)?.is_empty() {
+            return Err(CodexErr::Fatal(
+                "background session commit did not become durably visible".to_string(),
+            ));
+        }
+        for committed in history.items.iter().filter_map(|item| match item {
+            RolloutItem::RemoteExecutionSessionCommitted(committed)
+                if committed.thread_id == self.thread_id.to_string() =>
+            {
+                Some(committed)
+            }
+            _ => None,
+        }) {
+            if !committed.terminal {
+                self.services
+                    .unified_exec_manager
+                    .acknowledge_output_receipt(
+                        &committed.receipt_turn_id,
+                        &committed.receipt_call_id,
+                    )
+                    .await;
+                continue;
+            }
+            let prepared = history
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::RemoteExecutionSessionPrepared(prepared)
+                        if prepared.thread_id == committed.thread_id
+                            && prepared.receipt_turn_id == committed.receipt_turn_id
+                            && prepared.receipt_call_id == committed.receipt_call_id =>
+                    {
+                        Some(prepared)
+                    }
+                    _ => None,
+                })
+                .next()
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "terminal background session {} lacks exact prepared authority",
+                        committed.session_id
+                    ))
+                })?;
+            let token = committed
+                .terminal_acknowledgement_token
+                .as_ref()
+                .filter(|token| !token.is_empty())
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "terminal background session {} lacks durable acknowledgement authority",
+                        committed.session_id
+                    ))
+                })?;
+            if prepared.terminal_acknowledgement_token.as_ref() != Some(token) {
+                return Err(CodexErr::Fatal(format!(
+                    "terminal background session {} has conflicting acknowledgement authority",
+                    committed.session_id
+                )));
+            }
+            let terminal_status = committed.terminal_status.as_ref().ok_or_else(|| {
+                CodexErr::Fatal(format!(
+                    "terminal background session {} lacks durable terminal status",
+                    committed.session_id
+                ))
+            })?;
+            let observed_exit_code = terminal_status_observed_exit_code(terminal_status);
+            let (verified_token, verified_output_digest, verified_status) = self
+                .verify_terminal_remote_receipt(
+                    prepared,
+                    committed.range_start,
+                    committed.range_end,
+                    observed_exit_code,
+                )
+                .await?;
+            if verified_token != *token
+                || committed.terminal_output_digest.as_deref()
+                    != Some(verified_output_digest.as_str())
+                || committed.terminal_status.as_ref() != Some(&verified_status)
+            {
+                return Err(CodexErr::Fatal(format!(
+                    "terminal background session {} changed before acknowledgement",
+                    committed.session_id
+                )));
+            }
+            let environment = self
+                .services
+                .turn_environments
+                .environment_manager()
+                .get_environment(&prepared.environment_id)
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "terminal background session {} environment {} is unavailable",
+                        committed.session_id, prepared.environment_id
+                    ))
+                })?;
+            if !environment.supports_durable_remote_exec_recovery() {
+                return Err(CodexErr::Fatal(format!(
+                    "terminal background session {} environment {} cannot acknowledge recovery",
+                    committed.session_id, prepared.environment_id
+                )));
+            }
+            environment
+                .get_exec_backend()
+                .acknowledge_consumed(
+                    codex_exec_server::RecoveredExecutionAcknowledgement::new(token.clone())
+                        .with_terminal_proof(codex_exec_server::TerminalAcknowledgementProof {
+                            range_start: committed.range_start,
+                            range_end: committed.range_end,
+                            output_sha256: verified_output_digest,
+                            status: match verified_status {
+                                RemoteExecutionTerminalStatus::Exited(exit_code) => {
+                                    codex_exec_server::RecoveredExecutionStatus::Exited(exit_code)
+                                }
+                                RemoteExecutionTerminalStatus::Terminated => {
+                                    codex_exec_server::RecoveredExecutionStatus::Terminated
+                                }
+                            },
+                        }),
+                )
+                .await
+                .map_err(|error| {
+                    CodexErr::Fatal(format!(
+                        "failed to retire terminal background session {}: {error}",
+                        committed.session_id
+                    ))
+                })?;
+            self.services
+                .unified_exec_manager
+                .acknowledge_output_receipt(&committed.receipt_turn_id, &committed.receipt_call_id)
+                .await;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn restore_committed_background_sessions(self: &Arc<Self>) -> CodexResult<()> {
+        self.finalize_background_session_receipts().await?;
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(());
+        };
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let mut latest = HashMap::<i32, RemoteExecutionSessionCommitted>::new();
+        for item in &history.items {
+            if let RolloutItem::RemoteExecutionSessionCommitted(committed) = item
+                && committed.thread_id == self.thread_id.to_string()
+            {
+                latest.insert(committed.session_id, committed.clone());
+            }
+        }
+        for committed in latest.into_values().filter(|commit| !commit.terminal) {
+            let prepared = history
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::RemoteExecutionSessionPrepared(prepared)
+                        if prepared.thread_id == committed.thread_id
+                            && prepared.session_id == committed.session_id
+                            && prepared.exec_call_id == committed.exec_call_id
+                            && prepared.receipt_turn_id == committed.receipt_turn_id
+                            && prepared.receipt_call_id == committed.receipt_call_id
+                            && prepared.attempt_generation == committed.attempt_generation =>
+                    {
+                        Some(prepared)
+                    }
+                    _ => None,
+                })
+                .last()
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "committed background session {} lacks adoption metadata",
+                        committed.session_id
+                    ))
+                })?;
+            let environment = self
+                .services
+                .turn_environments
+                .environment_manager()
+                .get_environment(&prepared.environment_id)
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "background session {} environment {} is unavailable",
+                        committed.session_id, prepared.environment_id
+                    ))
+                })?;
+            if !environment.supports_durable_remote_exec_recovery() {
+                return Err(CodexErr::Fatal(format!(
+                    "background session {} environment {} does not support durable recovery",
+                    committed.session_id, prepared.environment_id
+                )));
+            }
+            let cwd = PathUri::parse(&prepared.cwd).map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "background session {} cwd is invalid: {error}",
+                    committed.session_id
+                ))
+            })?;
+            self.services
+                .unified_exec_manager
+                .adopt_background_process(
+                    environment.as_ref(),
+                    codex_exec_server::AdoptionRequest {
+                        identity: codex_exec_server::ExecutionIdentity {
+                            thread_id: committed.thread_id.clone(),
+                            turn_id: committed.exec_turn_id.clone(),
+                            call_id: committed.exec_call_id.clone(),
+                            attempt_generation: committed.attempt_generation,
+                        },
+                        expected_command_digest: committed.command_digest.clone(),
+                        original_session_id: Some(committed.session_id),
+                        committed_output_cursor: committed.range_end,
+                        tty: prepared.tty,
+                    },
+                    self,
+                    committed.exec_call_id,
+                    cwd,
+                    prepared.hook_command.clone(),
+                )
+                .await
+                .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn repair_pending_empty_polls_before_reconstruction(
+        self: &Arc<Self>,
+        pending_writes: &[codex_exec_server::PendingWriteInteraction],
+        initial_history: &mut InitialHistory,
+    ) -> CodexResult<()> {
+        for pending in pending_writes {
+            if pending.protocol_evidence
+                != codex_exec_server::RemoteExecutionProtocolEvidence::V2Proven
+            {
+                return Err(CodexErr::Fatal(format!(
+                    "pending write {} lacks durable-v2 protocol evidence",
+                    pending.call_id
+                )));
+            }
+        }
+        if self.live_thread().is_none() {
+            if pending_writes.is_empty() {
+                return Ok(());
+            }
+            return Err(CodexErr::Fatal(
+                "pending remote write requires live rollout persistence".to_string(),
+            ));
+        }
+
+        // First close any crash gap where a FunctionCallOutput was durable but
+        // its receipt commit was not. Then recover Prepared receipts by
+        // appending their exact stored model-facing output; never poll those
+        // sessions again.
+        self.finalize_background_session_receipts().await?;
+        let mut polls_requiring_adoption = Vec::new();
+        let mut nonempty_writes = Vec::new();
+        for pending in pending_writes {
+            if !pending.input_is_empty {
+                nonempty_writes.push(pending.clone());
+                continue;
+            }
+            let live_thread = self
+                .live_thread_for_persistence("repair prepared remote empty poll")
+                .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+            let history = live_thread
+                .load_history(/*include_archived*/ true)
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+            let repair =
+                prepared_empty_poll_repair(&history.items, &self.thread_id.to_string(), pending)?;
+            let output_to_append = match repair {
+                PreparedEmptyPollRepair::Missing => {
+                    polls_requiring_adoption.push(pending.clone());
+                    continue;
+                }
+                PreparedEmptyPollRepair::Ready { output_to_append } => output_to_append,
+            };
+            if let Some(output) = output_to_append {
+                live_thread
+                    .append_items(std::slice::from_ref(&output))
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+                live_thread
+                    .flush()
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+            }
+            self.commit_prepared_remote_session_after_output(&pending.turn_id, &pending.call_id)
+                .await?;
+        }
+
+        for pending in &nonempty_writes {
+            self.repair_pending_nonempty_write_before_reconstruction(pending)
+                .await?;
+        }
+
+        // Adopt every still-live background session from its latest committed
+        // cursor before polling any receipt that crashed before Prepared was
+        // durable. This restores the original integer session identity without
+        // relaunching the command.
+        self.restore_committed_background_sessions().await?;
+
+        for pending in &polls_requiring_adoption {
+            let live_thread = self
+                .live_thread_for_persistence("repair remote empty poll")
+                .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+            let history = live_thread
+                .load_history(/*include_archived*/ true)
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+            if !matches!(
+                prepared_empty_poll_repair(&history.items, &self.thread_id.to_string(), pending,)?,
+                PreparedEmptyPollRepair::Missing
+            ) {
+                return Err(CodexErr::Fatal(format!(
+                    "pending empty poll {} changed recovery state after adoption",
+                    pending.call_id
+                )));
+            }
+            let response = self
+                .services
+                .unified_exec_manager
+                .write_stdin(crate::unified_exec::WriteStdinRequest {
+                    process_id: pending.session_id,
+                    input: "",
+                    yield_time_ms: crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS,
+                    max_output_tokens: None,
+                    truncation_policy: TruncationPolicy::Tokens(10_000),
+                    interaction_event: Some(crate::unified_exec::WriteStdinInteractionEvent {
+                        session: self,
+                        turn: None,
+                        receipt_turn_id: &pending.turn_id,
+                        call_id: &pending.call_id,
+                    }),
+                })
+                .await
+                .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+            let item = successful_remote_poll_output(pending, response.response_text());
+            let persist_result = async {
+                live_thread
+                    .append_items(std::slice::from_ref(&item))
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+                live_thread
+                    .flush()
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))
+            }
+            .await;
+            if let Err(error) = persist_result {
+                self.services
+                    .unified_exec_manager
+                    .freeze_output_receipt(&pending.turn_id, &pending.call_id)
+                    .await;
+                return Err(error);
+            }
+            if let Err(error) = self
+                .commit_prepared_remote_session_after_output(&pending.turn_id, &pending.call_id)
+                .await
+            {
+                self.services
+                    .unified_exec_manager
+                    .freeze_output_receipt(&pending.turn_id, &pending.call_id)
+                    .await;
+                return Err(error);
+            }
+        }
+
+        // Session history normalization runs after this method. Reload the
+        // repaired rollout so it sees the truthful output instead of inserting
+        // a synthetic "aborted" result for the unmatched write call.
+        let live_thread = self
+            .live_thread_for_persistence("reload repaired remote poll history")
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        let repaired = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let InitialHistory::Resumed(resumed) = initial_history else {
+            return Err(CodexErr::Fatal(
+                "remote empty-poll repair requires resumed history".to_string(),
+            ));
+        };
+        resumed.history = Arc::new(repaired.items);
+        *initial_history = self
+            .dynamic_tool_argument_policy
+            .redact_serializable(initial_history)
+            .map_err(|_| {
+                CodexErr::Fatal(
+                    "failed to safely project repaired history for protected tool arguments"
+                        .to_string(),
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn repair_pending_nonempty_write_before_reconstruction(
+        self: &Arc<Self>,
+        pending: &codex_exec_server::PendingWriteInteraction,
+    ) -> CodexResult<()> {
+        let live_thread = self
+            .live_thread_for_persistence("repair pending nonempty remote write")
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        if pending_nonempty_write_already_recovered(
+            &history.items,
+            &self.thread_id.to_string(),
+            pending,
+        )? {
+            return Ok(());
+        }
+        let (committed, prepared) = latest_committed_background_session(
+            &history.items,
+            &self.thread_id.to_string(),
+            pending.session_id,
+        )?;
+        let environment = self
+            .services
+            .turn_environments
+            .environment_manager()
+            .get_environment(&prepared.environment_id)
+            .ok_or_else(|| {
+                CodexErr::Fatal(format!(
+                    "background session {} environment {} is unavailable",
+                    pending.session_id, prepared.environment_id
+                ))
+            })?;
+        if !environment.supports_durable_remote_exec_recovery() {
+            return Err(CodexErr::Fatal(format!(
+                "background session {} environment {} does not support durable recovery",
+                pending.session_id, prepared.environment_id
+            )));
+        }
+        let request = codex_exec_server::ReconciliationRequest {
+            thread_id: prepared.thread_id.clone(),
+            incomplete_executions: vec![codex_exec_server::IncompleteExecution {
+                turn_id: prepared.exec_turn_id.clone(),
+                call_id: prepared.exec_call_id.clone(),
+                attempt_generation: prepared.attempt_generation,
+                expected_command_digest: Some(prepared.command_digest.clone()),
+                expected_session_id: Some(prepared.session_id),
+                expected_tty: Some(prepared.tty),
+                protocol_evidence: codex_exec_server::RemoteExecutionProtocolEvidence::V2Proven,
+            }],
+            pending_writes: Vec::new(),
+        };
+        let mut recovered = environment
+            .get_exec_backend()
+            .reconcile(request.clone())
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to reconcile background session {} for nonempty write recovery: {error}",
+                    pending.session_id
+                ))
+            })?;
+        let [execution] = recovered.as_mut_slice() else {
+            return Err(CodexErr::Fatal(format!(
+                "background session {} did not resolve to one exact descriptor",
+                pending.session_id
+            )));
+        };
+        match execution.status {
+            codex_exec_server::RecoveredExecutionStatus::Running => {
+                let cwd = PathUri::parse(&prepared.cwd).map_err(|error| {
+                    CodexErr::Fatal(format!(
+                        "background session {} cwd is invalid: {error}",
+                        pending.session_id
+                    ))
+                })?;
+                self.services
+                    .unified_exec_manager
+                    .adopt_background_process(
+                        environment.as_ref(),
+                        codex_exec_server::AdoptionRequest {
+                            identity: codex_exec_server::ExecutionIdentity {
+                                thread_id: prepared.thread_id.clone(),
+                                turn_id: prepared.exec_turn_id.clone(),
+                                call_id: prepared.exec_call_id.clone(),
+                                attempt_generation: prepared.attempt_generation,
+                            },
+                            expected_command_digest: prepared.command_digest.clone(),
+                            original_session_id: Some(prepared.session_id),
+                            committed_output_cursor: committed.range_end,
+                            tty: prepared.tty,
+                        },
+                        self,
+                        prepared.exec_call_id.clone(),
+                        cwd,
+                        prepared.hook_command.clone(),
+                    )
+                    .await
+                    .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+                if !self
+                    .services
+                    .unified_exec_manager
+                    .terminate_process(prepared.session_id)
+                    .await
+                {
+                    return Err(CodexErr::Fatal(format!(
+                        "background session {} termination was not confirmed",
+                        pending.session_id
+                    )));
+                }
+            }
+            codex_exec_server::RecoveredExecutionStatus::Exited(_)
+            | codex_exec_server::RecoveredExecutionStatus::Terminated => {}
+            _ => {
+                return Err(CodexErr::Fatal(format!(
+                    "background session {} is not safely recoverable for nonempty write",
+                    pending.session_id
+                )));
+            }
+        }
+
+        let mut verified = environment
+            .get_exec_backend()
+            .reconcile(request)
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to verify terminated background session {}: {error}",
+                    pending.session_id
+                ))
+            })?;
+        let [execution] = verified.as_mut_slice() else {
+            return Err(CodexErr::Fatal(format!(
+                "terminated background session {} did not resolve to one exact descriptor",
+                pending.session_id
+            )));
+        };
+        let observed_exit_code = match execution.status {
+            codex_exec_server::RecoveredExecutionStatus::Exited(exit_code) => exit_code,
+            codex_exec_server::RecoveredExecutionStatus::Terminated => 143,
+            _ => {
+                return Err(CodexErr::Fatal(format!(
+                    "background session {} lacks terminal proof after nonempty write recovery",
+                    pending.session_id
+                )));
+            }
+        };
+        if execution.command_digest.as_deref() != Some(prepared.command_digest.as_str())
+            || execution.session_id != Some(prepared.session_id)
+            || !execution.terminal_verified_dead
+            || execution.committed_output_cursor < committed.range_end
+        {
+            return Err(CodexErr::Fatal(format!(
+                "background session {} terminal proof conflicts with durable authority",
+                pending.session_id
+            )));
+        }
+        let range_start = committed.range_end;
+        let range_end = execution.committed_output_cursor;
+        let (token, output_digest, terminal_status) = self
+            .verify_terminal_remote_receipt(prepared, range_start, range_end, observed_exit_code)
+            .await?;
+        let start = usize::try_from(range_start).map_err(|_| {
+            CodexErr::Fatal(format!(
+                "background session {} range start is too large",
+                pending.session_id
+            ))
+        })?;
+        let end = usize::try_from(range_end).map_err(|_| {
+            CodexErr::Fatal(format!(
+                "background session {} range end is too large",
+                pending.session_id
+            ))
+        })?;
+        let suffix = execution.output.get(start..end).ok_or_else(|| {
+            CodexErr::Fatal(format!(
+                "background session {} lacks terminal output suffix",
+                pending.session_id
+            ))
+        })?;
+        let terminal = match terminal_status {
+            RemoteExecutionTerminalStatus::Exited(exit_code) => {
+                format!(
+                    "Process exited with code {exit_code} during SSH lifecycle recovery; stdin delivery is unknown"
+                )
+            }
+            RemoteExecutionTerminalStatus::Terminated => {
+                "Process was terminated during SSH lifecycle recovery; stdin delivery is unknown"
+                    .to_string()
+            }
+        };
+        let receipt_output_text =
+            format!("{terminal}\nOutput:\n{}", String::from_utf8_lossy(suffix));
+        self.persist_remote_execution_delivery_unknown_prepared(
+            pending.session_id,
+            &pending.turn_id,
+            &pending.call_id,
+            range_start,
+            range_end,
+            token,
+            output_digest,
+            terminal_status,
+            &receipt_output_text,
+        )
+        .await?;
+        let output = delivery_unknown_remote_write_output(pending, receipt_output_text.clone());
+        let live_thread = self
+            .live_thread_for_persistence("append pending nonempty write recovery output")
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let matching_outputs = history
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. })
+                        if call_id == &pending.call_id
+                )
+            })
+            .collect::<Vec<_>>();
+        if matching_outputs
+            .iter()
+            .any(|item| !remote_poll_output_matches(item, pending, &receipt_output_text))
+        {
+            return Err(CodexErr::Fatal(format!(
+                "pending nonempty write {} has conflicting durable output",
+                pending.call_id
+            )));
+        }
+        if matching_outputs.is_empty() {
+            live_thread
+                .append_items(std::slice::from_ref(&output))
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+            live_thread
+                .flush()
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        }
+        self.commit_prepared_remote_session_after_output(&pending.turn_id, &pending.call_id)
+            .await?;
+        self.finalize_background_session_receipts().await
+    }
+
+    pub(crate) async fn persist_remote_execution_launch_intent(
+        &self,
+        prepared: &codex_exec_server::PreparedExecution,
+    ) -> CodexResult<()> {
+        let identity = prepared
+            .params()
+            .execution_identity
+            .as_ref()
+            .ok_or_else(|| {
+                CodexErr::Fatal(
+                    "remote prepared execution lacks structured execution identity".to_string(),
+                )
+            })?;
+        if identity.thread_id != self.thread_id.to_string() {
+            return Err(CodexErr::Fatal(
+                "remote prepared execution thread identity does not match the active session"
+                    .to_string(),
+            ));
+        }
+        let original_session_id = prepared.original_session_id().ok_or_else(|| {
+            CodexErr::Fatal(
+                "remote prepared execution lacks a valid integer session identity".to_string(),
+            )
+        })?;
+        let live_thread = self.live_thread().ok_or_else(|| {
+            CodexErr::Fatal(
+                "remote prepared execution requires live rollout persistence".to_string(),
+            )
+        })?;
+        let expected = RemoteExecutionLaunchIntent {
+            thread_id: identity.thread_id.clone(),
+            turn_id: identity.turn_id.clone(),
+            call_id: identity.call_id.clone(),
+            attempt_generation: identity.attempt_generation,
+            command_digest: prepared.command_digest().to_string(),
+            original_session_id,
+            tty: prepared.tty(),
+        };
+        if expected.attempt_generation > 1 {
+            return Err(CodexErr::Fatal(format!(
+                "unsupported remote execution generation {}",
+                expected.attempt_generation
+            )));
+        }
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let mut valid_marker_count = 0usize;
+        let mut exact_call_seen = false;
+        let mut generation_zero_intent_count = 0usize;
+        for item in &history.items {
+            match item {
+                RolloutItem::RemoteExecutionProtocolMarker(marker)
+                    if marker.turn_id == expected.turn_id =>
+                {
+                    let valid = marker.thread_id == expected.thread_id
+                        && marker.protocol_version == 2
+                        && marker.identity_schema == "thread-turn-call-generation"
+                        && marker.descriptor_before_go;
+                    if !valid {
+                        return Err(CodexErr::Fatal(format!(
+                            "invalid remote execution protocol marker for turn {}",
+                            expected.turn_id
+                        )));
+                    }
+                    valid_marker_count += 1;
+                }
+                RolloutItem::ResponseItem(
+                    response @ ResponseItem::FunctionCall { call_id, name, .. },
+                ) if call_id == &expected.call_id => {
+                    if exact_call_seen
+                        || name != "exec_command"
+                        || response.turn_id() != Some(expected.turn_id.as_str())
+                        || valid_marker_count != 1
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote execution call {} lacks exact marker/call ordering",
+                            expected.call_id
+                        )));
+                    }
+                    exact_call_seen = true;
+                }
+                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. })
+                    if call_id == &expected.call_id =>
+                {
+                    return Err(CodexErr::Fatal(format!(
+                        "remote execution call {} already has an output",
+                        expected.call_id
+                    )));
+                }
+                RolloutItem::RemoteExecutionLaunchIntent(intent)
+                    if intent.turn_id == expected.turn_id
+                        && intent.call_id == expected.call_id
+                        && intent.attempt_generation == expected.attempt_generation =>
+                {
+                    return Err(CodexErr::Fatal(format!(
+                        "remote execution launch intent already exists for call {} generation {}",
+                        expected.call_id, expected.attempt_generation
+                    )));
+                }
+                RolloutItem::RemoteExecutionLaunchIntent(intent)
+                    if expected.attempt_generation == 1
+                        && intent.thread_id == expected.thread_id
+                        && intent.turn_id == expected.turn_id
+                        && intent.call_id == expected.call_id
+                        && intent.attempt_generation == 0 =>
+                {
+                    generation_zero_intent_count += 1;
+                }
+                _ => {}
+            }
+        }
+        if valid_marker_count != 1 || !exact_call_seen {
+            return Err(CodexErr::Fatal(format!(
+                "remote execution call {} is not durably ordered after one protocol marker",
+                expected.call_id
+            )));
+        }
+        if expected.attempt_generation == 1 && generation_zero_intent_count != 1 {
+            return Err(CodexErr::Fatal(format!(
+                "remote execution generation 1 for call {} lacks exactly one generation-0 intent",
+                expected.call_id
+            )));
+        }
+        let intent = RolloutItem::RemoteExecutionLaunchIntent(expected);
+        live_thread
+            .append_items(&[intent])
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn persist_remote_execution_session_prepared(
+        &self,
+        turn_id: &str,
+        call_id: &str,
+        session_id: i32,
+        tty: bool,
+        output_mode: &str,
+        environment_id: &str,
+        cwd: &str,
+        hook_command: &str,
+        range_start: u64,
+        range_end: u64,
+        receipt_output_text: &str,
+    ) -> CodexResult<()> {
+        let live_thread = self.live_thread().ok_or_else(|| {
+            CodexErr::Fatal(
+                "background remote execution requires live rollout persistence".to_string(),
+            )
+        })?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let intents = history
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::RemoteExecutionLaunchIntent(intent)
+                    if intent.thread_id == self.thread_id.to_string()
+                        && intent.turn_id == turn_id
+                        && intent.call_id == call_id =>
+                {
+                    Some(intent)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if intents.len() != 1 {
+            return Err(CodexErr::Fatal(format!(
+                "background session requires one exact launch intent for call {call_id}"
+            )));
+        }
+        let intent = intents[0];
+        if range_start != 0 || range_end < range_start {
+            return Err(CodexErr::Fatal(format!(
+                "background session {session_id} lacks one exact initial backend range"
+            )));
+        }
+        let prepared = RemoteExecutionSessionPrepared {
+            thread_id: intent.thread_id.clone(),
+            exec_turn_id: intent.turn_id.clone(),
+            exec_call_id: intent.call_id.clone(),
+            receipt_turn_id: turn_id.to_string(),
+            receipt_call_id: call_id.to_string(),
+            receipt_kind: RemoteExecutionReceiptKind::InitialExec,
+            attempt_generation: intent.attempt_generation,
+            session_id,
+            command_digest: intent.command_digest.clone(),
+            tty,
+            output_mode: output_mode.to_string(),
+            environment_id: environment_id.to_string(),
+            cwd: cwd.to_string(),
+            hook_command: hook_command.to_string(),
+            range_start,
+            range_end,
+            receipt_output_digest: remote_receipt_output_digest(receipt_output_text),
+            receipt_output_text: receipt_output_text.to_string(),
+            terminal_acknowledgement_token: None,
+            terminal_output_digest: None,
+            terminal_status: None,
+            terminal_candidate: false,
+        };
+        let conflicts = history.items.iter().filter(|item| {
+            matches!(
+                item,
+                RolloutItem::RemoteExecutionSessionPrepared(existing)
+                    if existing.thread_id == prepared.thread_id
+                        && existing.exec_turn_id == prepared.exec_turn_id
+                        && existing.exec_call_id == prepared.exec_call_id
+                        && existing != &prepared
+            )
+        });
+        if conflicts.count() != 0 {
+            return Err(CodexErr::Fatal(format!(
+                "conflicting background session preparation for call {call_id}"
+            )));
+        }
+        let already_present = history.items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::RemoteExecutionSessionPrepared(existing) if existing == &prepared
+            )
+        });
+        if !already_present {
+            live_thread
+                .append_items(&[RolloutItem::RemoteExecutionSessionPrepared(prepared)])
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        }
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))
+    }
+
+    async fn verify_terminal_remote_receipt(
+        &self,
+        prepared: &RemoteExecutionSessionPrepared,
+        range_start: u64,
+        range_end: u64,
+        observed_exit_code: i32,
+    ) -> CodexResult<(String, String, RemoteExecutionTerminalStatus)> {
+        let environment = self
+            .services
+            .turn_environments
+            .environment_manager()
+            .get_environment(&prepared.environment_id)
+            .ok_or_else(|| {
+                CodexErr::Fatal(format!(
+                    "terminal background session {} environment {} is unavailable",
+                    prepared.session_id, prepared.environment_id
+                ))
+            })?;
+        if !environment.supports_durable_remote_exec_recovery() {
+            return Err(CodexErr::Fatal(format!(
+                "terminal background session {} environment {} does not support durable recovery",
+                prepared.session_id, prepared.environment_id
+            )));
+        }
+        let expected_identity = codex_exec_server::ExecutionIdentity {
+            thread_id: prepared.thread_id.clone(),
+            turn_id: prepared.exec_turn_id.clone(),
+            call_id: prepared.exec_call_id.clone(),
+            attempt_generation: prepared.attempt_generation,
+        };
+        let recovered = environment
+            .get_exec_backend()
+            .reconcile(codex_exec_server::ReconciliationRequest {
+                thread_id: prepared.thread_id.clone(),
+                incomplete_executions: vec![codex_exec_server::IncompleteExecution {
+                    turn_id: prepared.exec_turn_id.clone(),
+                    call_id: prepared.exec_call_id.clone(),
+                    attempt_generation: prepared.attempt_generation,
+                    expected_command_digest: Some(prepared.command_digest.clone()),
+                    expected_session_id: Some(prepared.session_id),
+                    expected_tty: Some(prepared.tty),
+                    protocol_evidence: codex_exec_server::RemoteExecutionProtocolEvidence::V2Proven,
+                }],
+                pending_writes: Vec::new(),
+            })
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to verify terminal background session {}: {error}",
+                    prepared.session_id
+                ))
+            })?;
+        let [execution] = recovered.as_slice() else {
+            return Err(CodexErr::Fatal(format!(
+                "terminal background session {} did not resolve to one exact descriptor",
+                prepared.session_id
+            )));
+        };
+        let terminal_status = match &execution.status {
+            codex_exec_server::RecoveredExecutionStatus::Exited(actual)
+                if *actual == observed_exit_code =>
+            {
+                Some(RemoteExecutionTerminalStatus::Exited(*actual))
+            }
+            codex_exec_server::RecoveredExecutionStatus::Terminated
+                if observed_exit_code == 143 =>
+            {
+                Some(RemoteExecutionTerminalStatus::Terminated)
+            }
+            _ => None,
+        };
+        if execution.identity != expected_identity
+            || execution.command_digest.as_deref() != Some(prepared.command_digest.as_str())
+            || execution.session_id != Some(prepared.session_id)
+            || range_start > range_end
+            || execution.committed_output_cursor != range_end
+            || execution.output.len() as u64 != range_end
+            || !execution.terminal_verified_dead
+            || execution.delivery_unknown
+            || terminal_status.is_none()
+        {
+            return Err(CodexErr::Fatal(format!(
+                "terminal background session {} lacks exact durable death and cursor proof",
+                prepared.session_id
+            )));
+        }
+        let token = execution.acknowledgement.persistence_token();
+        if token.is_empty() {
+            return Err(CodexErr::Fatal(format!(
+                "terminal background session {} lacks acknowledgement authority",
+                prepared.session_id
+            )));
+        }
+        let start = usize::try_from(range_start).map_err(|_| {
+            CodexErr::Fatal(format!(
+                "terminal background session {} range start is too large",
+                prepared.session_id
+            ))
+        })?;
+        let end = usize::try_from(range_end).map_err(|_| {
+            CodexErr::Fatal(format!(
+                "terminal background session {} range end is too large",
+                prepared.session_id
+            ))
+        })?;
+        let suffix = execution.output.get(start..end).ok_or_else(|| {
+            CodexErr::Fatal(format!(
+                "terminal background session {} lacks the exact authoritative suffix",
+                prepared.session_id
+            ))
+        })?;
+        Ok((
+            token.to_string(),
+            remote_receipt_bytes_digest(suffix),
+            terminal_status.expect("terminal status checked above"),
+        ))
+    }
+
+    pub(crate) async fn persist_remote_execution_poll_prepared(
+        &self,
+        session_id: i32,
+        receipt_turn_id: &str,
+        receipt_call_id: &str,
+        observed_range: Option<(u64, u64)>,
+        terminal: bool,
+        terminal_exit_code: Option<i32>,
+        receipt_output_text: &str,
+    ) -> CodexResult<bool> {
+        let live_thread = self
+            .live_thread_for_persistence("prepare remote execution poll")
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let committed = history
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::RemoteExecutionSessionCommitted(committed)
+                    if committed.thread_id == self.thread_id.to_string()
+                        && committed.session_id == session_id =>
+                {
+                    Some(committed)
+                }
+                _ => None,
+            })
+            .last();
+        let Some(committed) = committed else {
+            // Native-local sessions do not participate in remote receipt recovery.
+            return Ok(false);
+        };
+        if committed.terminal {
+            return Err(CodexErr::Fatal(format!(
+                "empty poll targets retired background session {session_id}"
+            )));
+        }
+        let base = history
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                RolloutItem::RemoteExecutionSessionPrepared(prepared)
+                    if prepared.thread_id == committed.thread_id
+                        && prepared.session_id == session_id
+                        && prepared.exec_call_id == committed.exec_call_id
+                        && prepared.attempt_generation == committed.attempt_generation =>
+                {
+                    Some(prepared)
+                }
+                _ => None,
+            })
+            .last()
+            .ok_or_else(|| {
+                CodexErr::Fatal(format!(
+                    "committed background session {session_id} lacks preparation metadata"
+                ))
+            })?;
+        let range_start = committed.range_end;
+        let range_end = match observed_range {
+            Some((start, end)) if start == range_start && end >= start => end,
+            None if receipt_output_text.is_empty() => range_start,
+            _ => {
+                return Err(CodexErr::Fatal(format!(
+                    "background poll {receipt_call_id} lacks one exact contiguous backend range"
+                )));
+            }
+        };
+        let (terminal_acknowledgement_token, terminal_output_digest, terminal_status) = if terminal
+        {
+            let observed_exit_code = terminal_exit_code.ok_or_else(|| {
+                CodexErr::Fatal(format!(
+                    "terminal background poll {receipt_call_id} lacks its rendered exit code"
+                ))
+            })?;
+            let (token, output_digest, status) = self
+                .verify_terminal_remote_receipt(base, range_start, range_end, observed_exit_code)
+                .await?;
+            (Some(token), Some(output_digest), Some(status))
+        } else {
+            (None, None, None)
+        };
+        let prepared = RemoteExecutionSessionPrepared {
+            receipt_turn_id: receipt_turn_id.to_string(),
+            receipt_call_id: receipt_call_id.to_string(),
+            receipt_kind: RemoteExecutionReceiptKind::EmptyPoll,
+            range_start,
+            range_end,
+            receipt_output_digest: remote_receipt_output_digest(receipt_output_text),
+            receipt_output_text: receipt_output_text.to_string(),
+            terminal_acknowledgement_token,
+            terminal_output_digest,
+            terminal_status,
+            terminal_candidate: terminal,
+            ..base.clone()
+        };
+        if history.items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::RemoteExecutionSessionPrepared(existing)
+                    if existing.receipt_turn_id == receipt_turn_id
+                        && existing.receipt_call_id == receipt_call_id
+            )
+        }) {
+            return Err(CodexErr::Fatal(format!(
+                "duplicate background poll preparation {receipt_call_id}"
+            )));
+        }
+        live_thread
+            .append_items(&[RolloutItem::RemoteExecutionSessionPrepared(prepared)])
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        Ok(true)
+    }
+
+    async fn persist_remote_execution_delivery_unknown_prepared(
+        &self,
+        session_id: i32,
+        receipt_turn_id: &str,
+        receipt_call_id: &str,
+        range_start: u64,
+        range_end: u64,
+        terminal_acknowledgement_token: String,
+        terminal_output_digest: String,
+        terminal_status: RemoteExecutionTerminalStatus,
+        receipt_output_text: &str,
+    ) -> CodexResult<()> {
+        let live_thread = self
+            .live_thread_for_persistence("prepare delivery-unknown remote write")
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let (committed, base) = latest_committed_background_session(
+            &history.items,
+            &self.thread_id.to_string(),
+            session_id,
+        )?;
+        if committed.range_end != range_start || range_end < range_start {
+            return Err(CodexErr::Fatal(format!(
+                "delivery-unknown write {receipt_call_id} lacks one exact terminal backend range"
+            )));
+        }
+        let prepared = RemoteExecutionSessionPrepared {
+            receipt_turn_id: receipt_turn_id.to_string(),
+            receipt_call_id: receipt_call_id.to_string(),
+            receipt_kind: RemoteExecutionReceiptKind::DeliveryUnknownWrite,
+            range_start,
+            range_end,
+            receipt_output_digest: remote_receipt_output_digest(receipt_output_text),
+            receipt_output_text: receipt_output_text.to_string(),
+            terminal_acknowledgement_token: Some(terminal_acknowledgement_token),
+            terminal_output_digest: Some(terminal_output_digest),
+            terminal_status: Some(terminal_status),
+            terminal_candidate: true,
+            ..base.clone()
+        };
+        let existing = history.items.iter().filter_map(|item| match item {
+            RolloutItem::RemoteExecutionSessionPrepared(existing)
+                if existing.receipt_turn_id == receipt_turn_id
+                    && existing.receipt_call_id == receipt_call_id =>
+            {
+                Some(existing)
+            }
+            _ => None,
+        });
+        let mut found_exact = false;
+        for existing in existing {
+            if existing == &prepared {
+                found_exact = true;
+            } else {
+                return Err(CodexErr::Fatal(format!(
+                    "duplicate delivery-unknown write preparation {receipt_call_id}"
+                )));
+            }
+        }
+        if !found_exact {
+            live_thread
+                .append_items(&[RolloutItem::RemoteExecutionSessionPrepared(prepared)])
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+            live_thread
+                .flush()
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
@@ -3009,6 +4963,124 @@ impl Session {
         }
         self.persist_rollout_response_items(items).await;
         self.send_raw_response_items(turn_context, items).await;
+    }
+
+    /// Persists tool outputs with an explicit durability barrier, then activates
+    /// any matching prepared background-session receipt.
+    pub(crate) async fn record_tool_output_items_durably(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+    ) -> CodexResult<()> {
+        let items = self.prepare_conversation_items_for_history(turn_context, items);
+        let items = items.as_ref();
+        let receipt_ids = items
+            .iter()
+            .filter_map(|item| match item {
+                ResponseItem::FunctionCallOutput { call_id, .. } => item
+                    .turn_id()
+                    .map(|turn_id| (turn_id.to_string(), call_id.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(live_thread) = self.live_thread() {
+            let rollout_items = items
+                .iter()
+                .cloned()
+                .map(RolloutItem::ResponseItem)
+                .collect::<Vec<_>>();
+            let persist_result = async {
+                live_thread
+                    .append_items(&rollout_items)
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+                live_thread
+                    .flush()
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))
+            }
+            .await;
+            if let Err(error) = persist_result {
+                for (turn_id, call_id) in &receipt_ids {
+                    self.services
+                        .unified_exec_manager
+                        .freeze_output_receipt(turn_id, call_id)
+                        .await;
+                }
+                return Err(error);
+            }
+        } else {
+            freeze_pending_remote_receipts_without_live_rollout(
+                &self.services.unified_exec_manager,
+                &receipt_ids,
+            )
+            .await?;
+            self.persist_rollout_response_items(items).await;
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.current_time_reminder.note_recorded_items(items);
+            state.record_items(
+                items.iter(),
+                turn_context.model_info.truncation_policy.into(),
+            );
+        }
+        self.send_raw_response_items(turn_context, items).await;
+        for (receipt_turn_id, receipt_call_id) in &receipt_ids {
+            if let Err(error) = self
+                .commit_prepared_remote_session_after_output(receipt_turn_id, receipt_call_id)
+                .await
+            {
+                self.services
+                    .unified_exec_manager
+                    .freeze_output_receipt(receipt_turn_id, receipt_call_id)
+                    .await;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn commit_prepared_remote_session_after_output(
+        &self,
+        receipt_turn_id: &str,
+        receipt_call_id: &str,
+    ) -> CodexResult<()> {
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(());
+        };
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let prepared_count = history
+            .items
+            .iter()
+            .filter(|item| match item {
+                RolloutItem::RemoteExecutionSessionPrepared(prepared)
+                    if prepared.thread_id == self.thread_id.to_string()
+                        && prepared.receipt_turn_id == receipt_turn_id
+                        && prepared.receipt_call_id == receipt_call_id =>
+                {
+                    true
+                }
+                _ => false,
+            })
+            .count();
+        if prepared_count == 0 {
+            return Ok(());
+        }
+        if prepared_count != 1 {
+            return Err(CodexErr::Fatal(format!(
+                "duplicate prepared background sessions for call {receipt_call_id}"
+            )));
+        }
+        self.finalize_background_session_receipts().await?;
+        self.services
+            .unified_exec_manager
+            .acknowledge_output_receipt(receipt_turn_id, receipt_call_id)
+            .await;
+        Ok(())
     }
 
     pub(crate) async fn record_step_world_state_if_changed(

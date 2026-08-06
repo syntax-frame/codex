@@ -1,4 +1,28 @@
 use super::*;
+
+#[test]
+fn remote_launch_intent_is_durable_before_prepared_backend_start() {
+    let source = include_str!("process_manager.rs");
+    let method = source
+        .split("pub(crate) async fn open_session_with_prepared_exec_env")
+        .nth(1)
+        .expect("prepared execution method")
+        .split("// TODO(anp)")
+        .next()
+        .expect("remote branch");
+    let prepare = method
+        .find("PreparedExecution::new")
+        .expect("immutable preparation");
+    let persist = method
+        .find("persist_remote_execution_launch_intent")
+        .expect("durable launch intent");
+    let launch = method
+        .find(".start_prepared(prepared)")
+        .expect("exact prepared launch");
+    assert!(prepare < persist);
+    assert!(persist < launch);
+    assert!(!method[persist..launch].contains("exec_server_params_for_request"));
+}
 use crate::unified_exec::clamp_yield_time;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use pretty_assertions::assert_eq;
@@ -67,6 +91,7 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
         HashMap::from([
             ("PATH".to_string(), "/sandbox-path".to_string()),
             ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
+            ("CODEX_EXEC_TURN_ID".to_string(), "turn-1".to_string()),
             (
                 CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
                 "current-profile".to_string(),
@@ -119,12 +144,15 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         allow_local_binding: false,
     };
     let mut request = ExecRequest {
+        attempt_generation: 0,
         command: vec!["bash".to_string(), "-lc".to_string(), "true".to_string()],
         cwd: cwd.clone().into(),
         env: HashMap::from([
             ("HOME".to_string(), "/client-home".to_string()),
             ("PATH".to_string(), "/sandbox-path".to_string()),
             ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
+            ("CODEX_EXEC_TURN_ID".to_string(), "turn-1".to_string()),
+            ("CODEX_EXEC_CALL_ID".to_string(), "call-1".to_string()),
             (
                 "HTTP_PROXY".to_string(),
                 "http://127.0.0.1:43123".to_string(),
@@ -181,6 +209,15 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true);
 
     assert_eq!(params.process_id.as_str(), "123");
+    assert_eq!(
+        params.execution_identity,
+        Some(codex_exec_server::ExecutionIdentity {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            call_id: "call-1".to_string(),
+            attempt_generation: 0,
+        })
+    );
     assert_eq!(params.cwd, request.cwd);
     assert!(params.enforce_managed_network);
     assert_eq!(params.managed_network, Some(managed_network));
@@ -190,6 +227,8 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         HashMap::from([
             ("PATH".to_string(), "/sandbox-path".to_string()),
             ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
+            ("CODEX_EXEC_TURN_ID".to_string(), "turn-1".to_string()),
+            ("CODEX_EXEC_CALL_ID".to_string(), "call-1".to_string()),
             (
                 "HTTP_PROXY".to_string(),
                 "http://127.0.0.1:43123".to_string(),
@@ -200,13 +239,53 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     request.exec_server_sandbox = Some(
         codex_exec_server::FileSystemSandboxContext::from_permission_profile(permission_profile),
     );
+    request.attempt_generation = 1;
     let first =
         exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true);
     let second =
         exec_server_params_for_request(/*process_id*/ 123, &request, /*tty*/ true);
-    assert!(first.process_id.as_str().starts_with("123-"));
-    assert!(second.process_id.as_str().starts_with("123-"));
-    assert_ne!(first.process_id, second.process_id);
+    assert_eq!(first.process_id.as_str(), "123");
+    assert_eq!(second.process_id.as_str(), "123");
+    assert_eq!(
+        first
+            .execution_identity
+            .as_ref()
+            .expect("retry execution identity")
+            .attempt_generation,
+        1
+    );
+
+    let direct_ssh = codex_exec_server::Environment::ssh(
+        "example.com",
+        22,
+        "test",
+        "/tmp/nonexistent-test-key",
+        None,
+        Some("direct".to_string()),
+    );
+    assert!(
+        exec_server_params_for_environment(123, &request, true, &direct_ssh)
+            .execution_identity
+            .is_none()
+    );
+    let preferred_ssh =
+        codex_exec_server::Environment::ssh_with_config(codex_exec_server::SshEnvironmentConfig {
+            connection_key: "test@example.com:22".to_string(),
+            agent_key: "preferred".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            user: "test".to_string(),
+            authentication: codex_exec_server::SshAuthentication::PrivateKeyPath(
+                "/tmp/nonexistent-test-key".to_string(),
+            ),
+            host_fingerprint: None,
+            tmux_mode: codex_exec_server::SshTmuxMode::Preferred,
+        });
+    assert!(
+        exec_server_params_for_environment(123, &request, true, &preferred_ssh)
+            .execution_identity
+            .is_some()
+    );
 }
 
 #[cfg(windows)]
@@ -539,6 +618,8 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                 } else {
                     now
                 },
+                pending_receipt: None,
+                receipt_frozen: false,
             },
         );
     }
@@ -549,4 +630,113 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
         (pruned.map(|entry| entry.process_id), store.processes.len()),
         (None, MAX_UNIFIED_EXEC_PROCESSES)
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_retains_process_when_remote_termination_is_unconfirmed() {
+    let manager = UnifiedExecProcessManager::default();
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            Some("transport lost".to_string()),
+        )
+        .await,
+    );
+    let process_id = 17;
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ProcessEntry {
+            process,
+            call_id: "call-17".to_string(),
+            process_id,
+            cwd: PathUri::parse("file:///tmp").expect("test cwd should be valid"),
+            initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+            hook_command: "sleep 30".to_string(),
+            tty: false,
+            network_approval: None,
+            session: std::sync::Weak::new(),
+            last_used: Instant::now(),
+            pending_receipt: None,
+            receipt_frozen: false,
+        },
+    );
+
+    let result = manager.terminate_all_processes().await;
+
+    assert_eq!(result, Err(vec![process_id]));
+    assert_eq!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![process_id]
+    );
+}
+
+#[tokio::test]
+async fn no_live_rollout_freezes_pending_receipt_but_allows_identity_free_output() {
+    let manager = UnifiedExecProcessManager::default();
+    let process = Arc::new(
+        crate::unified_exec::process_tests::remote_process(
+            codex_exec_server::WriteStatus::Accepted,
+            /*terminate_error*/ None,
+        )
+        .await,
+    );
+    let process_id = 23;
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ProcessEntry {
+            process,
+            call_id: "exec-23".to_string(),
+            process_id,
+            cwd: PathUri::parse("file:///tmp").expect("test cwd should be valid"),
+            initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+            hook_command: "sleep 30".to_string(),
+            tty: false,
+            network_approval: None,
+            session: std::sync::Weak::new(),
+            last_used: Instant::now(),
+            pending_receipt: Some(PendingOutputReceipt {
+                turn_id: "turn-23".to_string(),
+                call_id: "poll-23".to_string(),
+                output: HeadTailBuffer::default(),
+            }),
+            receipt_frozen: false,
+        },
+    );
+
+    let error = crate::session::freeze_pending_remote_receipts_without_live_rollout(
+        &manager,
+        &[("turn-23".to_string(), "poll-23".to_string())],
+    )
+    .await
+    .expect_err("pending receipt must require a live rollout");
+    assert!(
+        error
+            .to_string()
+            .contains("pending remote output receipt requires live rollout persistence")
+    );
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get(&process_id)
+            .expect("pending process should remain")
+            .receipt_frozen
+    );
+
+    crate::session::freeze_pending_remote_receipts_without_live_rollout(
+        &manager,
+        &[("identity-free".to_string(), "ordinary-output".to_string())],
+    )
+    .await
+    .expect("an output without a pending remote receipt may use legacy persistence");
 }

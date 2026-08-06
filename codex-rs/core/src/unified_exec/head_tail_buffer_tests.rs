@@ -49,7 +49,7 @@ fn draining_resets_state_and_push_buffer_preserves_omissions() {
     buf.push_chunk(b"0123456789".to_vec());
     buf.push_chunk(b"ab".to_vec());
 
-    let drained = buf.drain();
+    let drained = buf.take_for_receipt();
     let mut collected = HeadTailBuffer::new(/*max_bytes*/ 10);
     collected.push_buffer(drained);
 
@@ -111,4 +111,21 @@ fn empty_and_tiny_chunks_have_bounded_metadata() {
     );
     assert_eq!(buf.retained_bytes(), 10);
     assert_eq!(buf.omitted_bytes(), 2);
+}
+
+#[test]
+fn absolute_ranges_must_be_exact_and_contiguous_across_drains() {
+    let mut buffer = HeadTailBuffer::new(16);
+    buffer
+        .push_chunk_at(b"abc".to_vec(), 10, 13)
+        .expect("first exact range");
+    buffer
+        .push_chunk_at(b"de".to_vec(), 13, 15)
+        .expect("contiguous range");
+    assert_eq!(buffer.absolute_range(), Some((10, 15)));
+    assert!(buffer.push_chunk_at(b"x".to_vec(), 16, 17).is_err());
+
+    let drained = buffer.take_for_receipt();
+    assert_eq!(drained.absolute_range(), Some((10, 15)));
+    assert_eq!(buffer.absolute_range(), None);
 }

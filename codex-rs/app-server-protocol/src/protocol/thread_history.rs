@@ -401,6 +401,10 @@ impl ThreadHistoryBuilder {
             RolloutItem::ResponseItem(item) => self.handle_response_item(item),
             RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::RemoteExecutionProtocolMarker(_)
+            | RolloutItem::RemoteExecutionLaunchIntent(_)
+            | RolloutItem::RemoteExecutionSessionPrepared(_)
+            | RolloutItem::RemoteExecutionSessionCommitted(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::SessionMeta(_) => {}

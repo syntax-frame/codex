@@ -2699,6 +2699,10 @@ impl InitialHistory {
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::RemoteExecutionProtocolMarker(_)
+                | RolloutItem::RemoteExecutionLaunchIntent(_)
+                | RolloutItem::RemoteExecutionSessionPrepared(_)
+                | RolloutItem::RemoteExecutionSessionCommitted(_)
                 | RolloutItem::Compacted(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::EventMsg(_) => None,
@@ -3035,6 +3039,10 @@ fn multi_agent_version_from_items(
             | RolloutItem::ResponseItem(_)
             | RolloutItem::InterAgentCommunication(_)
             | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::RemoteExecutionProtocolMarker(_)
+            | RolloutItem::RemoteExecutionLaunchIntent(_)
+            | RolloutItem::RemoteExecutionSessionPrepared(_)
+            | RolloutItem::RemoteExecutionSessionCommitted(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::EventMsg(_) => None,
@@ -3217,10 +3225,123 @@ pub enum RolloutItem {
     InterAgentCommunicationMetadata {
         trigger_turn: bool,
     },
+    /// Persistence-only evidence for deterministic AgentApp remote execution
+    /// recovery. This item is never replayed into model context.
+    RemoteExecutionProtocolMarker(RemoteExecutionProtocolMarker),
+    /// Persistence-only authority proving the exact immutable parameters that
+    /// were durably committed before a remote process launch.
+    RemoteExecutionLaunchIntent(RemoteExecutionLaunchIntent),
+    /// Inactive durable candidate for restoring a background execution.
+    RemoteExecutionSessionPrepared(RemoteExecutionSessionPrepared),
+    /// Active durable cursor/index for restoring a background execution.
+    RemoteExecutionSessionCommitted(RemoteExecutionSessionCommitted),
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
     EventMsg(EventMsg),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+pub struct RemoteExecutionProtocolMarker {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub protocol_version: u32,
+    pub identity_schema: String,
+    pub descriptor_before_go: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+pub struct RemoteExecutionLaunchIntent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    pub attempt_generation: u32,
+    pub command_digest: String,
+    pub original_session_id: i32,
+    pub tty: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteExecutionReceiptKind {
+    InitialExec,
+    EmptyPoll,
+    DeliveryUnknownWrite,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteExecutionTerminalStatus {
+    Exited(i32),
+    Terminated,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+pub struct RemoteExecutionSessionPrepared {
+    pub thread_id: String,
+    pub exec_turn_id: String,
+    pub exec_call_id: String,
+    pub receipt_turn_id: String,
+    pub receipt_call_id: String,
+    pub receipt_kind: RemoteExecutionReceiptKind,
+    pub attempt_generation: u32,
+    pub session_id: i32,
+    pub command_digest: String,
+    pub tty: bool,
+    pub output_mode: String,
+    pub environment_id: String,
+    pub cwd: String,
+    pub hook_command: String,
+    /// Inclusive absolute backend output cursor at the start of this receipt.
+    pub range_start: u64,
+    /// Exclusive absolute backend output cursor after this receipt.
+    pub range_end: u64,
+    /// SHA-256 of the exact model-visible FunctionCallOutput text.
+    pub receipt_output_digest: String,
+    /// Exact model-visible FunctionCallOutput text used for deterministic
+    /// recovery of an unmatched receipt.
+    pub receipt_output_text: String,
+    /// Backend-issued, idempotent authority for retiring the exact remote
+    /// descriptor after the terminal receipt and its commit are durable.
+    /// Required exactly when `terminal_candidate` is true.
+    pub terminal_acknowledgement_token: Option<String>,
+    /// SHA-256 of the exact authoritative backend bytes in
+    /// `[range_start, range_end)`. Required exactly for terminal receipts.
+    pub terminal_output_digest: Option<String>,
+    /// Exact verified remote terminal classification used to render this
+    /// receipt. Required exactly for terminal receipts.
+    pub terminal_status: Option<RemoteExecutionTerminalStatus>,
+    pub terminal_candidate: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+pub struct RemoteExecutionSessionCommitted {
+    pub thread_id: String,
+    pub exec_turn_id: String,
+    pub exec_call_id: String,
+    pub receipt_turn_id: String,
+    pub receipt_call_id: String,
+    pub receipt_kind: RemoteExecutionReceiptKind,
+    pub attempt_generation: u32,
+    pub session_id: i32,
+    pub command_digest: String,
+    /// Inclusive absolute backend output cursor activated by this commit.
+    pub range_start: u64,
+    /// Exclusive absolute backend output cursor activated by this commit.
+    pub range_end: u64,
+    /// Binds this commit to the exact prepared receipt bytes.
+    pub receipt_output_digest: String,
+    /// SHA-256 of the complete serialized Prepared receipt, binding adoption
+    /// and rendering metadata as well as the output digest.
+    pub prepared_receipt_digest: String,
+    /// Exact backend retirement authority copied from the Prepared receipt.
+    /// Required exactly when `terminal` is true.
+    pub terminal_acknowledgement_token: Option<String>,
+    /// Exact raw terminal suffix digest copied from the Prepared receipt.
+    pub terminal_output_digest: Option<String>,
+    /// Exact verified remote terminal status copied from the Prepared receipt.
+    pub terminal_status: Option<RemoteExecutionTerminalStatus>,
+    pub terminal: bool,
 }
 
 /// Persisted comparison state used to resume model-visible world-state diffing.

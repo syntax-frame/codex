@@ -440,7 +440,7 @@ impl ExecCommandToolOutput {
         )
     }
 
-    fn response_text(&self) -> String {
+    pub(crate) fn response_text(&self) -> String {
         let mut sections = Vec::new();
 
         if !self.chunk_id.is_empty() {

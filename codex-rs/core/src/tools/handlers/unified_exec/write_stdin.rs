@@ -57,6 +57,7 @@ impl WriteStdinHandler {
             session,
             turn,
             payload,
+            call_id,
             ..
         } = invocation;
 
@@ -81,7 +82,9 @@ impl WriteStdinHandler {
                 truncation_policy: turn.model_info.truncation_policy.into(),
                 interaction_event: Some(WriteStdinInteractionEvent {
                     session: &session,
-                    turn: &turn,
+                    turn: Some(&turn),
+                    receipt_turn_id: turn.sub_id.as_str(),
+                    call_id: &call_id,
                 }),
             })
             .await

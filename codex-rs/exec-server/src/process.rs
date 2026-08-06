@@ -4,12 +4,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 
 use crate::ExecServerError;
 use crate::ProcessId;
 use crate::protocol::ExecParams;
+use crate::protocol::ExecutionIdentity;
 use crate::protocol::ProcessOutputChunk;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadResponse;
@@ -17,6 +20,261 @@ use crate::protocol::WriteResponse;
 
 pub struct StartedExecProcess {
     pub process: Arc<dyn ExecProcess>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedExecution {
+    params: ExecParams,
+    command_digest: String,
+}
+
+impl PreparedExecution {
+    pub fn new(params: ExecParams) -> Self {
+        let command_digest = canonical_command_digest(&params);
+        Self {
+            params,
+            command_digest,
+        }
+    }
+
+    pub fn params(&self) -> &ExecParams {
+        &self.params
+    }
+
+    pub fn command_digest(&self) -> &str {
+        &self.command_digest
+    }
+
+    pub fn original_session_id(&self) -> Option<i32> {
+        self.params.process_id.as_str().parse().ok()
+    }
+
+    pub fn tty(&self) -> bool {
+        self.params.tty
+    }
+
+    pub fn into_params(self) -> ExecParams {
+        self.params
+    }
+
+    pub(crate) fn into_parts(self) -> (ExecParams, String) {
+        (self.params, self.command_digest)
+    }
+}
+
+pub fn canonical_command_digest(params: &ExecParams) -> String {
+    fn write_value(output: &mut String, value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                output.push('{');
+                let mut fields = map.iter().collect::<Vec<_>>();
+                fields.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                for (index, (key, value)) in fields.into_iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    output.push_str(
+                        &serde_json::to_string(key).expect("JSON object key is serializable"),
+                    );
+                    output.push(':');
+                    write_value(output, value);
+                }
+                output.push('}');
+            }
+            serde_json::Value::Array(values) => {
+                output.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    write_value(output, value);
+                }
+                output.push(']');
+            }
+            scalar => output
+                .push_str(&serde_json::to_string(scalar).expect("JSON scalar is serializable")),
+        }
+    }
+
+    let value = serde_json::to_value(params).expect("ExecParams is JSON serializable");
+    let mut canonical = String::from("agentapp-tmux-command-v2:");
+    write_value(&mut canonical, &value);
+    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptionRequest {
+    pub identity: ExecutionIdentity,
+    pub expected_command_digest: String,
+    pub original_session_id: Option<i32>,
+    pub committed_output_cursor: u64,
+    pub tty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveredExecutionStatus {
+    Missing,
+    Prepared,
+    LaunchInterrupted,
+    Running,
+    Exited(i32),
+    Terminated,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteExecution {
+    pub turn_id: String,
+    pub call_id: String,
+    pub attempt_generation: u32,
+    /// Locally durable launch authority. This must never be populated from the
+    /// remote descriptor being reconciled.
+    pub expected_command_digest: Option<String>,
+    pub expected_session_id: Option<i32>,
+    pub expected_tty: Option<bool>,
+    pub protocol_evidence: RemoteExecutionProtocolEvidence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteExecutionProtocolEvidence {
+    V2Proven,
+    LegacyUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWriteInteraction {
+    pub call_id: String,
+    pub turn_id: String,
+    pub session_id: i32,
+    pub input_is_empty: bool,
+    pub protocol_evidence: RemoteExecutionProtocolEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryIntent {
+    Foreground,
+    BackgroundPoll {
+        session_id: i32,
+        committed_output_cursor: u64,
+    },
+    AmbiguousNonemptyStdin {
+        session_id: i32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationRequest {
+    pub thread_id: String,
+    pub incomplete_executions: Vec<IncompleteExecution>,
+    pub pending_writes: Vec<PendingWriteInteraction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalAcknowledgementProof {
+    pub range_start: u64,
+    pub range_end: u64,
+    pub output_sha256: String,
+    pub status: RecoveredExecutionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredExecutionAcknowledgement {
+    token: String,
+    terminal_proof: Option<TerminalAcknowledgementProof>,
+}
+
+impl RecoveredExecutionAcknowledgement {
+    /// Reconstructs a backend-issued token for durable transport or test doubles.
+    ///
+    /// Backends still validate the token against their owned completed descriptor.
+    pub fn new(value: String) -> Self {
+        Self {
+            token: value,
+            terminal_proof: None,
+        }
+    }
+
+    pub fn with_terminal_proof(mut self, terminal_proof: TerminalAcknowledgementProof) -> Self {
+        self.terminal_proof = Some(terminal_proof);
+        self
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.token
+    }
+
+    /// Returns the opaque backend token that must be persisted before the
+    /// recovered descriptor can be acknowledged and retired.
+    pub fn persistence_token(&self) -> &str {
+        &self.token
+    }
+
+    pub(crate) fn terminal_proof(&self) -> Option<&TerminalAcknowledgementProof> {
+        self.terminal_proof.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredExecution {
+    pub identity: ExecutionIdentity,
+    pub command_digest: Option<String>,
+    pub output: Vec<u8>,
+    pub status: RecoveredExecutionStatus,
+    pub terminal_verified_dead: bool,
+    pub session_id: Option<i32>,
+    pub committed_output_cursor: u64,
+    pub delivery_unknown: bool,
+    pub acknowledgement: RecoveredExecutionAcknowledgement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationSelection {
+    NotLaunched,
+    Selected(u32),
+    NeedsTerminalVerification(u32),
+}
+
+pub fn select_execution_generation(
+    generation_zero: &RecoveredExecution,
+    generation_one: &RecoveredExecution,
+) -> Result<GenerationSelection, String> {
+    use RecoveredExecutionStatus::*;
+    match (&generation_zero.status, &generation_one.status) {
+        (Missing, Missing) => Ok(GenerationSelection::NotLaunched),
+        (Missing, _) => Err("generation one exists while generation zero is missing".to_string()),
+        (Prepared | Running, Missing) => Ok(GenerationSelection::Selected(0)),
+        (Prepared | Running, _) => {
+            Err("generation zero is live while generation one exists".to_string())
+        }
+        (Exited(_) | Terminated | LaunchInterrupted, Missing)
+            if generation_zero.terminal_verified_dead =>
+        {
+            Ok(GenerationSelection::Selected(0))
+        }
+        (Exited(_) | Terminated | LaunchInterrupted, Missing) => {
+            Ok(GenerationSelection::NeedsTerminalVerification(0))
+        }
+        (Exited(_) | Terminated | LaunchInterrupted, _)
+            if !generation_zero.terminal_verified_dead =>
+        {
+            Ok(GenerationSelection::NeedsTerminalVerification(0))
+        }
+        (
+            Exited(_) | Terminated | LaunchInterrupted,
+            Exited(_) | Terminated | LaunchInterrupted,
+        ) if !generation_one.terminal_verified_dead => {
+            Ok(GenerationSelection::NeedsTerminalVerification(1))
+        }
+        (
+            Exited(_) | Terminated | LaunchInterrupted,
+            Prepared | Running | Exited(_) | Terminated | LaunchInterrupted,
+        ) if generation_one.terminal_verified_dead
+            || matches!(generation_one.status, Prepared | Running) =>
+        {
+            Ok(GenerationSelection::Selected(1))
+        }
+        _ => Err("descriptor generations are conflicting or unknown".to_string()),
+    }
 }
 
 /// Pushed process events for consumers that want to follow process output as it
@@ -202,10 +460,38 @@ pub type ExecProcessFuture<'a, T> =
 
 pub trait ExecBackend: Send + Sync {
     fn start(&self, params: ExecParams) -> ExecBackendFuture<'_>;
+
+    fn start_prepared(&self, prepared: PreparedExecution) -> ExecBackendFuture<'_> {
+        self.start(prepared.into_params())
+    }
+
+    fn adopt_execution(&self, _request: AdoptionRequest) -> ExecBackendFuture<'_> {
+        Box::pin(std::future::ready(Err(ExecServerError::Protocol(
+            "execution adoption is unsupported by this backend".to_string(),
+        ))))
+    }
+
+    /// Reconciles durable executor-side state before a resumed turn can issue tools.
+    ///
+    /// Backends without persistent process state may keep the default no-op.
+    fn reconcile(&self, _request: ReconciliationRequest) -> ExecBackendReconcileFuture<'_> {
+        Box::pin(std::future::ready(Ok(Vec::new())))
+    }
+
+    fn acknowledge_consumed(
+        &self,
+        _acknowledgement: RecoveredExecutionAcknowledgement,
+    ) -> ExecBackendAcknowledgeFuture<'_> {
+        Box::pin(std::future::ready(Ok(())))
+    }
 }
 
 pub type ExecBackendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<StartedExecProcess, ExecServerError>> + Send + 'a>>;
+pub type ExecBackendReconcileFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<RecoveredExecution>, ExecServerError>> + Send + 'a>>;
+pub type ExecBackendAcknowledgeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), ExecServerError>> + Send + 'a>>;
 
 #[cfg(test)]
 mod tests {
@@ -238,6 +524,8 @@ mod tests {
             seq: 1,
             stream: ExecOutputStream::Stdout,
             chunk: b"large".to_vec().into(),
+            absolute_start: None,
+            absolute_end: None,
         }));
         log.publish(ExecProcessEvent::Exited {
             seq: 2,

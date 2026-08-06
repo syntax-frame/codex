@@ -43,6 +43,7 @@ async fn sandbox_request_wraps_native_argv_on_executor() {
     );
     let params = ExecParams {
         process_id: ProcessId::from("process-1"),
+        execution_identity: None,
         argv: vec![
             "/bin/bash".to_string(),
             "-lc".to_string(),
@@ -110,6 +111,7 @@ async fn sandbox_request_allows_prepared_managed_proxy_port() {
     );
     let params = ExecParams {
         process_id: ProcessId::from("process-managed-network"),
+        execution_identity: None,
         argv: vec!["/usr/bin/true".to_string()],
         cwd: cwd_uri,
         env_policy: None,
@@ -148,6 +150,7 @@ async fn native_request_preserves_native_launch_fields() {
     let env = HashMap::from([("TEST_ENV".to_string(), "value".to_string())]);
     let params = ExecParams {
         process_id: ProcessId::from("process-1"),
+        execution_identity: None,
         argv: vec!["echo".to_string(), "hello".to_string()],
         cwd: cwd_uri,
         env_policy: None,
@@ -186,6 +189,7 @@ async fn remote_proxy_config_starts_executor_local_proxy() {
         .expect("supported remote proxy config");
     let params = ExecParams {
         process_id: ProcessId::from("process-remote-proxy"),
+        execution_identity: None,
         argv: vec!["echo".to_string(), "hello".to_string()],
         cwd: PathUri::from_abs_path(&cwd),
         env_policy: None,
@@ -249,6 +253,7 @@ async fn disabled_remote_proxy_config_is_rejected_before_exporting_ports() {
             .expect("serializable disabled proxy config");
     let params = ExecParams {
         process_id: ProcessId::from("process-disabled-remote-proxy"),
+        execution_identity: None,
         argv: vec!["echo".to_string(), "hello".to_string()],
         cwd: PathUri::from_abs_path(&cwd),
         env_policy: None,
@@ -293,6 +298,7 @@ async fn managed_network_selects_elevated_windows_spawn() {
     sandbox.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
     let params = ExecParams {
         process_id: ProcessId::from("process-managed-network"),
+        execution_identity: None,
         argv: vec!["cmd.exe".to_string(), "/c".to_string(), "exit".to_string()],
         cwd: cwd_uri,
         env_policy: None,

@@ -1917,8 +1917,11 @@ async fn drain_in_flight(
         match res {
             Ok(response_input) => {
                 let response_item = response_input.into();
-                sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
-                    .await;
+                sess.record_tool_output_items_durably(
+                    &turn_context,
+                    std::slice::from_ref(&response_item),
+                )
+                .await?;
                 mark_thread_memory_mode_polluted_if_external_context(
                     sess.as_ref(),
                     turn_context.as_ref(),

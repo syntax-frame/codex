@@ -11,7 +11,6 @@ use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
@@ -40,6 +39,7 @@ use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::MIN_YIELD_TIME_MS;
+use crate::unified_exec::PendingOutputReceipt;
 use crate::unified_exec::ProcessEntry;
 use crate::unified_exec::ProcessStore;
 use crate::unified_exec::UnifiedExecContext;
@@ -86,6 +86,8 @@ const NETWORK_ACCESS_DENIED_MESSAGE: &str =
     "Network access was denied by the Codex sandbox network proxy.";
 const LATE_NETWORK_DENIAL_GRACE_PERIOD: Duration = Duration::from_millis(100);
 const INTERRUPT: &str = "\u{3}";
+const CODEX_EXEC_CALL_ID_ENV_VAR: &str = "CODEX_EXEC_CALL_ID";
+const CODEX_EXEC_TURN_ID_ENV_VAR: &str = "CODEX_EXEC_TURN_ID";
 
 /// Test-only override for deterministic unified exec process IDs.
 ///
@@ -178,14 +180,22 @@ fn exec_server_params_for_request(
     tty: bool,
 ) -> codex_exec_server::ExecParams {
     let (env_policy, env) = exec_server_env_for_request(request);
-    // Sandbox retries reuse the unified-exec ID but start a distinct executor process.
-    let exec_server_process_id = if request.exec_server_sandbox.is_some() {
-        format!("{process_id}-{}", Uuid::new_v4())
-    } else {
-        process_id.to_string()
-    };
+    let attempt_generation = request.attempt_generation;
     codex_exec_server::ExecParams {
-        process_id: exec_server_process_id.into(),
+        process_id: process_id.to_string().into(),
+        execution_identity: request
+            .env
+            .get(CODEX_THREAD_ID_ENV_VAR)
+            .zip(request.env.get(CODEX_EXEC_TURN_ID_ENV_VAR))
+            .zip(request.env.get(CODEX_EXEC_CALL_ID_ENV_VAR))
+            .map(
+                |((thread_id, turn_id), call_id)| codex_exec_server::ExecutionIdentity {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    call_id: call_id.clone(),
+                    attempt_generation,
+                },
+            ),
         argv: request.command.clone(),
         cwd: request.cwd.clone(),
         env_policy,
@@ -198,6 +208,19 @@ fn exec_server_params_for_request(
         managed_network: request.exec_server_managed_network.clone(),
         network_proxy: request.exec_server_network_proxy.clone(),
     }
+}
+
+fn exec_server_params_for_environment(
+    process_id: i32,
+    request: &ExecRequest,
+    tty: bool,
+    environment: &codex_exec_server::Environment,
+) -> codex_exec_server::ExecParams {
+    let mut params = exec_server_params_for_request(process_id, request, tty);
+    if !environment.supports_durable_remote_exec_recovery() {
+        params.execution_identity = None;
+    }
+    params
 }
 
 /// Borrowed process state prepared for a `write_stdin` or poll operation.
@@ -373,6 +396,116 @@ fn terminate_process_on_network_denial(
 }
 
 impl UnifiedExecProcessManager {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn adopt_background_process(
+        &self,
+        environment: &codex_exec_server::Environment,
+        request: codex_exec_server::AdoptionRequest,
+        session: &Arc<crate::session::session::Session>,
+        original_call_id: String,
+        cwd: PathUri,
+        hook_command: String,
+    ) -> Result<(), UnifiedExecError> {
+        let process_id = request.original_session_id.ok_or_else(|| {
+            UnifiedExecError::create_process(
+                "background adoption requires original integer session id".to_string(),
+            )
+        })?;
+        {
+            let mut store = self.process_store.lock().await;
+            if !store.reserve_exact(process_id) {
+                return Err(UnifiedExecError::create_process(format!(
+                    "cannot restore background session {process_id}: id collision"
+                )));
+            }
+        }
+        let tty = request.tty;
+        let started = environment
+            .get_exec_backend()
+            .adopt_execution(request)
+            .await
+            .map_err(|error| UnifiedExecError::create_process(error.to_string()))?;
+        let process = Arc::new(UnifiedExecProcess::from_exec_server_started(started).await?);
+        let entry = ProcessEntry {
+            process,
+            call_id: original_call_id,
+            process_id,
+            cwd,
+            initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+            hook_command,
+            tty,
+            network_approval: None,
+            session: Arc::downgrade(session),
+            last_used: Instant::now(),
+            pending_receipt: None,
+            receipt_frozen: false,
+        };
+        let mut store = self.process_store.lock().await;
+        if store.processes.contains_key(&process_id)
+            || !store.reserved_process_ids.contains(&process_id)
+        {
+            return Err(UnifiedExecError::create_process(format!(
+                "background session {process_id} reservation was lost"
+            )));
+        }
+        store.processes.insert(process_id, entry);
+        Ok(())
+    }
+
+    /// Reattaches an exact durable backend execution under its original user-visible ID.
+    ///
+    /// The reservation is deliberately retained when backend adoption fails: dropping it
+    /// would make uncertain remote ownership available for an unrelated local process.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn adopt_process(
+        &self,
+        environment: &codex_exec_server::Environment,
+        request: codex_exec_server::AdoptionRequest,
+        context: &UnifiedExecContext,
+        cwd: PathUri,
+        hook_command: String,
+    ) -> Result<Arc<UnifiedExecProcess>, UnifiedExecError> {
+        let process_id = request.original_session_id.ok_or_else(|| {
+            UnifiedExecError::create_process(
+                "background adoption requires the original integer session id".to_string(),
+            )
+        })?;
+        {
+            let mut store = self.process_store.lock().await;
+            if !store.reserve_exact(process_id) {
+                return Err(UnifiedExecError::create_process(format!(
+                    "cannot adopt session {process_id}: process id is already owned"
+                )));
+            }
+        }
+
+        let tty = request.tty;
+        let started = environment
+            .get_exec_backend()
+            .adopt_execution(request)
+            .await
+            .map_err(|error| UnifiedExecError::create_process(error.to_string()))?;
+        let process = Arc::new(UnifiedExecProcess::from_exec_server_started(started).await?);
+        let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+        start_streaming_output(&process, context, Arc::clone(&transcript));
+        self.store_process(
+            Arc::clone(&process),
+            context,
+            &[],
+            hook_command,
+            cwd,
+            Instant::now(),
+            process_id,
+            tty,
+            None,
+            None,
+            transcript,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        Ok(process)
+    }
+
     pub(crate) async fn allocate_process_id(&self) -> i32 {
         loop {
             let mut store = self.process_store.lock().await;
@@ -503,6 +636,11 @@ impl UnifiedExecProcessManager {
             deadline,
         )
         .await;
+        // For durable remote sessions this local drain is only a presentation
+        // snapshot. The tmux output log remains authoritative and append-only.
+        // A prepared receipt freezes the process entry until its rollout output
+        // and commit are both fsynced; failure therefore replays from the last
+        // committed absolute backend cursor instead of consuming these bytes.
         let wall_time = Instant::now().saturating_duration_since(start);
 
         let original_token_count = usize::try_from(approx_tokens_from_byte_count(
@@ -655,6 +793,50 @@ impl UnifiedExecProcessManager {
             hook_command: Some(request.hook_command.clone()),
         };
 
+        if let Some(background_session_id) = response.process_id
+            && request
+                .turn_environment
+                .environment
+                .supports_durable_remote_exec_recovery()
+        {
+            let observed_range = collected_output
+                .absolute_range()
+                .or_else(|| (collected_output.total_bytes() == 0).then_some((0, 0)));
+            let (range_start, range_end) = observed_range.ok_or_else(|| {
+                UnifiedExecError::create_process(
+                    "background remote output lacks backend absolute offsets".to_string(),
+                )
+            })?;
+            self.begin_output_receipt(
+                background_session_id,
+                context.turn.sub_id.as_str(),
+                &context.call_id,
+                collected_output.clone(),
+            )
+            .await?;
+            if let Err(error) = context
+                .session
+                .persist_remote_execution_session_prepared(
+                    context.turn.sub_id.as_str(),
+                    &context.call_id,
+                    background_session_id,
+                    request.tty,
+                    if request.tty { "pty" } else { "stdout" },
+                    &request.turn_environment.environment_id,
+                    &request.cwd.to_string(),
+                    &request.hook_command,
+                    range_start,
+                    range_end,
+                    &response.response_text(),
+                )
+                .await
+            {
+                self.freeze_output_receipt(context.turn.sub_id.as_str(), &context.call_id)
+                    .await;
+                return Err(UnifiedExecError::create_process(error.to_string()));
+            }
+        }
+
         Ok(response)
     }
 
@@ -803,6 +985,16 @@ impl UnifiedExecProcessManager {
                 {
                     return Err(fail_process_with_message(entry.process.as_ref(), message));
                 }
+                if request.input.is_empty() && request.interaction_event.is_some() {
+                    let mut store = self.process_store.lock().await;
+                    if !store.reserve_exact(request.process_id) {
+                        return Err(UnifiedExecError::create_process(format!(
+                            "terminal receipt lost exclusive reservation for session {}",
+                            request.process_id
+                        )));
+                    }
+                    store.processes.insert(request.process_id, *entry);
+                }
                 (None, exit_code, call_id)
             }
             ProcessStatus::Unknown => {
@@ -830,9 +1022,50 @@ impl UnifiedExecProcessManager {
             hook_command: Some(hook_command),
         };
 
+        if request.input.is_empty()
+            && let Some(interaction) = request.interaction_event.as_ref()
+        {
+            self.begin_output_receipt(
+                request.process_id,
+                interaction.receipt_turn_id,
+                interaction.call_id,
+                collected_output.clone(),
+            )
+            .await?;
+            let prepared = match interaction
+                .session
+                .persist_remote_execution_poll_prepared(
+                    request.process_id,
+                    interaction.receipt_turn_id,
+                    interaction.call_id,
+                    collected_output.absolute_range(),
+                    response.process_id.is_none(),
+                    response.exit_code,
+                    &response.response_text(),
+                )
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.freeze_process_output_receipts(request.process_id)
+                        .await;
+                    return Err(UnifiedExecError::create_process(error.to_string()));
+                }
+            };
+            if !prepared {
+                self.acknowledge_output_receipt(interaction.receipt_turn_id, interaction.call_id)
+                    .await;
+            }
+        }
+
         let should_emit_interaction = !request.input.is_empty() || response.process_id.is_some();
         if should_emit_interaction
-            && let Some(WriteStdinInteractionEvent { session, turn }) = request.interaction_event
+            && let Some(WriteStdinInteractionEvent {
+                session,
+                turn: Some(turn),
+                call_id: _,
+                ..
+            }) = request.interaction_event
         {
             let interaction = TerminalInteractionEvent {
                 call_id: response.event_call_id.clone(),
@@ -886,6 +1119,11 @@ impl UnifiedExecProcessManager {
             .processes
             .get_mut(&process_id)
             .ok_or(UnifiedExecError::UnknownProcessId { process_id })?;
+        if entry.receipt_frozen || entry.pending_receipt.is_some() {
+            return Err(UnifiedExecError::create_process(format!(
+                "session {process_id} is frozen pending durable output receipt recovery"
+            )));
+        }
         if !Arc::ptr_eq(&entry.process, expected_process) {
             return Err(UnifiedExecError::UnknownProcessId { process_id });
         }
@@ -920,6 +1158,88 @@ impl UnifiedExecProcessManager {
         })
     }
 
+    pub(crate) async fn begin_output_receipt(
+        &self,
+        process_id: i32,
+        receipt_turn_id: &str,
+        receipt_call_id: &str,
+        output: HeadTailBuffer,
+    ) -> Result<(), UnifiedExecError> {
+        let mut store = self.process_store.lock().await;
+        let entry = store
+            .processes
+            .get_mut(&process_id)
+            .ok_or(UnifiedExecError::UnknownProcessId { process_id })?;
+        if entry.receipt_frozen || entry.pending_receipt.is_some() {
+            return Err(UnifiedExecError::create_process(format!(
+                "session {process_id} already has a pending or frozen output receipt"
+            )));
+        }
+        entry.pending_receipt = Some(PendingOutputReceipt {
+            turn_id: receipt_turn_id.to_string(),
+            call_id: receipt_call_id.to_string(),
+            output,
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn acknowledge_output_receipt(
+        &self,
+        receipt_turn_id: &str,
+        receipt_call_id: &str,
+    ) {
+        let mut store = self.process_store.lock().await;
+        let mut retired = Vec::new();
+        for entry in store.processes.values_mut() {
+            if entry.pending_receipt.as_ref().is_some_and(|receipt| {
+                receipt.turn_id == receipt_turn_id && receipt.call_id == receipt_call_id
+            }) {
+                let _committed_snapshot = entry
+                    .pending_receipt
+                    .take()
+                    .expect("matched pending receipt")
+                    .output;
+                entry.receipt_frozen = false;
+                if entry.process.has_exited() {
+                    retired.push(entry.process_id);
+                }
+            }
+        }
+        for process_id in retired {
+            store.remove(process_id);
+        }
+    }
+
+    pub(crate) async fn freeze_output_receipt(
+        &self,
+        receipt_turn_id: &str,
+        receipt_call_id: &str,
+    ) -> bool {
+        let mut store = self.process_store.lock().await;
+        let mut frozen = false;
+        for entry in store.processes.values_mut() {
+            if entry.pending_receipt.as_ref().is_some_and(|receipt| {
+                receipt.turn_id == receipt_turn_id && receipt.call_id == receipt_call_id
+            }) {
+                entry.receipt_frozen = true;
+                frozen = true;
+            }
+        }
+        frozen
+    }
+
+    pub(crate) async fn freeze_process_output_receipts(&self, process_id: i32) {
+        if let Some(entry) = self
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get_mut(&process_id)
+        {
+            entry.receipt_frozen = true;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn store_process(
         &self,
@@ -947,6 +1267,8 @@ impl UnifiedExecProcessManager {
             network_approval,
             session: Arc::downgrade(&context.session),
             last_used: started_at,
+            pending_receipt: None,
+            receipt_frozen: false,
         };
         let pruned_entry = {
             let mut store = self.process_store.lock().await;
@@ -978,6 +1300,7 @@ impl UnifiedExecProcessManager {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open_session_with_exec_env(
         &self,
+        context: Option<&UnifiedExecContext>,
         process_id: i32,
         command: SandboxCommand,
         options: ExecOptions,
@@ -999,6 +1322,7 @@ impl UnifiedExecProcessManager {
         request.exec_server_network_proxy = network_proxy_launch;
         request.exec_server_env_config = exec_server_env_config;
         self.open_session_with_prepared_exec_env(
+            context,
             process_id,
             &request,
             tty,
@@ -1019,6 +1343,7 @@ impl UnifiedExecProcessManager {
 
     pub(crate) async fn open_session_with_prepared_exec_env(
         &self,
+        context: Option<&UnifiedExecContext>,
         process_id: i32,
         request: &ExecRequest,
         tty: bool,
@@ -1034,9 +1359,25 @@ impl UnifiedExecProcessManager {
                 ));
             }
 
+            let prepared = codex_exec_server::PreparedExecution::new(
+                exec_server_params_for_environment(process_id, request, tty, environment),
+            );
+            if environment.supports_durable_remote_exec_recovery() {
+                let context = context.ok_or_else(|| {
+                    UnifiedExecError::create_process(
+                        "durably recoverable remote execution requires launch-intent context"
+                            .to_string(),
+                    )
+                })?;
+                context
+                    .session
+                    .persist_remote_execution_launch_intent(&prepared)
+                    .await
+                    .map_err(|error| UnifiedExecError::create_process(error.to_string()))?;
+            }
             let started = environment
                 .get_exec_backend()
-                .start(exec_server_params_for_request(process_id, request, tty))
+                .start_prepared(prepared)
                 .await
                 .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
             spawn_lifecycle.after_spawn();
@@ -1101,6 +1442,14 @@ impl UnifiedExecProcessManager {
         env.insert(
             CODEX_THREAD_ID_ENV_VAR.to_string(),
             context.session.thread_id.to_string(),
+        );
+        env.insert(
+            CODEX_EXEC_TURN_ID_ENV_VAR.to_string(),
+            context.turn.sub_id.clone(),
+        );
+        env.insert(
+            CODEX_EXEC_CALL_ID_ENV_VAR.to_string(),
+            context.call_id.clone(),
         );
         let active_permission_profile = context.turn.config.permissions.active_permission_profile();
         inject_permission_profile_env(&mut env, active_permission_profile.as_ref());
@@ -1213,7 +1562,7 @@ impl UnifiedExecProcessManager {
             let mut wait_for_output = None;
             {
                 let mut guard = output_buffer.lock().await;
-                drained_output = guard.drain();
+                drained_output = guard.take_for_receipt();
                 has_drained_output =
                     drained_output.retained_bytes() > 0 || drained_output.omitted_bytes() > 0;
                 if !has_drained_output {
@@ -1386,21 +1735,26 @@ impl UnifiedExecProcessManager {
             .map(|(process_id, _, _)| process_id)
     }
 
-    pub(crate) async fn terminate_all_processes(&self) {
-        let entries: Vec<ProcessEntry> = {
-            let mut processes = self.process_store.lock().await;
-            let entries: Vec<ProcessEntry> = processes
-                .processes
-                .drain()
-                .map(|(_, entry)| entry)
-                .collect();
-            processes.reserved_process_ids.clear();
-            entries
+    pub(crate) async fn terminate_all_processes(&self) -> Result<(), Vec<i32>> {
+        let process_ids = {
+            let processes = self.process_store.lock().await;
+            processes.processes.keys().copied().collect::<Vec<_>>()
         };
 
-        for entry in entries {
-            unregister_network_approval_for_entry(&entry).await;
-            entry.process.terminate();
+        let mut uncertain = Vec::new();
+        for process_id in process_ids {
+            if !self.terminate_process(process_id).await {
+                tracing::warn!(
+                    process_id,
+                    "retaining unified exec process after unconfirmed termination"
+                );
+                uncertain.push(process_id);
+            }
+        }
+        if uncertain.is_empty() {
+            Ok(())
+        } else {
+            Err(uncertain)
         }
     }
 

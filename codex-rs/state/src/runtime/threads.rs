@@ -1203,6 +1203,10 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
         RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::RemoteExecutionProtocolMarker(_)
+        | RolloutItem::RemoteExecutionLaunchIntent(_)
+        | RolloutItem::RemoteExecutionSessionPrepared(_)
+        | RolloutItem::RemoteExecutionSessionCommitted(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)

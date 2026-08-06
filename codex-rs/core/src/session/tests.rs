@@ -1,5 +1,684 @@
 use super::turn_context::TurnEnvironment;
 use super::*;
+use codex_exec_server::PendingWriteInteraction;
+use codex_exec_server::RemoteExecutionProtocolEvidence;
+
+fn background_prepared(session_id: i32, operation_call_id: &str, cursor: u64) -> RolloutItem {
+    RolloutItem::RemoteExecutionSessionPrepared(RemoteExecutionSessionPrepared {
+        thread_id: "thread".to_string(),
+        exec_turn_id: "exec-turn".to_string(),
+        exec_call_id: format!("exec-{session_id}"),
+        receipt_turn_id: "receipt-turn".to_string(),
+        receipt_call_id: operation_call_id.to_string(),
+        receipt_kind: if operation_call_id.starts_with("exec-") {
+            RemoteExecutionReceiptKind::InitialExec
+        } else {
+            RemoteExecutionReceiptKind::EmptyPoll
+        },
+        attempt_generation: 0,
+        session_id,
+        command_digest: format!("digest-{session_id}"),
+        tty: true,
+        output_mode: "pty".to_string(),
+        environment_id: "ssh".to_string(),
+        cwd: "/workspace".to_string(),
+        hook_command: "cmd".to_string(),
+        range_start: 0,
+        range_end: cursor,
+        receipt_output_digest: remote_receipt_output_digest("output"),
+        receipt_output_text: "output".to_string(),
+        terminal_acknowledgement_token: None,
+        terminal_output_digest: None,
+        terminal_status: None,
+        terminal_candidate: false,
+    })
+}
+
+fn background_output(call_id: &str) -> RolloutItem {
+    background_output_for_turn("receipt-turn", call_id)
+}
+
+fn background_output_for_turn(turn_id: &str, call_id: &str) -> RolloutItem {
+    RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("output".to_string()),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some(turn_id.to_string()),
+        }),
+    })
+}
+
+fn background_output_for_turn_with_text(turn_id: &str, call_id: &str, text: &str) -> RolloutItem {
+    RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(text.to_string()),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some(turn_id.to_string()),
+        }),
+    })
+}
+
+#[test]
+fn background_prepared_without_output_is_inactive_but_output_gap_is_finalized() {
+    assert!(
+        missing_background_session_commits(&[background_prepared(41, "exec-41", 7)])
+            .expect("inactive preparation")
+            .is_empty()
+    );
+    let commits = missing_background_session_commits(&[
+        background_prepared(41, "exec-41", 7),
+        background_output("exec-41"),
+    ])
+    .expect("durable output gap");
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].session_id, 41);
+    assert_eq!(commits[0].range_end, 7);
+}
+
+#[test]
+fn background_receipt_requires_one_exact_ordered_output() {
+    let prepared = background_prepared(41, "poll-1", 7);
+    assert!(
+        missing_background_session_commits(&[background_output("poll-1"), prepared.clone(),])
+            .is_err()
+    );
+    assert!(
+        missing_background_session_commits(&[
+            prepared.clone(),
+            background_output("poll-1"),
+            background_output("poll-1"),
+        ])
+        .is_err()
+    );
+    assert!(
+        missing_background_session_commits(&[
+            prepared,
+            background_output_for_turn("other-turn", "poll-1"),
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn background_receipt_binds_exact_rendered_output_and_prepared_metadata() {
+    let prepared = background_prepared(41, "poll-1", 7);
+    let wrong_output = RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "poll-1".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("different output".to_string()),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some("receipt-turn".to_string()),
+        }),
+    });
+    assert!(missing_background_session_commits(&[prepared.clone(), wrong_output]).is_err());
+
+    let mut commit =
+        missing_background_session_commits(&[prepared.clone(), background_output("poll-1")])
+            .expect("exact receipt")[0]
+            .clone();
+    commit.prepared_receipt_digest = "wrong-prepared-metadata".to_string();
+    assert!(
+        missing_background_session_commits(&[
+            prepared,
+            background_output("poll-1"),
+            RolloutItem::RemoteExecutionSessionCommitted(commit),
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn background_poll_keeps_exec_identity_and_advances_cumulative_cursor() {
+    let initial = background_prepared(41, "exec-41", 3);
+    let initial_output = background_output("exec-41");
+    let initial_commit =
+        missing_background_session_commits(&[initial.clone(), initial_output.clone()])
+            .expect("initial receipt")[0]
+            .clone();
+    let RolloutItem::RemoteExecutionSessionPrepared(mut poll) =
+        background_prepared(41, "poll-1", 8)
+    else {
+        unreachable!();
+    };
+    poll.receipt_turn_id = "poll-turn".to_string();
+    poll.range_start = 3;
+    let commits = missing_background_session_commits(&[
+        initial,
+        initial_output,
+        RolloutItem::RemoteExecutionSessionCommitted(initial_commit),
+        RolloutItem::RemoteExecutionSessionPrepared(poll),
+        background_output_for_turn("poll-turn", "poll-1"),
+    ])
+    .expect("cumulative poll receipt");
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].exec_call_id, "exec-41");
+    assert_eq!(commits[0].receipt_call_id, "poll-1");
+    assert_eq!(commits[0].range_end, 8);
+}
+
+#[test]
+fn background_poll_range_must_start_at_previous_commit() {
+    let initial = background_prepared(41, "exec-41", 3);
+    let initial_output = background_output("exec-41");
+    let initial_commit =
+        missing_background_session_commits(&[initial.clone(), initial_output.clone()])
+            .expect("initial receipt")[0]
+            .clone();
+    let RolloutItem::RemoteExecutionSessionPrepared(mut poll) =
+        background_prepared(41, "poll-gap", 8)
+    else {
+        unreachable!();
+    };
+    poll.receipt_turn_id = "poll-turn".to_string();
+    poll.range_start = 4;
+    assert!(
+        missing_background_session_commits(&[
+            initial,
+            initial_output,
+            RolloutItem::RemoteExecutionSessionCommitted(initial_commit),
+            RolloutItem::RemoteExecutionSessionPrepared(poll),
+            background_output_for_turn("poll-turn", "poll-gap"),
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn proposed_background_receipts_form_one_contiguous_chain() {
+    let initial = background_prepared(41, "exec-41", 3);
+    let initial_output = background_output("exec-41");
+    let initial_commit =
+        missing_background_session_commits(&[initial.clone(), initial_output.clone()])
+            .expect("initial receipt")[0]
+            .clone();
+    let RolloutItem::RemoteExecutionSessionPrepared(mut first_poll) =
+        background_prepared(41, "poll-1", 5)
+    else {
+        unreachable!();
+    };
+    first_poll.receipt_turn_id = "poll-turn-1".to_string();
+    first_poll.range_start = 3;
+    let RolloutItem::RemoteExecutionSessionPrepared(mut competing_poll) =
+        background_prepared(41, "poll-2", 7)
+    else {
+        unreachable!();
+    };
+    competing_poll.receipt_turn_id = "poll-turn-2".to_string();
+    competing_poll.range_start = 3;
+
+    assert!(
+        missing_background_session_commits(&[
+            initial,
+            initial_output,
+            RolloutItem::RemoteExecutionSessionCommitted(initial_commit),
+            RolloutItem::RemoteExecutionSessionPrepared(first_poll),
+            background_output_for_turn("poll-turn-1", "poll-1"),
+            RolloutItem::RemoteExecutionSessionPrepared(competing_poll),
+            background_output_for_turn("poll-turn-2", "poll-2"),
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn background_receipts_support_multiple_sessions_and_cursor_advancement() {
+    let commits = missing_background_session_commits(&[
+        background_prepared(41, "exec-41", 3),
+        background_output("exec-41"),
+        background_prepared(42, "exec-42", 9),
+        background_output("exec-42"),
+    ])
+    .expect("multiple sessions");
+    assert_eq!(
+        commits
+            .iter()
+            .map(|commit| (commit.session_id, commit.range_end))
+            .collect::<Vec<_>>(),
+        vec![(41, 3), (42, 9)]
+    );
+}
+
+#[test]
+fn duplicate_background_preparation_fails_closed() {
+    let prepared = background_prepared(41, "exec-41", 3);
+    assert!(missing_background_session_commits(&[prepared.clone(), prepared]).is_err());
+}
+
+#[test]
+fn terminal_background_commit_retires_the_session_index() {
+    let RolloutItem::RemoteExecutionSessionPrepared(mut prepared) =
+        background_prepared(41, "poll-1", 7)
+    else {
+        unreachable!();
+    };
+    prepared.terminal_candidate = true;
+    prepared.terminal_acknowledgement_token = Some("terminal-token".to_string());
+    prepared.terminal_output_digest = Some(remote_receipt_bytes_digest(b"terminal"));
+    prepared.terminal_status = Some(RemoteExecutionTerminalStatus::Exited(0));
+    let prepared = RolloutItem::RemoteExecutionSessionPrepared(prepared);
+    let generated_terminal_commit =
+        missing_background_session_commits(&[prepared.clone(), background_output("poll-1")])
+            .expect("terminal receipt gap")[0]
+            .clone();
+    assert_eq!(
+        generated_terminal_commit
+            .terminal_acknowledgement_token
+            .as_deref(),
+        Some("terminal-token")
+    );
+    let terminal_output_digest = remote_receipt_bytes_digest(b"terminal");
+    assert_eq!(
+        generated_terminal_commit.terminal_output_digest.as_deref(),
+        Some(terminal_output_digest.as_str())
+    );
+    assert_eq!(
+        generated_terminal_commit.terminal_status,
+        Some(RemoteExecutionTerminalStatus::Exited(0))
+    );
+    let terminal = RolloutItem::RemoteExecutionSessionCommitted(RemoteExecutionSessionCommitted {
+        thread_id: "thread".to_string(),
+        exec_turn_id: "exec-turn".to_string(),
+        exec_call_id: "exec-41".to_string(),
+        receipt_turn_id: "receipt-turn".to_string(),
+        receipt_call_id: "poll-1".to_string(),
+        receipt_kind: RemoteExecutionReceiptKind::EmptyPoll,
+        attempt_generation: 0,
+        session_id: 41,
+        command_digest: "digest-41".to_string(),
+        range_start: 0,
+        range_end: 7,
+        receipt_output_digest: remote_receipt_output_digest("output"),
+        prepared_receipt_digest: prepared_remote_receipt_digest(match &prepared {
+            RolloutItem::RemoteExecutionSessionPrepared(prepared) => prepared,
+            _ => unreachable!(),
+        })
+        .expect("prepared digest"),
+        terminal_acknowledgement_token: Some("terminal-token".to_string()),
+        terminal_output_digest: Some(remote_receipt_bytes_digest(b"terminal")),
+        terminal_status: Some(RemoteExecutionTerminalStatus::Exited(0)),
+        terminal: true,
+    });
+    assert!(
+        missing_background_session_commits(&[
+            prepared.clone(),
+            background_output("poll-1"),
+            terminal.clone(),
+        ])
+        .expect("terminal receipt")
+        .is_empty()
+    );
+    assert!(
+        missing_background_session_commits(&[
+            background_prepared(41, "poll-1", 7),
+            background_output("poll-1"),
+            terminal.clone(),
+            background_prepared(41, "poll-2", 8),
+            background_output("poll-2"),
+        ])
+        .is_err()
+    );
+    let RolloutItem::RemoteExecutionSessionPrepared(mut same_cursor_after_terminal) =
+        background_prepared(41, "poll-same-cursor", 7)
+    else {
+        unreachable!();
+    };
+    same_cursor_after_terminal.receipt_turn_id = "later-turn".to_string();
+    same_cursor_after_terminal.range_start = 7;
+    assert!(
+        missing_background_session_commits(&[
+            prepared,
+            background_output("poll-1"),
+            terminal,
+            RolloutItem::RemoteExecutionSessionPrepared(same_cursor_after_terminal),
+            background_output_for_turn("later-turn", "poll-same-cursor"),
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn latest_committed_background_session_pairs_the_exact_receipt() {
+    let initial = background_prepared(41, "exec-41", 3);
+    let initial_output = background_output("exec-41");
+    let initial_commit =
+        missing_background_session_commits(&[initial.clone(), initial_output.clone()])
+            .expect("initial receipt")[0]
+            .clone();
+    let RolloutItem::RemoteExecutionSessionPrepared(mut poll) =
+        background_prepared(41, "poll-1", 5)
+    else {
+        unreachable!();
+    };
+    poll.receipt_turn_id = "poll-turn".to_string();
+    poll.range_start = 3;
+    let poll_output = background_output_for_turn("poll-turn", "poll-1");
+    let poll_commit = missing_background_session_commits(&[
+        initial.clone(),
+        initial_output.clone(),
+        RolloutItem::RemoteExecutionSessionCommitted(initial_commit.clone()),
+        RolloutItem::RemoteExecutionSessionPrepared(poll.clone()),
+        poll_output.clone(),
+    ])
+    .expect("poll receipt")[0]
+        .clone();
+    let RolloutItem::RemoteExecutionSessionPrepared(mut later_prepared) =
+        background_prepared(41, "poll-2", 8)
+    else {
+        unreachable!();
+    };
+    later_prepared.receipt_turn_id = "later-turn".to_string();
+    later_prepared.range_start = 5;
+
+    let history = [
+        initial,
+        initial_output,
+        RolloutItem::RemoteExecutionSessionCommitted(initial_commit),
+        RolloutItem::RemoteExecutionSessionPrepared(poll),
+        poll_output,
+        RolloutItem::RemoteExecutionSessionCommitted(poll_commit),
+        RolloutItem::RemoteExecutionSessionPrepared(later_prepared),
+    ];
+    let (_committed, prepared) = latest_committed_background_session(&history, "thread", 41)
+        .expect("latest committed session");
+    assert_eq!(prepared.receipt_call_id, "poll-1");
+    assert_eq!(prepared.receipt_turn_id, "poll-turn");
+}
+
+#[test]
+fn committed_delivery_unknown_write_is_restart_idempotent() {
+    let initial = background_prepared(41, "exec-41", 3);
+    let initial_output = background_output("exec-41");
+    let initial_commit =
+        missing_background_session_commits(&[initial.clone(), initial_output.clone()])
+            .expect("initial receipt")[0]
+            .clone();
+    let pending = PendingWriteInteraction {
+        call_id: "stdin-1".to_string(),
+        turn_id: "stdin-turn".to_string(),
+        session_id: 41,
+        input_is_empty: false,
+        protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+    };
+    let RolloutItem::RemoteExecutionSessionPrepared(mut delivery) =
+        background_prepared(41, "stdin-1", 3)
+    else {
+        unreachable!();
+    };
+    let text = "Process was terminated during SSH lifecycle recovery; stdin delivery is unknown\nOutput:\n";
+    delivery.receipt_turn_id = pending.turn_id.clone();
+    delivery.receipt_kind = RemoteExecutionReceiptKind::DeliveryUnknownWrite;
+    delivery.range_start = initial_commit.range_end;
+    delivery.range_end = initial_commit.range_end;
+    delivery.receipt_output_text = text.to_string();
+    delivery.receipt_output_digest = remote_receipt_output_digest(text);
+    delivery.terminal_acknowledgement_token = Some("token".to_string());
+    delivery.terminal_output_digest = Some(remote_receipt_bytes_digest(b""));
+    delivery.terminal_status = Some(RemoteExecutionTerminalStatus::Terminated);
+    delivery.terminal_candidate = true;
+    let delivery_commit = RemoteExecutionSessionCommitted {
+        thread_id: delivery.thread_id.clone(),
+        exec_turn_id: delivery.exec_turn_id.clone(),
+        exec_call_id: delivery.exec_call_id.clone(),
+        receipt_turn_id: delivery.receipt_turn_id.clone(),
+        receipt_call_id: delivery.receipt_call_id.clone(),
+        receipt_kind: delivery.receipt_kind.clone(),
+        attempt_generation: delivery.attempt_generation,
+        session_id: delivery.session_id,
+        command_digest: delivery.command_digest.clone(),
+        range_start: delivery.range_start,
+        range_end: delivery.range_end,
+        receipt_output_digest: delivery.receipt_output_digest.clone(),
+        prepared_receipt_digest: prepared_remote_receipt_digest(&delivery)
+            .expect("prepared digest"),
+        terminal_acknowledgement_token: delivery.terminal_acknowledgement_token.clone(),
+        terminal_output_digest: delivery.terminal_output_digest.clone(),
+        terminal_status: delivery.terminal_status.clone(),
+        terminal: true,
+    };
+
+    assert!(
+        pending_nonempty_write_already_recovered(
+            &[
+                initial,
+                initial_output,
+                RolloutItem::RemoteExecutionSessionCommitted(initial_commit),
+                RolloutItem::RemoteExecutionSessionPrepared(delivery),
+                background_output_for_turn_with_text("stdin-turn", "stdin-1", text),
+                RolloutItem::RemoteExecutionSessionCommitted(delivery_commit),
+            ],
+            "thread",
+            &pending,
+        )
+        .expect("already recovered")
+    );
+}
+
+#[test]
+fn terminal_status_maps_to_observed_exit_code_for_reverification() {
+    assert_eq!(
+        terminal_status_observed_exit_code(&RemoteExecutionTerminalStatus::Exited(17)),
+        17
+    );
+    assert_eq!(
+        terminal_status_observed_exit_code(&RemoteExecutionTerminalStatus::Terminated),
+        143
+    );
+}
+
+#[test]
+fn terminal_acknowledgement_reverifies_raw_output_digest_and_status() {
+    let session = include_str!("mod.rs");
+    let finalize = session
+        .find("pub(crate) async fn finalize_background_session_receipts")
+        .expect("finalize method");
+    let verify_before_ack = session[finalize..]
+        .find("verify_terminal_remote_receipt")
+        .expect("terminal proof reverified before acknowledgement")
+        + finalize;
+    let digest_check = session[verify_before_ack..]
+        .find("verified_output_digest")
+        .expect("verified raw byte digest is compared")
+        + verify_before_ack;
+    let status_check = session[verify_before_ack..]
+        .find("verified_status")
+        .expect("verified terminal status is compared")
+        + verify_before_ack;
+    let acknowledge = session[verify_before_ack..]
+        .find(".acknowledge_consumed")
+        .expect("backend acknowledgement")
+        + verify_before_ack;
+
+    assert!(verify_before_ack < acknowledge);
+    assert!(digest_check < acknowledge);
+    assert!(status_check < acknowledge);
+}
+
+#[test]
+fn background_receipt_transition_orders_prepared_output_and_commit_barriers() {
+    let manager = include_str!("../unified_exec/process_manager.rs");
+    let turn = include_str!("turn.rs");
+    let session = include_str!("mod.rs");
+    assert!(
+        manager.find("persist_remote_execution_session_prepared") < manager.find("Ok(response)")
+    );
+    assert!(turn.contains("record_tool_output_items_durably"));
+    let durable_output = session
+        .find("pub(crate) async fn record_tool_output_items_durably")
+        .expect("durable output method");
+    let append_output = session[durable_output..]
+        .find("append_items(&rollout_items)")
+        .expect("output append")
+        + durable_output;
+    let output_flush = session[append_output..]
+        .find(".flush()")
+        .expect("output fsync")
+        + append_output;
+    let commit = session[output_flush..]
+        .find("commit_prepared_remote_session_after_output")
+        .expect("commit after durable output")
+        + output_flush;
+    assert!(append_output < output_flush);
+    assert!(output_flush < commit);
+    assert!(manager.contains("if request.input.is_empty()"));
+    assert!(manager.contains("begin_output_receipt"));
+    assert!(manager.contains("freeze_output_receipt"));
+    assert!(manager.contains("acknowledge_output_receipt"));
+}
+
+#[test]
+fn resumed_writes_are_repaired_before_resume_returns() {
+    let manager = include_str!("../thread_manager.rs");
+    let session = include_str!("mod.rs");
+    let session_init = include_str!("session.rs");
+    let ios = include_str!("../../../codex-ios/src/turn.rs");
+    assert!(!manager.contains(".repair_pending_empty_polls(&pending_writes)"));
+    assert!(!manager.contains("cannot resume with delivery-unknown nonempty write_stdin"));
+    assert!(!ios.contains("any(|write| !write.input_is_empty)"));
+    let repair_impl = session
+        .find("repair_pending_empty_polls_before_reconstruction")
+        .expect("pending write repair implementation");
+    let nonempty_repair = session[repair_impl..]
+        .find("repair_pending_nonempty_write_before_reconstruction")
+        .expect("nonempty write delivery-unknown repair")
+        + repair_impl;
+    let no_resend = session[nonempty_repair..]
+        .find("terminate_process(prepared.session_id)")
+        .expect("nonempty write recovery terminates instead of resending input")
+        + nonempty_repair;
+    let prepared = session[nonempty_repair..]
+        .find("persist_remote_execution_delivery_unknown_prepared")
+        .expect("delivery-unknown receipt is prepared")
+        + nonempty_repair;
+    let output = session[prepared..]
+        .find("append_items(std::slice::from_ref(&output))")
+        .expect("truthful write_stdin output is appended")
+        + prepared;
+    let commit = session[output..]
+        .find("commit_prepared_remote_session_after_output")
+        .expect("delivery-unknown receipt is committed after output")
+        + output;
+    let finalize = session[commit..]
+        .find("finalize_background_session_receipts")
+        .expect("existing finalizer acknowledges after commit")
+        + commit;
+    let redaction = session[repair_impl..]
+        .find(".redact_serializable(initial_history)")
+        .expect("repaired history redaction")
+        + repair_impl;
+    let repair = session_init
+        .find("repair_pending_empty_polls_before_reconstruction")
+        .expect("pre-reconstruction empty poll repair");
+    let initial_messages = session_init[repair..]
+        .find("let initial_messages = initial_history.get_event_msgs()")
+        .expect("initial message projection")
+        + repair;
+    let reconstruction = session_init[initial_messages..]
+        .find("record_initial_history(initial_history)")
+        .expect("history reconstruction")
+        + initial_messages;
+    assert!(nonempty_repair < redaction);
+    assert!(no_resend < prepared);
+    assert!(prepared < output);
+    assert!(output < commit);
+    assert!(commit < finalize);
+    assert!(repair_impl < redaction);
+    assert!(repair < initial_messages);
+    assert!(initial_messages < reconstruction);
+    assert!(ios.contains("pending_writes"));
+}
+
+fn pending_empty_poll(session_id: i32, turn_id: &str, call_id: &str) -> PendingWriteInteraction {
+    PendingWriteInteraction {
+        call_id: call_id.to_string(),
+        turn_id: turn_id.to_string(),
+        session_id,
+        input_is_empty: true,
+        protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+    }
+}
+
+#[test]
+fn prepared_empty_poll_reuses_exact_stored_output_without_polling() {
+    let RolloutItem::RemoteExecutionSessionPrepared(mut prepared) =
+        background_prepared(41, "poll-1", 7)
+    else {
+        unreachable!();
+    };
+    prepared.receipt_output_text = "exact prepared output".to_string();
+    prepared.receipt_output_digest = remote_receipt_output_digest(&prepared.receipt_output_text);
+    let pending = pending_empty_poll(41, "receipt-turn", "poll-1");
+
+    let repair = prepared_empty_poll_repair(
+        &[RolloutItem::RemoteExecutionSessionPrepared(prepared)],
+        "thread",
+        &pending,
+    )
+    .expect("prepared receipt should be reusable");
+    let PreparedEmptyPollRepair::Ready {
+        output_to_append:
+            Some(RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                call_id,
+                output,
+                internal_chat_message_metadata_passthrough,
+                ..
+            })),
+    } = repair
+    else {
+        panic!("expected exact stored output repair");
+    };
+    assert_eq!(call_id, "poll-1");
+    assert_eq!(
+        output.body.to_text(),
+        Some("exact prepared output".to_string())
+    );
+    assert_eq!(output.success, Some(true));
+    assert_eq!(
+        internal_chat_message_metadata_passthrough
+            .and_then(|metadata| metadata.turn_id)
+            .as_deref(),
+        Some("receipt-turn")
+    );
+}
+
+#[test]
+fn pending_empty_poll_without_preparation_requires_one_adopted_poll() {
+    let repair = prepared_empty_poll_repair(
+        &[],
+        "thread",
+        &pending_empty_poll(41, "receipt-turn", "poll-1"),
+    )
+    .expect("missing preparation is a classified crash boundary");
+    assert!(matches!(repair, PreparedEmptyPollRepair::Missing));
+}
+
+#[test]
+fn prepared_empty_poll_rejects_conflicting_session_or_output_digest() {
+    let RolloutItem::RemoteExecutionSessionPrepared(mut prepared) =
+        background_prepared(41, "poll-1", 7)
+    else {
+        unreachable!();
+    };
+    prepared.receipt_output_digest = "wrong".to_string();
+    assert!(
+        prepared_empty_poll_repair(
+            &[RolloutItem::RemoteExecutionSessionPrepared(prepared)],
+            "thread",
+            &pending_empty_poll(42, "receipt-turn", "poll-1"),
+        )
+        .is_err()
+    );
+}
 use crate::agents_md_manager::AgentsMdManager;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::config::ConfigBuilder;
@@ -2844,6 +3523,10 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::RemoteExecutionProtocolMarker(_)
+        | RolloutItem::RemoteExecutionLaunchIntent(_)
+        | RolloutItem::RemoteExecutionSessionPrepared(_)
+        | RolloutItem::RemoteExecutionSessionCommitted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::EventMsg(_) => None,
@@ -2900,6 +3583,10 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         RolloutItem::SessionMeta(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::RemoteExecutionProtocolMarker(_)
+        | RolloutItem::RemoteExecutionLaunchIntent(_)
+        | RolloutItem::RemoteExecutionSessionPrepared(_)
+        | RolloutItem::RemoteExecutionSessionCommitted(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
@@ -4412,6 +5099,136 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
     }
 }
 
+#[test]
+fn marker_is_required_before_spawn_and_any_first_inference() {
+    let source = include_str!("handlers.rs");
+    let new_turn_branch = source
+        .split("Err(SteerInputError::NoActiveTurn(items)) =>")
+        .nth(1)
+        .expect("new-turn branch")
+        .split("Err(err) =>")
+        .next()
+        .expect("new-turn branch body");
+    let marker = new_turn_branch
+        .find("persist_remote_execution_protocol_marker")
+        .expect("durable marker barrier");
+    let spawn = new_turn_branch.find("spawn_task(").expect("task spawn");
+    assert!(marker < spawn);
+    assert!(new_turn_branch[marker..spawn].contains(".await"));
+    assert!(new_turn_branch[marker..spawn].contains("return;"));
+    let steer_success = source
+        .split("Ok(_) =>")
+        .nth(1)
+        .expect("steering branch")
+        .split("Err(SteerInputError::NoActiveTurn(items)) =>")
+        .next()
+        .expect("steering body");
+    assert!(!steer_success.contains("persist_remote_execution_protocol_marker"));
+}
+
+#[test]
+fn marker_append_or_flush_failure_blocks_spawn_and_inference() {
+    let source = include_str!("handlers.rs");
+    let new_turn_branch = source
+        .split("Err(SteerInputError::NoActiveTurn(items)) =>")
+        .nth(1)
+        .expect("new-turn branch")
+        .split("Err(err) =>")
+        .next()
+        .expect("new-turn branch body");
+    let failure_gate = new_turn_branch
+        .find("if let Err(err) = sess")
+        .expect("fallible marker gate");
+    let persistence = new_turn_branch[failure_gate..]
+        .find("persist_remote_execution_protocol_marker")
+        .expect("required persistence call")
+        + failure_gate;
+    let early_return = new_turn_branch[persistence..]
+        .find("return;")
+        .expect("failure return")
+        + persistence;
+    let spawn = new_turn_branch.find("spawn_task(").expect("task spawn");
+    assert!(failure_gate < persistence);
+    assert!(persistence < early_return);
+    assert!(early_return < spawn);
+}
+
+#[tokio::test]
+async fn remote_unified_exec_requires_live_rollout_independent_of_multi_agent_version() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    let _ = Arc::make_mut(&mut turn_context.config)
+        .features
+        .enable(Feature::UnifiedExec);
+    turn_context.multi_agent_version = MultiAgentVersion::Disabled;
+    let local_environment = turn_context
+        .environments
+        .primary()
+        .expect("local primary environment")
+        .clone();
+    turn_context
+        .environments
+        .environments
+        .push(TurnEnvironmentState::Ready(TurnEnvironment::new(
+            "agentapp-ssh".to_string(),
+            Arc::new(codex_exec_server::Environment::ssh(
+                "127.0.0.1",
+                22,
+                "agentapp",
+                "/unused/test/key",
+                None,
+                Some("test-session".to_string()),
+            )),
+            local_environment.cwd().clone(),
+            local_environment.workspace_roots().to_vec(),
+            None,
+        )));
+    assert_eq!(
+        turn_context
+            .environments
+            .primary()
+            .expect("local primary remains first")
+            .environment_id,
+        local_environment.environment_id
+    );
+    assert!(session.live_thread().is_none());
+
+    let error = session
+        .persist_remote_execution_protocol_marker(&turn_context)
+        .await
+        .expect_err("remote UnifiedExec without a live writer must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("requires live rollout persistence")
+    );
+
+    let removed = turn_context
+        .environments
+        .environments
+        .pop()
+        .expect("secondary SSH environment");
+    assert!(matches!(removed, TurnEnvironmentState::Ready(_)));
+    session
+        .persist_remote_execution_protocol_marker(&turn_context)
+        .await
+        .expect("native-local UnifiedExec remains permissive");
+}
+
+#[test]
+fn only_restart_reconcilable_environments_are_marker_eligible() {
+    let source = include_str!("mod.rs");
+    let method = source
+        .split("pub(crate) async fn persist_remote_execution_protocol_marker")
+        .nth(1)
+        .expect("marker persistence method")
+        .split("pub(crate) async fn")
+        .next()
+        .expect("marker persistence body");
+    assert!(method.contains(".turn_environments()"));
+    assert!(method.contains(".supports_durable_remote_exec_recovery()"));
+    assert!(method.contains(".starting()"));
+}
+
 #[tokio::test]
 async fn emit_subagent_session_started_includes_fork_lineage_and_originator() {
     use wiremock::Mock;
@@ -5163,6 +5980,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         tx_event,
         agent_status_tx,
         InitialHistory::New,
+        Vec::new(),
         SessionSource::Exec,
         skills_service,
         plugins_manager,
@@ -5554,6 +6372,7 @@ async fn make_session_with_config_and_rx(
         tx_event,
         agent_status_tx,
         InitialHistory::New,
+        Vec::new(),
         SessionSource::Exec,
         skills_service,
         plugins_manager,
@@ -5661,6 +6480,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         tx_event,
         agent_status_tx,
         initial_history,
+        Vec::new(),
         session_source,
         skills_service,
         plugins_manager,
@@ -6940,7 +7760,11 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
     session.services.live_thread = Some(live_thread);
     let session = Arc::new(session);
 
-    assert!(handlers::shutdown(&session, "sub-1".to_string()).await);
+    assert!(
+        handlers::shutdown(&session, "sub-1".to_string())
+            .await
+            .expect("shutdown should succeed")
+    );
 
     assert_eq!(
         codex_thread_store::InMemoryThreadStoreCalls {
@@ -7035,7 +7859,9 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
     let session = Arc::new(session);
-    submission_loop(session, Arc::clone(&turn_context.config), rx_sub).await;
+    submission_loop(session, Arc::clone(&turn_context.config), rx_sub)
+        .await
+        .expect("channel-close teardown should succeed");
 
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(
@@ -7120,7 +7946,9 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
 
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
-    submission_loop(Arc::clone(&session), session.get_config().await, rx_sub).await;
+    submission_loop(Arc::clone(&session), session.get_config().await, rx_sub)
+        .await
+        .expect("channel-close teardown should succeed");
 
     assert_eq!(
         vec!["turn_abort", "thread_stop"],
@@ -7202,6 +8030,36 @@ async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
 }
 
 #[tokio::test]
+async fn shutdown_and_wait_propagates_uncertain_runtime_shutdown() {
+    let (_session, _turn_context) = make_session_and_context().await;
+    let (tx_sub, rx_sub) = async_channel::bounded(1);
+    let (_tx_event, rx_event) = async_channel::unbounded();
+    let session_loop_handle = tokio::spawn(async move {
+        let shutdown: Submission = rx_sub.recv().await.expect("shutdown submission");
+        assert_eq!(shutdown.op, Op::Shutdown);
+        Err::<(), Arc<str>>(Arc::from(
+            "shutdown could not confirm termination of unified exec processes: [17]",
+        ))
+    });
+    let io = SessionIo {
+        tx_sub,
+        rx_event,
+        agent_status: watch::channel(AgentStatus::PendingInit).1,
+        session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+    };
+
+    let err = io
+        .shutdown_and_wait()
+        .await
+        .expect_err("uncertain process termination must fail shutdown");
+
+    assert!(
+        err.to_string()
+            .contains("could not confirm termination of unified exec processes")
+    );
+}
+
+#[tokio::test]
 async fn shutdown_and_wait_shuts_down_cached_guardian_subagent() {
     let (parent_session, parent_turn_context) = make_session_and_context().await;
     let parent_session = Arc::new(parent_session);
@@ -7210,7 +8068,9 @@ async fn shutdown_and_wait_shuts_down_cached_guardian_subagent() {
     let (_parent_tx_event, parent_rx_event) = async_channel::unbounded();
     let parent_session_for_loop = Arc::clone(&parent_session);
     let parent_session_loop_handle = tokio::spawn(async move {
-        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await;
+        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub)
+            .await
+            .expect("parent submission loop should shut down cleanly");
     });
     let parent_io = SessionIo {
         tx_sub: parent_tx_sub,
@@ -7295,7 +8155,9 @@ async fn shutdown_and_wait_shuts_down_tracked_ephemeral_guardian_review() {
     let (_parent_tx_event, parent_rx_event) = async_channel::unbounded();
     let parent_session_for_loop = Arc::clone(&parent_session);
     let parent_session_loop_handle = tokio::spawn(async move {
-        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await;
+        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub)
+            .await
+            .expect("parent submission loop should shut down cleanly");
     });
     let parent_io = SessionIo {
         tx_sub: parent_tx_sub,

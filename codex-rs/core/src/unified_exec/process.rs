@@ -510,9 +510,24 @@ impl UnifiedExecProcess {
                         sandbox_denied,
                     } = response;
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
+                        let absolute_range = chunk.absolute_start.zip(chunk.absolute_end);
                         let bytes = chunk.chunk.into_inner();
                         let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
+                        if let Some((start, end)) = absolute_range {
+                            if guard.push_chunk_at(bytes.clone(), start, end).is_err() {
+                                let state = state_tx.borrow().clone();
+                                let _ = state_tx.send_replace(
+                                    state.failed(
+                                        "exec-server output absolute range is non-contiguous"
+                                            .to_string(),
+                                    ),
+                                );
+                                cancellation_token.cancel();
+                                break;
+                            }
+                        } else {
+                            guard.push_chunk(bytes.clone());
+                        }
                         drop(guard);
                         let _ = output_tx.send(bytes);
                         output_notify.notify_waiters();
@@ -553,9 +568,24 @@ impl UnifiedExecProcess {
                             continue;
                         }
                         last_seq = chunk.seq;
+                        let absolute_range = chunk.absolute_start.zip(chunk.absolute_end);
                         let bytes = chunk.chunk.into_inner();
                         let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
+                        if let Some((start, end)) = absolute_range {
+                            if guard.push_chunk_at(bytes.clone(), start, end).is_err() {
+                                let state = state_tx.borrow().clone();
+                                let _ = state_tx.send_replace(
+                                    state.failed(
+                                        "exec-server output absolute range is non-contiguous"
+                                            .to_string(),
+                                    ),
+                                );
+                                cancellation_token.cancel();
+                                break;
+                            }
+                        } else {
+                            guard.push_chunk(bytes.clone());
+                        }
                         drop(guard);
                         let _ = output_tx.send(bytes);
                         output_notify.notify_waiters();

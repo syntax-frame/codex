@@ -280,7 +280,11 @@ impl Session {
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::SessionMeta(_)
-                | RolloutItem::InterAgentCommunicationMetadata { .. } => {}
+                | RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::RemoteExecutionProtocolMarker(_)
+                | RolloutItem::RemoteExecutionLaunchIntent(_)
+                | RolloutItem::RemoteExecutionSessionPrepared(_)
+                | RolloutItem::RemoteExecutionSessionCommitted(_) => {}
             }
 
             if base_replacement_history.is_some()
@@ -368,7 +372,11 @@ impl Session {
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
-                | RolloutItem::SessionMeta(_) => {}
+                | RolloutItem::SessionMeta(_)
+                | RolloutItem::RemoteExecutionProtocolMarker(_)
+                | RolloutItem::RemoteExecutionLaunchIntent(_)
+                | RolloutItem::RemoteExecutionSessionPrepared(_)
+                | RolloutItem::RemoteExecutionSessionCommitted(_) => {}
             }
         }
 
@@ -414,6 +422,10 @@ impl Session {
                 | RolloutItem::ResponseItem(_)
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::RemoteExecutionProtocolMarker(_)
+                | RolloutItem::RemoteExecutionLaunchIntent(_)
+                | RolloutItem::RemoteExecutionSessionPrepared(_)
+                | RolloutItem::RemoteExecutionSessionCommitted(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::EventMsg(_) => {
                     unreachable!("only world-state replay items are collected")

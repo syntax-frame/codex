@@ -68,6 +68,8 @@ fn process_event_reorder_rejects_oversized_output() {
             seq: 1,
             stream: ExecOutputStream::Stdout,
             chunk: vec![0; super::super::MAX_PENDING_PROCESS_EVENT_BYTES + 1].into(),
+            absolute_start: None,
+            absolute_end: None,
         }))
         .expect_err("oversized pending process output should be rejected");
 
@@ -88,6 +90,8 @@ fn process_event_reorder_accepts_gap_closing_event_at_limits() {
                     seq,
                     stream: ExecOutputStream::Stdout,
                     chunk: vec![0; chunk_size].into(),
+                    absolute_start: None,
+                    absolute_end: None,
                 }))
                 .expect("future output should fit within reorder limits")
         );
@@ -98,6 +102,8 @@ fn process_event_reorder_accepts_gap_closing_event_at_limits() {
                 seq: 1,
                 stream: ExecOutputStream::Stdout,
                 chunk: b"x".to_vec().into(),
+                absolute_start: None,
+                absolute_end: None,
             }))
             .expect("gap-closing output should drain the reorder buffer")
     );
@@ -127,6 +133,8 @@ fn recovery_handles_dense_tail_output_and_newer_notification() {
                 seq: live_seq,
                 stream: ExecOutputStream::Stdout,
                 chunk: b"live".to_vec().into(),
+                absolute_start: None,
+                absolute_end: None,
             }))
             .expect("live output should remain bounded while recovery fills the gap")
     );
@@ -135,6 +143,8 @@ fn recovery_handles_dense_tail_output_and_newer_notification() {
             seq,
             stream: ExecOutputStream::Stdout,
             chunk: b"x".to_vec().into(),
+            absolute_start: None,
+            absolute_end: None,
         })
         .collect();
 
@@ -176,6 +186,8 @@ fn recovery_rejects_output_at_closed_sequence() {
                 seq: 1,
                 stream: ExecOutputStream::Stdout,
                 chunk: b"output".to_vec().into(),
+                absolute_start: None,
+                absolute_end: None,
             }],
             next_seq: 2,
             exited: false,
@@ -212,6 +224,8 @@ async fn recovery_adds_sandbox_denial_to_pending_exit_event() {
                 seq: 1,
                 stream: ExecOutputStream::Stderr,
                 chunk: b"sandbox denied".to_vec().into(),
+                absolute_start: None,
+                absolute_end: None,
             }],
             next_seq: 3,
             exited: true,

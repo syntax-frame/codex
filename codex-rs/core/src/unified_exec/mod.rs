@@ -50,6 +50,8 @@ mod process;
 mod process_manager;
 mod process_state;
 
+use head_tail_buffer::HeadTailBuffer;
+
 pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
     process_manager::set_deterministic_process_ids_for_tests(enabled);
 }
@@ -121,7 +123,9 @@ pub(crate) struct WriteStdinRequest<'a> {
 
 pub(crate) struct WriteStdinInteractionEvent<'a> {
     pub session: &'a Arc<Session>,
-    pub turn: &'a Arc<TurnContext>,
+    pub turn: Option<&'a Arc<TurnContext>>,
+    pub receipt_turn_id: &'a str,
+    pub call_id: &'a str,
 }
 
 impl std::fmt::Debug for WriteStdinInteractionEvent<'_> {
@@ -137,6 +141,15 @@ pub(crate) struct ProcessStore {
 }
 
 impl ProcessStore {
+    fn reserve_exact(&mut self, process_id: i32) -> bool {
+        if self.processes.contains_key(&process_id)
+            || self.reserved_process_ids.contains(&process_id)
+        {
+            return false;
+        }
+        self.reserved_process_ids.insert(process_id)
+    }
+
     fn remove(&mut self, process_id: i32) -> Option<ProcessEntry> {
         self.reserved_process_ids.remove(&process_id);
         self.processes.remove(&process_id)
@@ -175,6 +188,17 @@ struct ProcessEntry {
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
+    pending_receipt: Option<PendingOutputReceipt>,
+    receipt_frozen: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PendingOutputReceipt {
+    turn_id: String,
+    call_id: String,
+    /// Transactional snapshot retained until the durable commit is fsynced.
+    /// A failed receipt therefore never destroys the locally collected bytes.
+    output: HeadTailBuffer,
 }
 
 pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {

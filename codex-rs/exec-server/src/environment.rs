@@ -142,6 +142,77 @@ pub enum EnvironmentObservedStatus {
 }
 
 impl EnvironmentManager {
+    /// Reconciles the selected environment's durable execution state.
+    ///
+    /// Existing local and remote exec-server backends use the backend's default
+    /// no-op until they opt into persistent process recovery.
+    pub async fn reconcile_default_environment(
+        &self,
+        request: crate::ReconciliationRequest,
+    ) -> Result<Vec<crate::RecoveredExecution>, ExecServerError> {
+        let Some(environment_id) = &self.default_environment else {
+            return Ok(Vec::new());
+        };
+        let environment = self
+            .environments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(environment_id)
+            .cloned();
+        if let Some(environment) = environment {
+            return environment.get_exec_backend().reconcile(request).await;
+        }
+        Ok(Vec::new())
+    }
+
+    pub async fn acknowledge_default_environment_recovery(
+        &self,
+        acknowledgement: crate::RecoveredExecutionAcknowledgement,
+    ) -> Result<(), ExecServerError> {
+        let Some(environment_id) = &self.default_environment else {
+            return Ok(());
+        };
+        let environment = self
+            .environments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(environment_id)
+            .cloned();
+        if let Some(environment) = environment {
+            return environment
+                .get_exec_backend()
+                .acknowledge_consumed(acknowledgement)
+                .await;
+        }
+        Ok(())
+    }
+
+    pub async fn adopt_default_environment_execution(
+        &self,
+        request: crate::AdoptionRequest,
+    ) -> Result<crate::StartedExecProcess, ExecServerError> {
+        let environment_id = self.default_environment.as_ref().ok_or_else(|| {
+            ExecServerError::Protocol(
+                "execution adoption requires an exact default environment".to_string(),
+            )
+        })?;
+        let environment = self
+            .environments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(environment_id)
+            .cloned()
+            .ok_or_else(|| {
+                ExecServerError::Protocol(
+                    "execution adoption environment is unavailable".to_string(),
+                )
+            })?;
+        environment
+            .get_exec_backend()
+            .adopt_execution(request)
+            .await
+    }
+
     /// Builds a test-only manager without configured sandbox helper paths.
     pub fn default_for_tests() -> Self {
         Self {
@@ -662,6 +733,9 @@ pub struct Environment {
     /// `SshProcessBackend`: without this flag, exec would fall through to a
     /// local native process spawn (forbidden on iOS) instead of going over SSH.
     force_backend_exec: bool,
+    /// Whether backend exec implements AgentApp's durable identity, absolute
+    /// output cursor, adoption, and acknowledgement protocol.
+    durable_remote_exec_recovery: bool,
 }
 
 impl Environment {
@@ -676,6 +750,7 @@ impl Environment {
             http_client: Arc::new(ReqwestHttpClient),
             local_runtime_paths: None,
             force_backend_exec: false,
+            durable_remote_exec_recovery: false,
         }
     }
 }
@@ -736,6 +811,7 @@ impl Environment {
             http_client: Arc::new(ReqwestHttpClient),
             local_runtime_paths: Some(local_runtime_paths),
             force_backend_exec: false,
+            durable_remote_exec_recovery: false,
         }
     }
 
@@ -777,6 +853,7 @@ impl Environment {
     }
 
     pub fn ssh_with_config(config: SshEnvironmentConfig) -> Self {
+        let durable_remote_exec_recovery = !matches!(config.tmux_mode, SshTmuxMode::Disabled);
         let transport = SshTransport::new(
             config.connection_key,
             config.host,
@@ -807,6 +884,7 @@ impl Environment {
             // this is not a `remote_client` environment (`is_remote()` stays
             // false so shell-info snapshotting uses the safe local path).
             force_backend_exec: true,
+            durable_remote_exec_recovery,
         }
     }
 
@@ -843,6 +921,7 @@ impl Environment {
             // `is_remote()` already routes exec through the backend for remote
             // environments; the explicit flag is only needed for SSH server mode.
             force_backend_exec: false,
+            durable_remote_exec_recovery: false,
         }
     }
 
@@ -857,6 +936,13 @@ impl Environment {
     /// `SshProcessBackend`. Local environments return `false`.
     pub fn uses_backend_exec(&self) -> bool {
         self.is_remote() || self.force_backend_exec
+    }
+
+    /// Returns `true` only for backends that can reconcile a durable execution
+    /// after the client process restarts. Generic remote exec-server clients do
+    /// not currently expose authoritative output cursors or exact adoption.
+    pub fn supports_durable_remote_exec_recovery(&self) -> bool {
+        self.durable_remote_exec_recovery
     }
 
     /// Returns capability roots supplied with the deferred environment's ready signal.
@@ -1077,6 +1163,7 @@ mod tests {
             .expect("create environment");
 
         assert!(!environment.is_remote());
+        assert!(!environment.supports_durable_remote_exec_recovery());
         assert!(environment.info().await.is_ok());
     }
 
@@ -1128,6 +1215,7 @@ mod tests {
             Some(REMOTE_ENVIRONMENT_ID)
         );
         assert!(environment.is_remote());
+        assert!(!environment.supports_durable_remote_exec_recovery());
         assert!(Arc::ptr_eq(
             &environment,
             &manager
@@ -1621,6 +1709,7 @@ mod tests {
             .get_exec_backend()
             .start(crate::ExecParams {
                 process_id: ProcessId::from("default-env-proc"),
+                execution_identity: None,
                 argv: vec!["true".to_string()],
                 cwd: PathUri::from_host_native_path(
                     std::env::current_dir().expect("read current dir"),
@@ -1662,6 +1751,7 @@ mod tests {
             .get_exec_backend()
             .start(crate::ExecParams {
                 process_id: ProcessId::from("local-sandbox-proc"),
+                execution_identity: None,
                 argv: vec!["true".to_string()],
                 cwd: PathUri::from_host_native_path(
                     std::env::current_dir().expect("read current dir"),

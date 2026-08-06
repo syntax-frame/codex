@@ -406,6 +406,8 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
 }
 
 pub(crate) struct SandboxAttempt<'a> {
+    /// Zero for the initial launch and one for an intentional orchestrator retry.
+    pub attempt_generation: u32,
     pub sandbox: SandboxType,
     /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
     pub sandbox_requested: bool,
@@ -467,7 +469,8 @@ impl<'a> SandboxAttempt<'a> {
             request,
             options,
             workspace_roots,
-        ))
+        )
+        .with_attempt_generation(self.attempt_generation))
     }
 
     pub fn env_for_exec_server(
@@ -499,6 +502,7 @@ impl<'a> SandboxAttempt<'a> {
             .map_err(CodexErr::from)?;
         let mut exec_request =
             crate::sandboxing::ExecRequest::from_sandbox_exec_request(request, options, Vec::new());
+        exec_request.attempt_generation = self.attempt_generation;
         exec_request.exec_server_managed_network = managed_network;
         if self.sandbox_requested {
             exec_request.exec_server_sandbox = Some(FileSystemSandboxContext {

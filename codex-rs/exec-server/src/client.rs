@@ -1439,6 +1439,8 @@ async fn handle_server_notification(
                         seq: params.seq,
                         stream: params.stream,
                         chunk: params.chunk,
+                        absolute_start: params.absolute_start,
+                        absolute_end: params.absolute_end,
                     }));
                 if result.is_ok() {
                     session.note_change(params.seq);
@@ -1662,6 +1664,7 @@ mod tests {
         let session = client
             .start_process(ExecParams {
                 process_id: process_id.clone(),
+                execution_identity: None,
                 argv: vec!["true".to_string()],
                 cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
                     .expect("cwd URI"),
@@ -2031,6 +2034,8 @@ mod tests {
                         seq: 1,
                         stream: ExecOutputStream::Stdout,
                         chunk: b"one".to_vec().into(),
+                        absolute_start: None,
+                        absolute_end: None,
                     })
                     .expect("output notification should serialize"),
                 ),
@@ -2055,6 +2060,8 @@ mod tests {
                         seq: 2,
                         stream: ExecOutputStream::Stderr,
                         chunk: b"two".to_vec().into(),
+                        absolute_start: None,
+                        absolute_end: None,
                     })
                     .expect("output notification should serialize"),
                 ),
@@ -2083,11 +2090,15 @@ mod tests {
                     seq: 1,
                     stream: ExecOutputStream::Stdout,
                     chunk: b"one".to_vec().into(),
+                    absolute_start: None,
+                    absolute_end: None,
                 }),
                 ExecProcessEvent::Output(ProcessOutputChunk {
                     seq: 2,
                     stream: ExecOutputStream::Stderr,
                     chunk: b"two".to_vec().into(),
+                    absolute_start: None,
+                    absolute_end: None,
                 }),
                 ExecProcessEvent::Exited {
                     seq: 3,
@@ -2388,6 +2399,8 @@ mod tests {
                                 seq,
                                 stream: ExecOutputStream::Stdout,
                                 chunk: b"output".to_vec().into(),
+                                absolute_start: None,
+                                absolute_end: None,
                             })
                             .expect("output notification should serialize"),
                         ),
@@ -2686,6 +2699,8 @@ mod tests {
                             seq,
                             stream: ExecOutputStream::Stdout,
                             chunk: b"x".to_vec().into(),
+                            absolute_start: None,
+                            absolute_end: None,
                         })
                         .expect("output notification should serialize"),
                     ),

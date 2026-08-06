@@ -488,6 +488,7 @@ impl Session {
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
         mut initial_history: InitialHistory,
+        pending_remote_writes: Vec<codex_exec_server::PendingWriteInteraction>,
         session_source: SessionSource,
         skills_service: Arc<SkillsService>,
         plugins_manager: Arc<PluginsManager>,
@@ -1170,6 +1171,17 @@ impl Session {
                 dynamic_tool_argument_policy,
                 next_internal_sub_id: AtomicU64::new(0),
             });
+            if matches!(&initial_history, InitialHistory::Resumed(_)) {
+                sess.repair_pending_empty_polls_before_reconstruction(
+                    &pending_remote_writes,
+                    &mut initial_history,
+                )
+                .await?;
+            } else if !pending_remote_writes.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "pending remote writes require resumed rollout history"
+                ));
+            }
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
                 *guard = Arc::downgrade(&sess);

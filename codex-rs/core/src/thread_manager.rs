@@ -17,6 +17,7 @@ use crate::session::resolve_multi_agent_version;
 use crate::session::session::Session;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
+use base64::Engine;
 use codex_agent_graph_store::AgentGraphStore;
 use codex_agent_graph_store::LocalAgentGraphStore;
 use codex_analytics::AnalyticsEventsClient;
@@ -30,6 +31,14 @@ use codex_code_mode::InProcessCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::EnvironmentManager;
+use codex_exec_server::ExecProcessEvent;
+use codex_exec_server::GenerationSelection;
+use codex_exec_server::IncompleteExecution;
+use codex_exec_server::ReconciliationRequest;
+use codex_exec_server::RecoveredExecution;
+use codex_exec_server::RecoveredExecutionStatus;
+use codex_exec_server::RemoteExecutionProtocolEvidence;
+use codex_exec_server::select_execution_generation;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::LoadedUserInstructions;
@@ -49,12 +58,15 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RemoteExecutionLaunchIntent;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -66,6 +78,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
+use codex_rollout::append_function_output_if_missing;
 use codex_rollout::state_db::StateDbHandle;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LoadThreadHistoryParams;
@@ -724,6 +737,7 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread_with_source(
             options.config,
             options.initial_history,
+            Vec::new(),
             options.history_mode,
             options.allow_provider_model_fallback,
             Arc::clone(&self.state.auth_manager),
@@ -814,16 +828,304 @@ impl ThreadManager {
         supports_openai_form_elicitation: bool,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
     ) -> CodexResult<NewThread> {
+        self.resume_thread_from_rollout_with_tools_and_recovered_executions(
+            config,
+            rollout_path,
+            auth_manager,
+            parent_trace,
+            supports_openai_form_elicitation,
+            dynamic_tools,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Returns the exact durable unified-exec identities whose function calls
+    /// are still missing outputs in the persisted rollout.
+    pub async fn execution_reconciliation_request_from_rollout(
+        &self,
+        rollout_path: PathBuf,
+    ) -> CodexResult<ReconciliationRequest> {
         let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
-        Box::pin(self.resume_thread_with_history_and_tools(
+        let InitialHistory::Resumed(resumed) = initial_history else {
+            return Err(CodexErr::Fatal(
+                "rollout reconciliation requires resumed history".to_string(),
+            ));
+        };
+        Self::scan_active_remote_calls(
+            resumed.conversation_id.to_string(),
+            resumed.history.as_ref(),
+        )
+    }
+
+    pub(crate) fn scan_active_remote_calls(
+        thread_id: String,
+        history: &[RolloutItem],
+    ) -> CodexResult<ReconciliationRequest> {
+        let mut calls = HashMap::<
+            String,
+            (
+                usize,
+                String,
+                Option<(i32, bool)>,
+                RemoteExecutionProtocolEvidence,
+            ),
+        >::new();
+        let mut outputs = HashSet::new();
+        let mut marker_state = HashMap::<String, Option<bool>>::new();
+        let mut launch_intents =
+            HashMap::<(String, String, u32), RemoteExecutionLaunchIntent>::new();
+        let mut last_turn_id = None;
+        for (rollout_index, item) in history.iter().enumerate() {
+            let response_turn_id = match item {
+                RolloutItem::ResponseItem(response) => response.turn_id().map(str::to_owned),
+                _ => None,
+            };
+            if response_turn_id.is_some() {
+                last_turn_id = response_turn_id.clone();
+            }
+            match item {
+                RolloutItem::RemoteExecutionProtocolMarker(marker) => {
+                    let valid = marker.thread_id == thread_id
+                        && marker.protocol_version == 2
+                        && marker.identity_schema == "thread-turn-call-generation"
+                        && marker.descriptor_before_go;
+                    marker_state
+                        .entry(marker.turn_id.clone())
+                        .and_modify(|state| *state = None)
+                        .or_insert(Some(valid));
+                }
+                RolloutItem::RemoteExecutionLaunchIntent(intent) => {
+                    if intent.thread_id != thread_id
+                        || intent.attempt_generation > 1
+                        || intent.command_digest.is_empty()
+                        || intent.original_session_id <= 0
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "invalid remote execution launch intent for call {} generation {}",
+                            intent.call_id, intent.attempt_generation
+                        )));
+                    }
+                    let key = (
+                        intent.turn_id.clone(),
+                        intent.call_id.clone(),
+                        intent.attempt_generation,
+                    );
+                    let call_precedes_intent = calls.get(&intent.call_id).is_some_and(
+                        |(_, turn_id, interaction, protocol_evidence)| {
+                            turn_id == &intent.turn_id
+                                && interaction.is_none()
+                                && *protocol_evidence == RemoteExecutionProtocolEvidence::V2Proven
+                        },
+                    );
+                    if !call_precedes_intent || outputs.contains(&intent.call_id) {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote execution launch intent for call {} is early, late, or misordered",
+                            intent.call_id
+                        )));
+                    }
+                    if launch_intents.insert(key, intent.clone()).is_some() {
+                        return Err(CodexErr::Fatal(format!(
+                            "duplicate remote execution launch intent for call {} generation {}",
+                            intent.call_id, intent.attempt_generation
+                        )));
+                    }
+                }
+                RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                }) => {
+                    if name != "exec_command" && name != "write_stdin" {
+                        continue;
+                    }
+                    let turn_id = response_turn_id.ok_or_else(|| {
+                        CodexErr::Fatal(format!(
+                            "supported remote call {call_id} has no durable turn identity"
+                        ))
+                    })?;
+                    let protocol_evidence = if marker_state.get(&turn_id) == Some(&Some(true)) {
+                        RemoteExecutionProtocolEvidence::V2Proven
+                    } else {
+                        RemoteExecutionProtocolEvidence::LegacyUnknown
+                    };
+                    let interaction = if name == "write_stdin" {
+                        let arguments: serde_json::Value =
+                            serde_json::from_str(arguments).unwrap_or_default();
+                        let session_id = arguments
+                            .get("session_id")
+                            .and_then(serde_json::Value::as_i64)
+                            .and_then(|value| i32::try_from(value).ok());
+                        let chars = arguments
+                            .get("chars")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let session_id = session_id.ok_or_else(|| {
+                            CodexErr::Fatal(format!(
+                                "write_stdin call {call_id} has no valid session_id"
+                            ))
+                        })?;
+                        Some((session_id, chars.is_empty()))
+                    } else {
+                        None
+                    };
+                    if calls
+                        .insert(
+                            call_id.clone(),
+                            (rollout_index, turn_id, interaction, protocol_evidence),
+                        )
+                        .is_some()
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "duplicate supported function call id {call_id}"
+                        )));
+                    }
+                }
+                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. }) => {
+                    if !outputs.insert(call_id.clone()) {
+                        return Err(CodexErr::Fatal(format!(
+                            "duplicate function output id {call_id}"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let unmatched = calls
+            .iter()
+            .filter(|(call_id, _)| !outputs.contains(*call_id))
+            .collect::<Vec<_>>();
+        let unmatched_turns = unmatched
+            .iter()
+            .map(|(_, (_, turn_id, _, _))| turn_id.as_str())
+            .collect::<HashSet<_>>();
+        if unmatched_turns.len() > 1 {
+            return Err(CodexErr::Fatal(
+                "unmatched supported calls span multiple turns".to_string(),
+            ));
+        }
+        if let Some(unmatched_turn) = unmatched_turns.iter().next()
+            && last_turn_id.as_deref() != Some(*unmatched_turn)
+        {
+            return Err(CodexErr::Fatal(
+                "unmatched supported calls are not in the final active turn".to_string(),
+            ));
+        }
+        for ((turn_id, call_id, generation), _) in &launch_intents {
+            if *generation == 1
+                && !launch_intents.contains_key(&(turn_id.clone(), call_id.clone(), 0))
+            {
+                return Err(CodexErr::Fatal(format!(
+                    "remote execution generation 1 for call {call_id} lacks generation-0 intent"
+                )));
+            }
+        }
+        let mut incomplete_executions = unmatched
+            .iter()
+            .filter(|(_, (_, _, interaction, _))| interaction.is_none())
+            .flat_map(|(call_id, (_, turn_id, _, protocol_evidence))| {
+                let protocol_evidence = if *protocol_evidence
+                    == RemoteExecutionProtocolEvidence::V2Proven
+                    && marker_state.get(turn_id) == Some(&Some(true))
+                {
+                    RemoteExecutionProtocolEvidence::V2Proven
+                } else {
+                    RemoteExecutionProtocolEvidence::LegacyUnknown
+                };
+                [0, 1].map(|attempt_generation| IncompleteExecution {
+                    turn_id: turn_id.clone(),
+                    call_id: call_id.to_string(),
+                    attempt_generation,
+                    expected_command_digest: launch_intents
+                        .get(&(turn_id.clone(), call_id.to_string(), attempt_generation))
+                        .map(|intent| intent.command_digest.clone()),
+                    expected_session_id: launch_intents
+                        .get(&(turn_id.clone(), call_id.to_string(), attempt_generation))
+                        .map(|intent| intent.original_session_id),
+                    expected_tty: launch_intents
+                        .get(&(turn_id.clone(), call_id.to_string(), attempt_generation))
+                        .map(|intent| intent.tty),
+                    protocol_evidence,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut pending_writes = unmatched
+            .into_iter()
+            .filter_map(
+                |(call_id, (rollout_index, turn_id, interaction, protocol_evidence))| {
+                    interaction.map(|(session_id, input_is_empty)| {
+                        (
+                            *rollout_index,
+                            codex_exec_server::PendingWriteInteraction {
+                                call_id: call_id.clone(),
+                                turn_id: turn_id.clone(),
+                                session_id,
+                                input_is_empty,
+                                protocol_evidence: *protocol_evidence,
+                            },
+                        )
+                    })
+                },
+            )
+            .collect::<Vec<_>>();
+        pending_writes.sort_by_key(|(rollout_index, _)| *rollout_index);
+        let pending_writes = pending_writes
+            .into_iter()
+            .map(|(_, pending)| pending)
+            .collect::<Vec<_>>();
+        incomplete_executions.sort_by(|left, right| {
+            left.call_id
+                .cmp(&right.call_id)
+                .then(left.attempt_generation.cmp(&right.attempt_generation))
+        });
+        Ok(ReconciliationRequest {
+            thread_id,
+            incomplete_executions,
+            pending_writes,
+        })
+    }
+
+    /// Resume after inserting executor-recovered tool results into the loaded
+    /// rollout, before session reconstruction can normalize an open call as aborted.
+    pub async fn resume_thread_from_rollout_with_tools_and_recovered_executions(
+        &self,
+        config: Config,
+        rollout_path: PathBuf,
+        auth_manager: Arc<AuthManager>,
+        parent_trace: Option<W3cTraceContext>,
+        supports_openai_form_elicitation: bool,
+        dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+        recovered_executions: Vec<RecoveredExecution>,
+        pending_writes: Vec<codex_exec_server::PendingWriteInteraction>,
+    ) -> CodexResult<NewThread> {
+        let initial_history = self
+            .initial_history_from_rollout_path(rollout_path.clone())
+            .await?;
+        let repaired = append_recovered_execution_outputs_to_rollout(
+            &rollout_path,
+            &initial_history,
+            recovered_executions,
+            &self.environment_manager(),
+        )
+        .await?;
+        let initial_history = if repaired {
+            self.initial_history_from_rollout_path(rollout_path).await?
+        } else {
+            initial_history
+        };
+        let thread = Box::pin(self.resume_thread_with_history_and_tools(
             config,
             initial_history,
             auth_manager,
             parent_trace,
             supports_openai_form_elicitation,
             dynamic_tools,
+            pending_writes,
         ))
-        .await
+        .await?;
+        Ok(thread)
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -842,6 +1144,7 @@ impl ThreadManager {
             parent_trace,
             supports_openai_form_elicitation,
             Vec::new(),
+            Vec::new(),
         )
         .await
     }
@@ -855,6 +1158,7 @@ impl ThreadManager {
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+        pending_remote_writes: Vec<codex_exec_server::PendingWriteInteraction>,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&config);
         let environments = default_thread_environment_selections(
@@ -876,6 +1180,7 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread_with_source(
             config,
             initial_history,
+            pending_remote_writes,
             /*history_mode*/ None,
             /*allow_provider_model_fallback*/ false,
             auth_manager,
@@ -949,6 +1254,7 @@ impl ThreadManager {
         Box::pin(self.state.spawn_thread_with_source(
             config,
             initial_history,
+            Vec::new(),
             /*history_mode*/ None,
             /*allow_provider_model_fallback*/ false,
             auth_manager,
@@ -1504,6 +1810,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             InitialHistory::New,
+            Vec::new(),
             history_mode,
             /*allow_provider_model_fallback*/ false,
             Arc::clone(&self.auth_manager),
@@ -1547,6 +1854,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
+            Vec::new(),
             /*history_mode*/ None,
             /*allow_provider_model_fallback*/ false,
             Arc::clone(&self.auth_manager),
@@ -1594,6 +1902,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
+            Vec::new(),
             history_mode,
             /*allow_provider_model_fallback*/ false,
             Arc::clone(&self.auth_manager),
@@ -1637,6 +1946,7 @@ impl ThreadManagerState {
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
+            Vec::new(),
             /*history_mode*/ None,
             /*allow_provider_model_fallback*/ false,
             auth_manager,
@@ -1663,6 +1973,7 @@ impl ThreadManagerState {
         &self,
         config: Config,
         initial_history: InitialHistory,
+        pending_remote_writes: Vec<codex_exec_server::PendingWriteInteraction>,
         history_mode: Option<ThreadHistoryMode>,
         allow_provider_model_fallback: bool,
         auth_manager: Arc<AuthManager>,
@@ -1752,6 +2063,7 @@ impl ThreadManagerState {
             code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
             extensions: Arc::clone(&self.extensions),
             conversation_history: initial_history,
+            pending_remote_writes,
             requested_history_mode: history_mode,
             session_source,
             forked_from_thread_id,
@@ -1880,6 +2192,390 @@ fn stored_thread_to_initial_history(
         history: Arc::new(history.items),
         rollout_path: rollout_path.or(stored_thread.rollout_path),
     }))
+}
+
+async fn append_recovered_execution_outputs_to_rollout(
+    rollout_path: &std::path::Path,
+    history: &InitialHistory,
+    recovered_executions: Vec<RecoveredExecution>,
+    environment_manager: &EnvironmentManager,
+) -> CodexResult<bool> {
+    let InitialHistory::Resumed(resumed) = history else {
+        return Ok(false);
+    };
+    let conversation_id = resumed.conversation_id.to_string();
+    let mut call_identities = HashSet::new();
+    for item in resumed.history.iter() {
+        match item {
+            RolloutItem::ResponseItem(response @ ResponseItem::FunctionCall { call_id, .. }) => {
+                if let Some(turn_id) = response.turn_id() {
+                    call_identities.insert((turn_id.to_string(), call_id.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let reconciliation_request =
+        ThreadManager::scan_active_remote_calls(conversation_id.clone(), resumed.history.as_ref())?;
+    let launch_authorities = reconciliation_request
+        .incomplete_executions
+        .iter()
+        .cloned()
+        .map(|execution| {
+            (
+                (
+                    reconciliation_request.thread_id.clone(),
+                    execution.turn_id.clone(),
+                    execution.call_id.clone(),
+                    execution.attempt_generation,
+                ),
+                execution,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let v2_proven_calls = reconciliation_request
+        .incomplete_executions
+        .iter()
+        .filter(|execution| {
+            execution.protocol_evidence == RemoteExecutionProtocolEvidence::V2Proven
+                && execution.attempt_generation == 0
+        })
+        .map(|execution| {
+            (
+                reconciliation_request.thread_id.clone(),
+                execution.turn_id.clone(),
+                execution.call_id.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let selected_executions =
+        select_recovered_execution_rows(recovered_executions, &v2_proven_calls)?;
+    let mut appended = false;
+    for action in selected_executions {
+        let (mut execution, acknowledge_after_repair) = match action {
+            SelectedRecoveryAction::RepairAndAcknowledge(execution) => (execution, true),
+            SelectedRecoveryAction::RepairWithoutAcknowledgement(execution) => (execution, false),
+        };
+        let call_id = execution.identity.call_id.clone();
+        if execution.identity.thread_id != conversation_id
+            || !call_identities.contains(&(
+                execution.identity.turn_id.clone(),
+                execution.identity.call_id.clone(),
+            ))
+        {
+            continue;
+        }
+        let launch_authority = launch_authorities.get(&(
+            execution.identity.thread_id.clone(),
+            execution.identity.turn_id.clone(),
+            execution.identity.call_id.clone(),
+            execution.identity.attempt_generation,
+        ));
+        if !matches!(execution.status, RecoveredExecutionStatus::Missing) {
+            validate_recovered_execution_authority(&execution, launch_authority)?;
+        }
+        match execution.status {
+            RecoveredExecutionStatus::Missing => {
+                // Both deterministic slots were missing and the call had a
+                // preceding durable-v2 marker, so no remote descriptor exists
+                // to acknowledge or release.
+            }
+            RecoveredExecutionStatus::Prepared => {
+                return Err(CodexErr::Fatal(format!(
+                    "remote execution recovery is prepared for call {}",
+                    execution.identity.call_id
+                )));
+            }
+            RecoveredExecutionStatus::LaunchInterrupted => {}
+            RecoveredExecutionStatus::Running => {
+                let started = environment_manager
+                    .adopt_default_environment_execution(foreground_adoption_request(
+                        &execution,
+                        launch_authority,
+                    )?)
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+                let mut events = started.process.subscribe_events();
+                let mut exit_code = None;
+                loop {
+                    match events.recv().await {
+                        Ok(ExecProcessEvent::Output(chunk)) => {
+                            execution.output.extend_from_slice(&chunk.chunk.0);
+                        }
+                        Ok(ExecProcessEvent::Exited {
+                            exit_code: code, ..
+                        }) => exit_code = Some(code),
+                        Ok(ExecProcessEvent::Closed { .. }) if exit_code.is_some() => break,
+                        Ok(ExecProcessEvent::Closed { .. }) => {
+                            return Err(CodexErr::Fatal(format!(
+                                "adopted execution closed without a terminal status for call {}",
+                                execution.identity.call_id
+                            )));
+                        }
+                        Ok(ExecProcessEvent::Failed(error)) => {
+                            return Err(CodexErr::Fatal(format!(
+                                "adopted execution failed for call {}: {error}",
+                                execution.identity.call_id
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(CodexErr::Fatal(format!(
+                                "adopted execution event stream failed for call {}: {error}",
+                                execution.identity.call_id
+                            )));
+                        }
+                    }
+                }
+                execution.status = RecoveredExecutionStatus::Exited(
+                    exit_code.expect("closed branch requires an exit status"),
+                );
+                // Terminal status and output closure are not independently
+                // sufficient proof that the exact process group and retained
+                // tmux window are absent. Re-query the same descriptor while it
+                // is still retained, then use only that verified snapshot for
+                // rollout repair.
+                let authority = launch_authority.cloned().ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "adopted execution lacks local launch authority for call {}",
+                        execution.identity.call_id
+                    ))
+                })?;
+                let verification_request = ReconciliationRequest {
+                    thread_id: conversation_id.clone(),
+                    incomplete_executions: vec![authority],
+                    pending_writes: Vec::new(),
+                };
+                let mut verified = environment_manager
+                    .reconcile_default_environment(verification_request)
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+                if verified.len() != 1 {
+                    return Err(CodexErr::Fatal(format!(
+                        "adopted execution terminal verification returned {} rows for call {}",
+                        verified.len(),
+                        execution.identity.call_id
+                    )));
+                }
+                let verified = verified.pop().expect("length checked above");
+                validate_recovered_execution_authority(&verified, launch_authority)?;
+                let observed_exit = match execution.status {
+                    RecoveredExecutionStatus::Exited(exit_code) => exit_code,
+                    _ => unreachable!("adopted execution records an observed exit above"),
+                };
+                let terminal_matches = matches!(
+                    &verified.status,
+                    RecoveredExecutionStatus::Exited(exit_code) if *exit_code == observed_exit
+                ) || matches!(
+                    &verified.status,
+                    RecoveredExecutionStatus::Terminated if observed_exit == 143
+                );
+                if verified.identity != execution.identity
+                    || !terminal_matches
+                    || !verified.terminal_verified_dead
+                    || verified.output != execution.output
+                    || verified.committed_output_cursor != verified.output.len() as u64
+                {
+                    return Err(CodexErr::Fatal(format!(
+                        "adopted execution terminal verification is inconsistent for call {}",
+                        execution.identity.call_id
+                    )));
+                }
+                execution = verified;
+            }
+            RecoveredExecutionStatus::Unknown => {
+                return Err(CodexErr::Fatal(format!(
+                    "remote execution recovery state is unknown for call {}",
+                    execution.identity.call_id
+                )));
+            }
+            RecoveredExecutionStatus::Exited(_) | RecoveredExecutionStatus::Terminated => {}
+        }
+        let output =
+            FunctionCallOutputPayload::from_text(format_recovered_execution_output(&execution));
+        append_function_output_if_missing(rollout_path, &call_id, &output).await?;
+        if acknowledge_after_repair {
+            environment_manager
+                .acknowledge_default_environment_recovery(execution.acknowledgement)
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        }
+        appended = true;
+    }
+    Ok(appended)
+}
+
+fn foreground_adoption_request(
+    execution: &RecoveredExecution,
+    authority: Option<&IncompleteExecution>,
+) -> CodexResult<codex_exec_server::AdoptionRequest> {
+    let authority = authority.ok_or_else(|| {
+        CodexErr::Fatal(format!(
+            "remote execution recovery lacks local launch authority for call {}",
+            execution.identity.call_id
+        ))
+    })?;
+    let command_digest = authority.expected_command_digest.clone().ok_or_else(|| {
+        CodexErr::Fatal(format!(
+            "remote execution recovery lacks a local command digest for call {}",
+            execution.identity.call_id
+        ))
+    })?;
+    let original_session_id = authority.expected_session_id.ok_or_else(|| {
+        CodexErr::Fatal(format!(
+            "remote execution recovery lacks a local session id for call {}",
+            execution.identity.call_id
+        ))
+    })?;
+    let tty = authority.expected_tty.ok_or_else(|| {
+        CodexErr::Fatal(format!(
+            "remote execution recovery lacks a local output mode for call {}",
+            execution.identity.call_id
+        ))
+    })?;
+    Ok(codex_exec_server::AdoptionRequest {
+        identity: execution.identity.clone(),
+        expected_command_digest: command_digest,
+        original_session_id: Some(original_session_id),
+        committed_output_cursor: execution.committed_output_cursor,
+        tty,
+    })
+}
+
+fn validate_recovered_execution_authority(
+    execution: &RecoveredExecution,
+    authority: Option<&IncompleteExecution>,
+) -> CodexResult<()> {
+    let authority = authority.ok_or_else(|| {
+        CodexErr::Fatal(format!(
+            "remote execution recovery lacks local launch authority for call {}",
+            execution.identity.call_id
+        ))
+    })?;
+    if execution.command_digest.as_deref() != authority.expected_command_digest.as_deref()
+        || execution.session_id != authority.expected_session_id
+        || authority.expected_tty.is_none()
+    {
+        return Err(CodexErr::Fatal(format!(
+            "remote execution recovery conflicts with local launch authority for call {}",
+            execution.identity.call_id
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum SelectedRecoveryAction {
+    RepairAndAcknowledge(RecoveredExecution),
+    RepairWithoutAcknowledgement(RecoveredExecution),
+}
+
+fn select_recovered_execution_rows(
+    recovered_executions: Vec<RecoveredExecution>,
+    v2_proven_calls: &HashSet<(String, String, String)>,
+) -> CodexResult<Vec<SelectedRecoveryAction>> {
+    let mut grouped = std::collections::BTreeMap::<
+        (String, String, String),
+        [Option<RecoveredExecution>; 2],
+    >::new();
+    for execution in recovered_executions {
+        let generation = usize::try_from(execution.identity.attempt_generation).map_err(|_| {
+            CodexErr::Fatal("remote execution generation is out of range".to_string())
+        })?;
+        if generation > 1 {
+            return Err(CodexErr::Fatal(format!(
+                "unexpected remote execution generation {generation}"
+            )));
+        }
+        let key = (
+            execution.identity.thread_id.clone(),
+            execution.identity.turn_id.clone(),
+            execution.identity.call_id.clone(),
+        );
+        let slots = grouped.entry(key).or_insert_with(|| [None, None]);
+        if slots[generation].replace(execution).is_some() {
+            return Err(CodexErr::Fatal(format!(
+                "duplicate remote execution generation {generation}"
+            )));
+        }
+    }
+
+    let mut selected = Vec::with_capacity(grouped.len());
+    for ((thread_id, turn_id, call_id), [generation_zero, generation_one]) in grouped {
+        let generation_zero = generation_zero.ok_or_else(|| {
+            CodexErr::Fatal(format!(
+                "remote execution {thread_id}/{turn_id}/{call_id} is missing generation 0"
+            ))
+        })?;
+        let generation_one = generation_one.ok_or_else(|| {
+            CodexErr::Fatal(format!(
+                "remote execution {thread_id}/{turn_id}/{call_id} is missing generation 1"
+            ))
+        })?;
+        match select_execution_generation(&generation_zero, &generation_one)
+            .map_err(CodexErr::Fatal)?
+        {
+            GenerationSelection::Selected(0) => selected.push(
+                SelectedRecoveryAction::RepairAndAcknowledge(generation_zero),
+            ),
+            GenerationSelection::Selected(1) => {
+                selected.push(SelectedRecoveryAction::RepairAndAcknowledge(generation_one))
+            }
+            GenerationSelection::Selected(generation) => {
+                return Err(CodexErr::Fatal(format!(
+                    "invalid selected remote execution generation {generation}"
+                )));
+            }
+            GenerationSelection::NeedsTerminalVerification(generation) => {
+                return Err(CodexErr::Fatal(format!(
+                    "remote execution {thread_id}/{turn_id}/{call_id} generation {generation} needs terminal verification"
+                )));
+            }
+            GenerationSelection::NotLaunched => {
+                if v2_proven_calls.contains(&(thread_id.clone(), turn_id.clone(), call_id.clone()))
+                {
+                    selected.push(SelectedRecoveryAction::RepairWithoutAcknowledgement(
+                        generation_zero,
+                    ));
+                } else {
+                    return Err(CodexErr::Fatal(format!(
+                        "remote execution {thread_id}/{turn_id}/{call_id} has no durable-v2 launch evidence"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn format_recovered_execution_output(execution: &RecoveredExecution) -> String {
+    let terminal = match execution.status {
+        RecoveredExecutionStatus::Missing => "Process was not launched".to_string(),
+        RecoveredExecutionStatus::Prepared => "Process launch is prepared".to_string(),
+        RecoveredExecutionStatus::LaunchInterrupted => {
+            "Process launch was interrupted before execution".to_string()
+        }
+        RecoveredExecutionStatus::Running => "Process is still running".to_string(),
+        RecoveredExecutionStatus::Exited(exit_code) => {
+            format!("Process exited with code {exit_code}")
+        }
+        RecoveredExecutionStatus::Terminated => {
+            if execution.delivery_unknown {
+                "Process was terminated during SSH lifecycle recovery; stdin delivery is unknown"
+                    .to_string()
+            } else {
+                "Process was terminated during SSH lifecycle recovery".to_string()
+            }
+        }
+        RecoveredExecutionStatus::Unknown => "Remote process state is unknown".to_string(),
+    };
+    let output = match std::str::from_utf8(&execution.output) {
+        Ok(output) => output.to_string(),
+        Err(_) => format!(
+            "[invalid UTF-8 output; base64={} ]",
+            base64::engine::general_purpose::STANDARD.encode(&execution.output)
+        ),
+    };
+    format!("{terminal}\nOutput:\n{}", output)
 }
 
 fn thread_store_rollout_read_error(err: ThreadStoreError) -> CodexErr {

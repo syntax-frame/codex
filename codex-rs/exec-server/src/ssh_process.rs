@@ -36,6 +36,7 @@ use crate::ExecProcessFuture;
 use crate::ExecServerError;
 use crate::ProcessId;
 use crate::StartedExecProcess;
+use crate::process::ExecBackendReconcileFuture;
 use crate::process::ExecProcessEventLog;
 use crate::protocol::ExecOutputStream;
 use crate::protocol::ExecParams;
@@ -56,6 +57,7 @@ mod tmux;
 const RETAINED_OUTPUT_BYTES_PER_PROCESS: usize = 1024 * 1024;
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const SSH_START_ATTEMPTS: usize = 2;
+const SSH_TERMINATE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_PATH_EXPORT: &str = "export PATH=\"$HOME/bin:$HOME/.local/bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}\"";
 
 /// Whether server-mode process execution requires tmux continuity.
@@ -74,6 +76,7 @@ pub enum SshTmuxMode {
 pub struct SshProcessBackend {
     transport: SshTransport,
     session_key: String,
+    controller_id: String,
     tmux_mode: SshTmuxMode,
 }
 
@@ -176,9 +179,27 @@ impl SshProcessBackend {
         session_key: impl Into<String>,
         tmux_mode: SshTmuxMode,
     ) -> Self {
+        Self::from_transport_with_controller(
+            transport,
+            session_key,
+            uuid::Uuid::new_v4().simple().to_string(),
+            tmux_mode,
+        )
+    }
+
+    pub(crate) fn from_transport_with_controller(
+        transport: SshTransport,
+        session_key: impl Into<String>,
+        controller_id: impl Into<String>,
+        tmux_mode: SshTmuxMode,
+    ) -> Self {
         Self {
             transport,
             session_key: session_key.into(),
+            // Ordering is established under the remote lifecycle lock. The
+            // client contributes only a collision-resistant ownership token;
+            // wall-clock ordering is deliberately not part of fencing.
+            controller_id: controller_id.into(),
             tmux_mode,
         }
     }
@@ -305,11 +326,69 @@ impl SshProcessBackend {
     pub(super) fn session_key(&self) -> &str {
         &self.session_key
     }
+
+    pub(super) fn controller_id(&self) -> &str {
+        &self.controller_id
+    }
 }
 
 impl ExecBackend for SshProcessBackend {
     fn start(&self, params: ExecParams) -> ExecBackendFuture<'_> {
         Box::pin(SshProcessBackend::start(self, params))
+    }
+
+    fn start_prepared(&self, prepared: crate::PreparedExecution) -> ExecBackendFuture<'_> {
+        Box::pin(async move {
+            if prepared.params().execution_identity.is_none() {
+                return SshProcessBackend::start(self, prepared.into_params()).await;
+            }
+            match self.tmux_mode {
+                SshTmuxMode::Required | SshTmuxMode::Preferred => {
+                    tmux::start_prepared(self.clone(), prepared).await
+                }
+                SshTmuxMode::Disabled => Err(ExecServerError::Protocol(
+                    "durable SSH execution requires tmux".to_string(),
+                )),
+            }
+        })
+    }
+
+    fn adopt_execution(&self, request: crate::AdoptionRequest) -> ExecBackendFuture<'_> {
+        Box::pin(async move {
+            match self.tmux_mode {
+                SshTmuxMode::Required | SshTmuxMode::Preferred => {
+                    tmux::adopt_execution(self.clone(), request).await
+                }
+                SshTmuxMode::Disabled => Err(ExecServerError::Protocol(
+                    "direct SSH execution cannot be durably adopted".to_string(),
+                )),
+            }
+        })
+    }
+
+    fn reconcile(&self, request: crate::ReconciliationRequest) -> ExecBackendReconcileFuture<'_> {
+        Box::pin(async move {
+            match self.tmux_mode {
+                SshTmuxMode::Required | SshTmuxMode::Preferred => {
+                    tmux::reconcile(self, &request).await
+                }
+                SshTmuxMode::Disabled => Ok(Vec::new()),
+            }
+        })
+    }
+
+    fn acknowledge_consumed(
+        &self,
+        acknowledgement: crate::RecoveredExecutionAcknowledgement,
+    ) -> crate::process::ExecBackendAcknowledgeFuture<'_> {
+        Box::pin(async move {
+            match self.tmux_mode {
+                SshTmuxMode::Required | SshTmuxMode::Preferred => {
+                    tmux::acknowledge_consumed(self, &acknowledgement).await
+                }
+                SshTmuxMode::Disabled => Ok(()),
+            }
+        })
     }
 }
 
@@ -340,7 +419,9 @@ fn build_remote_command_with_argv_prefix(params: &ExecParams, argv_prefix: &str)
         prefix.push_str(" && ");
     }
 
-    for (key, value) in &params.env {
+    let mut environment = params.env.iter().collect::<Vec<_>>();
+    environment.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    for (key, value) in environment {
         prefix.push_str(&format!("export {}={} && ", key, shell_quote(value)));
     }
 
@@ -390,6 +471,8 @@ struct RetainedChunk {
     seq: u64,
     stream: ExecOutputStream,
     chunk: Vec<u8>,
+    absolute_start: Option<u64>,
+    absolute_end: Option<u64>,
 }
 
 /// Mutating channel operations are funneled to the pump task that owns the
@@ -400,7 +483,9 @@ enum ChannelCommand {
         ack: oneshot::Sender<Result<(), String>>,
     },
     Signal(Sig),
-    Eof,
+    Terminate {
+        ack: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 struct SshProcess {
@@ -443,6 +528,8 @@ impl ExecProcessImpl for SshProcess {
                         seq: retained.seq,
                         stream: retained.stream,
                         chunk: retained.chunk.clone().into(),
+                        absolute_start: retained.absolute_start,
+                        absolute_end: retained.absolute_end,
                     });
                     next_seq = retained.seq + 1;
                     if total_bytes >= max_bytes {
@@ -544,10 +631,31 @@ impl ExecProcessImpl for SshProcess {
     }
 
     async fn terminate(&self) -> Result<(), ExecServerError> {
-        // Send EOF to close stdin; the pump task closes the channel when the
-        // remote side finishes. Best effort.
-        let _ = self.cmd_tx.send(ChannelCommand::Eof).await;
-        Ok(())
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ChannelCommand::Terminate { ack: ack_tx })
+            .await
+            .map_err(|_| {
+                ExecServerError::Protocol(
+                    "ssh terminate failed: process command pump is unavailable".to_string(),
+                )
+            })?;
+        tokio::time::timeout(SSH_TERMINATE_ACK_TIMEOUT, ack_rx)
+            .await
+            .map_err(|_| {
+                ExecServerError::Protocol(
+                    "ssh terminate failed: timed out awaiting remote acknowledgement".to_string(),
+                )
+            })?
+            .map_err(|_| {
+                ExecServerError::Protocol(
+                    "ssh terminate failed: process command pump dropped acknowledgement"
+                        .to_string(),
+                )
+            })?
+            .map_err(|message| {
+                ExecServerError::Protocol(format!("ssh terminate failed: {message}"))
+            })
     }
 }
 
@@ -613,6 +721,7 @@ async fn channel_pump(
     mut cmd_rx: mpsc::Receiver<ChannelCommand>,
 ) {
     let mut exit_code: Option<i32> = None;
+    let mut termination_ack: Option<oneshot::Sender<Result<(), String>>> = None;
 
     loop {
         tokio::select! {
@@ -660,8 +769,22 @@ async fn channel_pump(
                     Some(ChannelCommand::Signal(sig)) => {
                         let _ = channel.channel().signal(sig).await;
                     }
-                    Some(ChannelCommand::Eof) => {
-                        let _ = channel.channel().eof().await;
+                    Some(ChannelCommand::Terminate { ack }) => {
+                        if termination_ack.is_some() {
+                            let _ = ack.send(Err("termination is already pending".to_string()));
+                            continue;
+                        }
+                        if let Err(error) = channel.channel().signal(Sig::TERM).await {
+                            let _ = ack.send(Err(error.to_string()));
+                            continue;
+                        }
+                        if let Err(error) = channel.channel().eof().await {
+                            let _ = ack.send(Err(error.to_string()));
+                            continue;
+                        }
+                        // Delivery of EOF/signal is not termination. Acknowledge
+                        // only after the SSH channel actually closes.
+                        termination_ack = Some(ack);
                     }
                     None => {
                         // All process handles dropped; nothing left to drive
@@ -676,6 +799,9 @@ async fn channel_pump(
     // readers observe an `Exited` before `Closed`.
     if exit_code.is_none() {
         publish_exit(&state, &events, &wake_tx, &output_notify, 0);
+    }
+    if let Some(ack) = termination_ack {
+        let _ = ack.send(Ok(()));
     }
     publish_closed(&state, &events, &wake_tx, &output_notify);
 }
@@ -696,6 +822,8 @@ fn publish_output(
             seq,
             stream,
             chunk: chunk.clone(),
+            absolute_start: None,
+            absolute_end: None,
         });
         while state.retained_bytes > RETAINED_OUTPUT_BYTES_PER_PROCESS {
             let Some(evicted) = state.output.pop_front() else {
@@ -708,6 +836,48 @@ fn publish_output(
             seq,
             stream,
             chunk: chunk.into(),
+            absolute_start: None,
+            absolute_end: None,
+        }
+    };
+    events.publish(ExecProcessEvent::Output(output));
+    output_notify.notify_waiters();
+}
+
+fn publish_output_with_absolute_range(
+    state: &Arc<StdMutex<SharedState>>,
+    events: &ExecProcessEventLog,
+    wake_tx: &watch::Sender<u64>,
+    output_notify: &Arc<Notify>,
+    stream: ExecOutputStream,
+    chunk: Vec<u8>,
+    absolute_start: u64,
+    absolute_end: u64,
+) {
+    let output = {
+        let mut state = lock(state);
+        let seq = next_seq(&mut state);
+        state.retained_bytes += chunk.len();
+        state.output.push_back(RetainedChunk {
+            seq,
+            stream,
+            chunk: chunk.clone(),
+            absolute_start: Some(absolute_start),
+            absolute_end: Some(absolute_end),
+        });
+        while state.retained_bytes > RETAINED_OUTPUT_BYTES_PER_PROCESS {
+            let Some(evicted) = state.output.pop_front() else {
+                break;
+            };
+            state.retained_bytes = state.retained_bytes.saturating_sub(evicted.chunk.len());
+        }
+        let _ = wake_tx.send(seq);
+        ProcessOutputChunk {
+            seq,
+            stream,
+            chunk: chunk.into(),
+            absolute_start: Some(absolute_start),
+            absolute_end: Some(absolute_end),
         }
     };
     events.publish(ExecProcessEvent::Output(output));
@@ -758,6 +928,10 @@ fn publish_closed(
     events.publish(ExecProcessEvent::Closed { seq });
     output_notify.notify_waiters();
 }
+
+#[cfg(test)]
+#[path = "ssh_process_tests.rs"]
+mod tests;
 
 fn next_seq(state: &mut SharedState) -> u64 {
     let seq = state.next_seq;

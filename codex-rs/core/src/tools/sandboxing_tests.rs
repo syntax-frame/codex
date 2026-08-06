@@ -214,6 +214,7 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd));
     let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
+        attempt_generation: 0,
         sandbox: SandboxType::None,
         sandbox_requested: true,
         permissions: &permissions,

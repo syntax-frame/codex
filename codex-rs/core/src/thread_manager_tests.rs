@@ -14,12 +14,15 @@ use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InternalSessionSource;
+use codex_protocol::protocol::RemoteExecutionLaunchIntent;
+use codex_protocol::protocol::RemoteExecutionProtocolMarker;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
@@ -39,6 +42,608 @@ use tempfile::tempdir;
 use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn scanner_call(name: &str, call_id: &str, turn_id: &str, arguments: &str) -> RolloutItem {
+    let mut item = ResponseItem::FunctionCall {
+        id: None,
+        name: name.to_string(),
+        namespace: None,
+        arguments: arguments.to_string(),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    item.set_turn_id_if_missing(turn_id);
+    RolloutItem::ResponseItem(item)
+}
+
+fn scanner_output(call_id: &str, turn_id: &str) -> RolloutItem {
+    let mut item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload::from_text("done".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    item.set_turn_id_if_missing(turn_id);
+    RolloutItem::ResponseItem(item)
+}
+
+fn scanner_marker(thread_id: &str, turn_id: &str, protocol_version: u32) -> RolloutItem {
+    RolloutItem::RemoteExecutionProtocolMarker(RemoteExecutionProtocolMarker {
+        thread_id: thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+        protocol_version,
+        identity_schema: "thread-turn-call-generation".to_string(),
+        descriptor_before_go: true,
+    })
+}
+
+fn scanner_launch_intent(
+    thread_id: &str,
+    turn_id: &str,
+    call_id: &str,
+    generation: u32,
+    digest: &str,
+) -> RolloutItem {
+    RolloutItem::RemoteExecutionLaunchIntent(RemoteExecutionLaunchIntent {
+        thread_id: thread_id.to_string(),
+        turn_id: turn_id.to_string(),
+        call_id: call_id.to_string(),
+        attempt_generation: generation,
+        command_digest: digest.to_string(),
+        original_session_id: 4242,
+        tty: false,
+    })
+}
+
+#[test]
+fn scanner_uses_only_unique_exact_post_call_launch_intent() {
+    let request = ThreadManager::scan_active_remote_calls(
+        "thread".to_string(),
+        &[
+            scanner_marker("thread", "turn", 2),
+            scanner_call("exec_command", "exec", "turn", "{}"),
+            scanner_launch_intent("thread", "turn", "exec", 0, "digest-0"),
+        ],
+    )
+    .expect("scan");
+    assert_eq!(
+        request.incomplete_executions[0]
+            .expected_command_digest
+            .as_deref(),
+        Some("digest-0")
+    );
+    assert_eq!(
+        request.incomplete_executions[1].expected_command_digest,
+        None
+    );
+    assert_eq!(
+        request.incomplete_executions[0].expected_session_id,
+        Some(4242)
+    );
+    assert_eq!(request.incomplete_executions[0].expected_tty, Some(false));
+}
+
+#[test]
+fn scanner_rejects_late_duplicate_conflicting_or_wrong_identity_intent_authority() {
+    for intents in [
+        vec![
+            scanner_launch_intent("thread", "turn", "exec", 0, "digest-a"),
+            scanner_launch_intent("thread", "turn", "exec", 0, "digest-a"),
+        ],
+        vec![
+            scanner_launch_intent("thread", "turn", "exec", 0, "digest-a"),
+            scanner_launch_intent("thread", "turn", "exec", 0, "digest-b"),
+        ],
+        vec![scanner_launch_intent(
+            "other-thread",
+            "turn",
+            "exec",
+            0,
+            "digest-a",
+        )],
+    ] {
+        let mut history = vec![
+            scanner_marker("thread", "turn", 2),
+            scanner_call("exec_command", "exec", "turn", "{}"),
+        ];
+        history.extend(intents);
+        ThreadManager::scan_active_remote_calls("thread".to_string(), &history)
+            .expect_err("invalid launch intent must fail closed");
+    }
+
+    ThreadManager::scan_active_remote_calls(
+        "thread".to_string(),
+        &[
+            scanner_marker("thread", "turn", 2),
+            scanner_launch_intent("thread", "turn", "exec", 0, "too-early"),
+            scanner_call("exec_command", "exec", "turn", "{}"),
+        ],
+    )
+    .expect_err("early launch intent must fail closed");
+}
+
+#[test]
+fn active_tail_scanner_requires_valid_marker_before_each_supported_call() {
+    let valid = ThreadManager::scan_active_remote_calls(
+        "thread".to_string(),
+        &[
+            scanner_marker("thread", "turn", 2),
+            scanner_call("exec_command", "exec", "turn", "{}"),
+        ],
+    )
+    .expect("valid marker");
+    assert!(valid.incomplete_executions.iter().all(|slot| {
+        slot.protocol_evidence == codex_exec_server::RemoteExecutionProtocolEvidence::V2Proven
+    }));
+
+    for history in [
+        vec![scanner_call("exec_command", "legacy", "turn", "{}")],
+        vec![
+            scanner_call("exec_command", "late", "turn", "{}"),
+            scanner_marker("thread", "turn", 2),
+        ],
+        vec![
+            scanner_marker("thread", "turn", 99),
+            scanner_call("exec_command", "unknown", "turn", "{}"),
+        ],
+        vec![
+            scanner_marker("thread", "turn", 2),
+            scanner_call("exec_command", "duplicate", "turn", "{}"),
+            scanner_marker("thread", "turn", 2),
+        ],
+        vec![
+            scanner_marker("thread", "turn", 2),
+            scanner_call("exec_command", "conflict", "turn", "{}"),
+            scanner_marker("thread", "turn", 99),
+        ],
+    ] {
+        let request =
+            ThreadManager::scan_active_remote_calls("thread".to_string(), &history).expect("scan");
+        assert!(request.incomplete_executions.iter().all(|slot| {
+            slot.protocol_evidence
+                == codex_exec_server::RemoteExecutionProtocolEvidence::LegacyUnknown
+        }));
+    }
+}
+
+#[test]
+fn marker_conflict_is_turn_local_and_late_marker_never_backfills_evidence() {
+    let request = ThreadManager::scan_active_remote_calls(
+        "thread".to_string(),
+        &[
+            scanner_marker("thread", "old-turn", 2),
+            scanner_marker("thread", "old-turn", 99),
+            scanner_call("exec_command", "old", "old-turn", "{}"),
+            scanner_output("old", "old-turn"),
+            scanner_call("exec_command", "late", "new-turn", "{}"),
+            scanner_marker("thread", "new-turn", 2),
+        ],
+    )
+    .expect("turn-local marker classification");
+    assert!(request.incomplete_executions.iter().all(|slot| {
+        slot.call_id == "late"
+            && slot.protocol_evidence
+                == codex_exec_server::RemoteExecutionProtocolEvidence::LegacyUnknown
+    }));
+
+    let request = ThreadManager::scan_active_remote_calls(
+        "thread".to_string(),
+        &[
+            scanner_marker("thread", "poisoned", 2),
+            scanner_marker("thread", "poisoned", 2),
+            scanner_marker("thread", "clean", 2),
+            scanner_call("exec_command", "clean-call", "clean", "{}"),
+        ],
+    )
+    .expect("old turn conflict must not poison clean turn");
+    assert!(request.incomplete_executions.iter().all(|slot| {
+        slot.call_id == "clean-call"
+            && slot.protocol_evidence
+                == codex_exec_server::RemoteExecutionProtocolEvidence::V2Proven
+    }));
+}
+
+#[test]
+fn clean_legacy_history_can_start_a_new_marked_turn() {
+    let request = ThreadManager::scan_active_remote_calls(
+        "thread".to_string(),
+        &[
+            scanner_call("exec_command", "old", "old-turn", "{}"),
+            scanner_output("old", "old-turn"),
+            scanner_marker("thread", "new-turn", 2),
+            scanner_call("exec_command", "new", "new-turn", "{}"),
+        ],
+    )
+    .expect("clean legacy history may migrate at a new turn");
+    assert!(request.incomplete_executions.iter().all(|slot| {
+        slot.call_id == "new"
+            && slot.protocol_evidence
+                == codex_exec_server::RemoteExecutionProtocolEvidence::V2Proven
+    }));
+}
+
+#[test]
+fn active_tail_scanner_supports_exec_and_preserves_write_interaction() {
+    let history = vec![
+        scanner_call("unrelated", "ignored", "turn-1", "{}"),
+        scanner_call("exec_command", "exec", "turn-1", "{}"),
+        scanner_call(
+            "write_stdin",
+            "write",
+            "turn-1",
+            r#"{"session_id":42,"chars":""}"#,
+        ),
+    ];
+    let request =
+        ThreadManager::scan_active_remote_calls("thread".to_string(), &history).expect("scan");
+
+    assert_eq!(request.incomplete_executions.len(), 2);
+    assert!(
+        request
+            .incomplete_executions
+            .iter()
+            .all(|slot| slot.call_id == "exec")
+    );
+    assert_eq!(request.pending_writes.len(), 1);
+    assert_eq!(request.pending_writes[0].call_id, "write");
+    assert_eq!(request.pending_writes[0].turn_id, "turn-1");
+    assert_eq!(request.pending_writes[0].session_id, 42);
+    assert!(request.pending_writes[0].input_is_empty);
+}
+
+#[test]
+fn active_tail_scanner_rejects_duplicates_and_turn_conflicts() {
+    assert!(
+        ThreadManager::scan_active_remote_calls(
+            "thread".to_string(),
+            &[
+                scanner_call("exec_command", "dup", "turn-1", "{}"),
+                scanner_call("exec_command", "dup", "turn-1", "{}"),
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        ThreadManager::scan_active_remote_calls(
+            "thread".to_string(),
+            &[
+                scanner_call("exec_command", "done", "turn-1", "{}"),
+                scanner_output("done", "turn-1"),
+                scanner_output("done", "turn-1"),
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        ThreadManager::scan_active_remote_calls(
+            "thread".to_string(),
+            &[
+                scanner_call("exec_command", "first", "turn-1", "{}"),
+                scanner_call("exec_command", "second", "turn-2", "{}"),
+            ],
+        )
+        .is_err()
+    );
+    assert!(
+        ThreadManager::scan_active_remote_calls(
+            "thread".to_string(),
+            &[
+                scanner_call("exec_command", "earlier", "turn-1", "{}"),
+                scanner_call("unrelated", "later", "turn-2", "{}"),
+            ],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn recovered_output_is_truthful_and_preserves_exact_bytes() {
+    let execution = codex_exec_server::RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: String::new(),
+            call_id: "call-after-crash".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: None,
+        output: b"exact output\n".to_vec(),
+        status: codex_exec_server::RecoveredExecutionStatus::Exited(0),
+        terminal_verified_dead: true,
+        session_id: Some(42),
+        committed_output_cursor: 13,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "0123456789abcdef-token".to_string(),
+        ),
+    };
+
+    let output = format_recovered_execution_output(&execution);
+
+    assert_eq!(
+        output,
+        "Process exited with code 0\nOutput:\nexact output\n"
+    );
+    assert!(!output.contains("aborted"));
+}
+
+#[test]
+fn running_foreground_recovery_adopts_and_waits_before_rollout_repair() {
+    let source = include_str!("thread_manager.rs");
+    let repair = source
+        .split("async fn append_recovered_execution_outputs_to_rollout")
+        .nth(1)
+        .expect("recovery repair function")
+        .split("#[derive(Debug)]")
+        .next()
+        .expect("recovery repair body");
+    let running = repair
+        .find("RecoveredExecutionStatus::Running")
+        .expect("running recovery branch");
+    let adopt = repair[running..]
+        .find("adopt_default_environment_execution")
+        .expect("exact foreground adoption")
+        + running;
+    let event_wait = repair[adopt..]
+        .find("events.recv().await")
+        .expect("truthful terminal wait")
+        + adopt;
+    let terminal_verify = repair[event_wait..]
+        .find("reconcile_default_environment")
+        .expect("exact retained-descriptor verification")
+        + event_wait;
+    let append = repair
+        .find("append_function_output_if_missing")
+        .expect("durable rollout repair");
+    assert!(running < adopt);
+    assert!(adopt < event_wait);
+    assert!(event_wait < terminal_verify);
+    assert!(terminal_verify < append);
+    assert!(source.contains("original_session_id: Some(original_session_id)"));
+    assert!(repair.contains("!verified.terminal_verified_dead"));
+    assert!(!repair.contains("if execution.session_id.is_some()"));
+}
+
+#[test]
+fn running_foreground_adoption_preserves_persisted_session_id() {
+    let mut execution = recovered_slot(
+        "foreground",
+        0,
+        codex_exec_server::RecoveredExecutionStatus::Running,
+        false,
+    );
+    execution.command_digest = Some("digest".to_string());
+    execution.session_id = Some(4242);
+    execution.committed_output_cursor = 17;
+
+    let authority = IncompleteExecution {
+        turn_id: execution.identity.turn_id.clone(),
+        call_id: execution.identity.call_id.clone(),
+        attempt_generation: execution.identity.attempt_generation,
+        expected_command_digest: Some("digest".to_string()),
+        expected_session_id: Some(4242),
+        expected_tty: Some(false),
+        protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+    };
+    let request = foreground_adoption_request(&execution, Some(&authority))
+        .expect("foreground adoption request");
+    assert_eq!(request.original_session_id, Some(4242));
+    assert_eq!(request.committed_output_cursor, 17);
+    assert_eq!(request.identity, execution.identity);
+}
+
+#[test]
+fn resumed_background_sessions_restore_before_thread_exposure() {
+    let source = include_str!("thread_manager.rs");
+    let spawn = source
+        .split("pub(crate) async fn spawn_thread_with_source")
+        .nth(1)
+        .expect("thread spawn")
+        .split("async fn finalize_thread_spawn")
+        .next()
+        .expect("spawn body");
+    let session_spawn = spawn.find("Session::spawn").expect("session construction");
+    let restore = spawn
+        .find("restore_committed_background_sessions")
+        .expect("background restoration");
+    let exposure = spawn
+        .find("finalize_thread_spawn")
+        .expect("thread exposure");
+    assert!(session_spawn < restore);
+    assert!(restore < exposure);
+}
+
+fn recovered_slot(
+    call_id: &str,
+    generation: u32,
+    status: codex_exec_server::RecoveredExecutionStatus,
+    terminal_verified_dead: bool,
+) -> codex_exec_server::RecoveredExecution {
+    codex_exec_server::RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            call_id: call_id.to_string(),
+            attempt_generation: generation,
+        },
+        command_digest: None,
+        output: format!("{call_id}-{generation}").into_bytes(),
+        status,
+        terminal_verified_dead,
+        session_id: None,
+        committed_output_cursor: 0,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(format!(
+            "{call_id}-{generation}-token"
+        )),
+    }
+}
+
+#[test]
+fn recovered_rows_are_grouped_and_selected_before_repair() {
+    let selected = select_recovered_execution_rows(
+        vec![
+            recovered_slot(
+                "second",
+                1,
+                codex_exec_server::RecoveredExecutionStatus::Running,
+                false,
+            ),
+            recovered_slot(
+                "first",
+                0,
+                codex_exec_server::RecoveredExecutionStatus::Exited(0),
+                true,
+            ),
+            recovered_slot(
+                "second",
+                0,
+                codex_exec_server::RecoveredExecutionStatus::Exited(1),
+                true,
+            ),
+            recovered_slot(
+                "first",
+                1,
+                codex_exec_server::RecoveredExecutionStatus::Missing,
+                false,
+            ),
+        ],
+        &HashSet::new(),
+    )
+    .expect("complete exact slot pairs should select once per call");
+
+    assert_eq!(selected.len(), 2);
+    let SelectedRecoveryAction::RepairAndAcknowledge(first) = &selected[0] else {
+        panic!("terminal generation must acknowledge after repair");
+    };
+    assert_eq!(first.identity.call_id, "first");
+    assert_eq!(first.identity.attempt_generation, 0);
+    let SelectedRecoveryAction::RepairAndAcknowledge(second) = &selected[1] else {
+        panic!("selected generation must use normal recovery action");
+    };
+    assert_eq!(second.identity.call_id, "second");
+    assert_eq!(second.identity.attempt_generation, 1);
+}
+
+#[test]
+fn recovered_rows_fail_closed_before_repair() {
+    assert!(
+        select_recovered_execution_rows(
+            vec![recovered_slot(
+                "missing-slot",
+                0,
+                codex_exec_server::RecoveredExecutionStatus::Exited(0),
+                true,
+            )],
+            &HashSet::new()
+        )
+        .is_err()
+    );
+    assert!(
+        select_recovered_execution_rows(
+            vec![
+                recovered_slot(
+                    "not-launched",
+                    0,
+                    codex_exec_server::RecoveredExecutionStatus::Missing,
+                    false,
+                ),
+                recovered_slot(
+                    "not-launched",
+                    1,
+                    codex_exec_server::RecoveredExecutionStatus::Missing,
+                    false,
+                ),
+            ],
+            &HashSet::new()
+        )
+        .is_err()
+    );
+    assert!(
+        select_recovered_execution_rows(
+            vec![
+                recovered_slot(
+                    "unverified",
+                    0,
+                    codex_exec_server::RecoveredExecutionStatus::Exited(0),
+                    false,
+                ),
+                recovered_slot(
+                    "unverified",
+                    1,
+                    codex_exec_server::RecoveredExecutionStatus::Missing,
+                    false,
+                ),
+            ],
+            &HashSet::new()
+        )
+        .is_err()
+    );
+    assert!(
+        select_recovered_execution_rows(
+            vec![
+                recovered_slot(
+                    "duplicate",
+                    0,
+                    codex_exec_server::RecoveredExecutionStatus::Exited(0),
+                    true,
+                ),
+                recovered_slot(
+                    "duplicate",
+                    0,
+                    codex_exec_server::RecoveredExecutionStatus::Exited(0),
+                    true,
+                ),
+                recovered_slot(
+                    "duplicate",
+                    1,
+                    codex_exec_server::RecoveredExecutionStatus::Missing,
+                    false,
+                ),
+            ],
+            &HashSet::new()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn not_launched_is_accepted_only_with_exact_v2_marker_evidence() {
+    let rows = || {
+        vec![
+            recovered_slot(
+                "not-launched",
+                0,
+                codex_exec_server::RecoveredExecutionStatus::Missing,
+                false,
+            ),
+            recovered_slot(
+                "not-launched",
+                1,
+                codex_exec_server::RecoveredExecutionStatus::Missing,
+                false,
+            ),
+        ]
+    };
+    assert!(select_recovered_execution_rows(rows(), &HashSet::new()).is_err());
+    let evidence = HashSet::from([(
+        "thread".to_string(),
+        "turn".to_string(),
+        "not-launched".to_string(),
+    )]);
+    let selected = select_recovered_execution_rows(rows(), &evidence).expect("exact v2 evidence");
+    assert_eq!(selected.len(), 1);
+    let SelectedRecoveryAction::RepairWithoutAcknowledgement(execution) = &selected[0] else {
+        panic!("absent roots must repair without descriptor acknowledgement");
+    };
+    assert_eq!(
+        execution.status,
+        codex_exec_server::RecoveredExecutionStatus::Missing
+    );
+    assert_eq!(
+        format_recovered_execution_output(execution),
+        "Process was not launched\nOutput:\nnot-launched-0"
+    );
+}
 
 struct FakeAgentGraphStore {
     root_thread_id: ThreadId,

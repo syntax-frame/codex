@@ -401,6 +401,8 @@ impl LocalProcess {
                         seq: retained.seq,
                         stream: retained.stream,
                         chunk: retained.chunk.clone().into(),
+                        absolute_start: None,
+                        absolute_end: None,
                     });
                     next_seq = retained.seq + 1;
                     if total_bytes >= max_bytes {
@@ -783,6 +785,8 @@ async fn stream_output(
                 seq,
                 stream,
                 chunk: chunk.into(),
+                absolute_start: None,
+                absolute_end: None,
             };
             process
                 .events
@@ -792,6 +796,8 @@ async fn stream_output(
                 seq,
                 stream,
                 chunk: output.chunk,
+                absolute_start: output.absolute_start,
+                absolute_end: output.absolute_end,
             }
         };
         output_notify.notify_waiters();
@@ -995,6 +1001,7 @@ mod tests {
     fn test_exec_params(env: HashMap<String, String>) -> ExecParams {
         ExecParams {
             process_id: ProcessId::from("env-test"),
+            execution_identity: None,
             argv: vec!["true".to_string()],
             cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
                 .expect("cwd URI"),
@@ -1205,6 +1212,8 @@ mod tests {
                 seq: 2,
                 stream: ExecOutputStream::Stdout,
                 chunk: b"late output after retention\n".to_vec().into(),
+                absolute_start: None,
+                absolute_end: None,
             }]
         );
         assert_eq!(late_response.exit_code, Some(0));
@@ -1292,12 +1301,16 @@ mod tests {
                 seq,
                 stream: ExecOutputStream::Stdout,
                 chunk: vec![b'x'].into(),
+                absolute_start: None,
+                absolute_end: None,
             })
             .collect::<Vec<_>>();
         expected_chunks.push(ProcessOutputChunk {
             seq: retained_chunk_count + 1,
             stream: ExecOutputStream::Stdout,
             chunk: vec![b'y'].into(),
+            absolute_start: None,
+            absolute_end: None,
         });
         assert_eq!(
             response,

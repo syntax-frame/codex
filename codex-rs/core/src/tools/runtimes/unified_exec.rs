@@ -4,6 +4,8 @@ Runtime: unified exec
 Handles approval + sandbox orchestration for unified exec requests, delegating to
 the process manager to spawn PTYs once an ExecRequest is prepared.
 */
+use std::sync::Arc;
+
 use crate::command_canonicalization::canonicalize_command_for_approval;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
@@ -37,6 +39,7 @@ use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
 use crate::unified_exec::NoopSpawnLifecycle;
+use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -300,6 +303,11 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<UnifiedExecProcess, ToolError> {
+        let launch_context = UnifiedExecContext::new(
+            Arc::clone(&ctx.session),
+            Arc::clone(&ctx.turn),
+            ctx.call_id.clone(),
+        );
         let base_command = &req.command;
         let session_shell = ctx.session.user_shell();
         let shell = req
@@ -461,6 +469,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                     return self
                         .manager
                         .open_session_with_prepared_exec_env(
+                            Some(&launch_context),
                             req.process_id,
                             &prepared.exec_request,
                             req.tty,
@@ -501,6 +510,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
         self.manager
             .open_session_with_exec_env(
+                Some(&launch_context),
                 req.process_id,
                 command,
                 options,

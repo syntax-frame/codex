@@ -507,6 +507,7 @@ impl ExecutorStdioServerLauncher {
         let started = exec_backend
             .start(ExecParams {
                 process_id,
+                execution_identity: None,
                 argv,
                 cwd,
                 env_policy: Some(Self::remote_env_policy(&remote_env_vars)),

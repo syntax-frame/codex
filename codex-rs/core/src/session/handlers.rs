@@ -65,7 +65,12 @@ pub async fn interrupt(sess: &Arc<Session>) {
 }
 
 pub async fn clean_background_terminals(sess: &Arc<Session>) {
-    sess.close_unified_exec_processes().await;
+    if let Err(process_ids) = sess.close_unified_exec_processes().await {
+        warn!(
+            ?process_ids,
+            "one or more background terminals could not be confirmed terminated"
+        );
+    }
 }
 
 pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
@@ -265,6 +270,17 @@ pub(super) async fn user_input_or_turn_inner(
                     content: items,
                     client_id: client_user_message_id,
                 });
+            }
+            if let Err(err) = sess
+                .persist_remote_execution_protocol_marker(current_context.as_ref())
+                .await
+            {
+                sess.emit_turn_error_lifecycle(
+                    current_context.as_ref(),
+                    err.to_codex_protocol_error(),
+                )
+                .await;
+                return;
             }
             sess.spawn_task(
                 Arc::clone(&current_context),
@@ -594,13 +610,14 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
-async fn shutdown_session_runtime(sess: &Arc<Session>) {
+async fn shutdown_session_runtime(sess: &Arc<Session>) -> Result<(), String> {
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
     let _ = sess.conversation.shutdown().await;
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-    sess.services
+    let termination_result = sess
+        .services
         .unified_exec_manager
         .terminate_all_processes()
         .await;
@@ -612,6 +629,9 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
     sess.guardian_review_session.shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    termination_result.map_err(|process_ids| {
+        format!("shutdown could not confirm termination of unified exec processes: {process_ids:?}")
+    })
 }
 
 async fn emit_thread_stop_lifecycle(sess: &Session) {
@@ -625,8 +645,19 @@ async fn emit_thread_stop_lifecycle(sess: &Session) {
     }
 }
 
-pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-    shutdown_session_runtime(sess).await;
+pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> Result<bool, String> {
+    if let Err(message) = shutdown_session_runtime(sess).await {
+        warn!("{message}");
+        sess.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::Error(ErrorEvent {
+                message: message.clone(),
+                codex_error_info: Some(CodexErrorInfo::Other),
+            }),
+        })
+        .await;
+        return Err(message);
+    }
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
     let turn_count = history
@@ -669,7 +700,7 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     sess.services
         .rollout_thread_trace
         .record_ended(codex_rollout_trace::RolloutStatus::Completed);
-    true
+    Ok(true)
 }
 
 pub async fn review(
@@ -712,9 +743,10 @@ pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
-) {
+) -> Result<(), String> {
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
+    let mut shutdown_error = None;
     while let Ok(sub) = rx_sub.recv().await {
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
@@ -835,7 +867,13 @@ pub(super) async fn submission_loop(
                         .await;
                     false
                 }
-                Op::Shutdown => shutdown(&sess, sub.id.clone()).await,
+                Op::Shutdown => match shutdown(&sess, sub.id.clone()).await {
+                    Ok(should_exit) => should_exit,
+                    Err(err) => {
+                        shutdown_error = Some(err);
+                        true
+                    }
+                },
                 Op::Review { review_request } => {
                     review(&sess, &config, sub.id.clone(), review_request).await;
                     false
@@ -857,7 +895,11 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        shutdown_session_runtime(&sess).await;
+        if let Err(err) = shutdown_session_runtime(&sess).await {
+            warn!(
+                "session runtime shutdown remains uncertain after submission channel closed: {err}"
+            );
+        }
         emit_thread_stop_lifecycle(sess.as_ref()).await;
         if let Some(live_thread) = sess.live_thread()
             && let Err(err) = live_thread.shutdown().await
@@ -866,6 +908,7 @@ pub(super) async fn submission_loop(
         }
     }
     debug!("Agent loop exited");
+    shutdown_error.map_or(Ok(()), Err)
 }
 
 async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAssessmentEvent) {

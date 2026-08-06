@@ -440,6 +440,7 @@ pub(crate) async fn execute_exec_request(
     after_spawn: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<ExecToolCallOutput> {
     let ExecRequest {
+        attempt_generation: _,
         command,
         cwd,
         env,

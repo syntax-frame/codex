@@ -285,6 +285,10 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::ResponseItem(_)
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::RemoteExecutionProtocolMarker(_)
+        | RolloutItem::RemoteExecutionLaunchIntent(_)
+        | RolloutItem::RemoteExecutionSessionPrepared(_)
+        | RolloutItem::RemoteExecutionSessionCommitted(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::WorldState(_) => None,
     }

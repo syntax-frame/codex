@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 /// dropping the middle once it exceeds the configured maximum. The buffer is
 /// symmetric meaning 50% of the capacity is allocated to the head and 50% is
 /// allocated to the tail.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[cfg_attr(test, derive(Eq, PartialEq))]
 pub(crate) struct HeadTailBuffer {
     max_bytes: usize,
@@ -15,6 +15,7 @@ pub(crate) struct HeadTailBuffer {
     head: Vec<u8>,
     tail: VecDeque<u8>,
     omitted_bytes: usize,
+    absolute_range: Option<(u64, u64)>,
 }
 
 impl Default for HeadTailBuffer {
@@ -38,6 +39,7 @@ impl HeadTailBuffer {
             head: Vec::new(),
             tail: VecDeque::new(),
             omitted_bytes: 0,
+            absolute_range: None,
         }
     }
 
@@ -58,6 +60,23 @@ impl HeadTailBuffer {
     /// Total bytes observed by the buffer, including bytes omitted by the cap.
     pub(crate) fn total_bytes(&self) -> usize {
         self.retained_bytes().saturating_add(self.omitted_bytes)
+    }
+
+    pub(crate) fn absolute_range(&self) -> Option<(u64, u64)> {
+        self.absolute_range
+    }
+
+    pub(crate) fn push_chunk_at(&mut self, chunk: Vec<u8>, start: u64, end: u64) -> Result<(), ()> {
+        if end < start || end.saturating_sub(start) != chunk.len() as u64 {
+            return Err(());
+        }
+        match self.absolute_range {
+            Some((_, previous_end)) if previous_end != start => return Err(()),
+            Some((first, _)) => self.absolute_range = Some((first, end)),
+            None => self.absolute_range = Some((start, end)),
+        }
+        self.push_chunk(chunk);
+        Ok(())
     }
 
     /// Append a chunk of bytes to the buffer.
@@ -131,9 +150,10 @@ impl HeadTailBuffer {
         out
     }
 
-    /// Drain the retained output and omission metadata, resetting this buffer's
-    /// contents while preserving its configured capacity.
-    pub(crate) fn drain(&mut self) -> Self {
+    /// Move the current output into a receipt snapshot. The caller must retain
+    /// the returned value until the receipt is durably committed; it is the
+    /// local transactional copy used if persistence fails.
+    pub(crate) fn take_for_receipt(&mut self) -> Self {
         Self {
             max_bytes: self.max_bytes,
             head_budget: self.head_budget,
@@ -141,12 +161,21 @@ impl HeadTailBuffer {
             head: std::mem::take(&mut self.head),
             tail: std::mem::take(&mut self.tail),
             omitted_bytes: std::mem::take(&mut self.omitted_bytes),
+            absolute_range: self.absolute_range.take(),
         }
     }
 
     /// Append retained output from another buffer and preserve any omissions it
     /// already recorded.
     pub(crate) fn push_buffer(&mut self, mut buffer: Self) {
+        match (self.absolute_range, buffer.absolute_range) {
+            (None, range) => self.absolute_range = range,
+            (Some((first, end)), Some((next, last))) if end == next => {
+                self.absolute_range = Some((first, last));
+            }
+            (Some(_), Some(_)) => self.absolute_range = None,
+            (Some(_), None) => self.absolute_range = None,
+        }
         self.push_chunk(std::mem::take(&mut buffer.head));
         self.push_chunk(buffer.tail.drain(..).collect());
         self.omitted_bytes = self.omitted_bytes.saturating_add(buffer.omitted_bytes);
