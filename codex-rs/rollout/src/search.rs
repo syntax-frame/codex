@@ -289,6 +289,7 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::RemoteExecutionLaunchIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
+        | RolloutItem::RemoteExecutionSessionAcknowledged(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::WorldState(_) => None,
     }

@@ -1417,7 +1417,13 @@ fn acknowledgement_command(
     acknowledgement: &RecoveredExecutionAcknowledgement,
 ) -> String {
     let agent_id = stable_identifier(agent_key);
-    let acknowledgement_key = format!("{:x}", Sha256::digest(acknowledgement.as_str().as_bytes()));
+    // Build 119 tombstones were keyed only by the backend token and were left
+    // empty. The generated command accepts that legacy path once, relying on
+    // Core's exact durable Prepared/output/Commit chain, and atomically binds
+    // it to the first full proof via `proof-key`. New tombstones are keyed by
+    // the full domain-separated proof from their creation.
+    let legacy_acknowledgement_key =
+        format!("{:x}", Sha256::digest(acknowledgement.as_str().as_bytes()));
     let (
         expected_range_start,
         expected_range_end,
@@ -1451,6 +1457,19 @@ fn acknowledgement_command(
             "-".to_string(),
         ),
     };
+    let acknowledgement_key_material = format!(
+        "agentapp-tmux-ack-v2\0{}\0{}\0{}\0{}\0{}\0{}",
+        acknowledgement.as_str(),
+        expected_range_start,
+        expected_range_end,
+        expected_output_sha256,
+        expected_state,
+        expected_exit_code
+    );
+    let acknowledgement_key = format!(
+        "{:x}",
+        Sha256::digest(acknowledgement_key_material.as_bytes())
+    );
     format!(
         concat!(
             "set -eu\n",
@@ -1465,21 +1484,27 @@ fn acknowledgement_command(
             "case \"$expected_range_end\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78 ;; esac\n",
             "[ \"$expected_range_end\" -ge \"$expected_range_start\" ] || {{ echo AGENTAPP_TMUX_ACK_RANGE_CONFLICT >&2; exit 78; }}\n",
             "[ \"$expected_output_sha256\" != - ] || {{ echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78; }}\n",
+            "[ \"${{#expected_output_sha256}}\" -eq 64 ] || {{ echo AGENTAPP_TMUX_ACK_PROOF_MALFORMED >&2; exit 78; }}\n",
+            "case \"$expected_output_sha256\" in *[!0-9a-f]*) echo AGENTAPP_TMUX_ACK_PROOF_MALFORMED >&2; exit 78 ;; esac\n",
             "case \"$expected_terminal_state\" in completed|terminated) ;; *) echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78 ;; esac\n",
             "case \"$expected_exit_code\" in ''|*[!0-9-]*) echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78 ;; *) ;; esac\n",
             "process_id=${{token%%-*}}\n",
             "case \"$process_id\" in ''|*[!0-9a-f]*) echo AGENTAPP_TMUX_ACK_BAD_TOKEN >&2; exit 78 ;; esac\n",
             "[ \"${{#process_id}}\" -eq 16 ] || {{ echo AGENTAPP_TMUX_ACK_BAD_TOKEN >&2; exit 78; }}\n",
+            "token_proof=${{token#*-}}\n",
+            "[ \"$token\" = \"$process_id-$token_proof\" ] && [ \"${{#token_proof}}\" -eq 64 ] || {{ echo AGENTAPP_TMUX_ACK_BAD_TOKEN >&2; exit 78; }}\n",
+            "case \"$token_proof\" in *[!0-9a-f]*) echo AGENTAPP_TMUX_ACK_BAD_TOKEN >&2; exit 78 ;; esac\n",
             "root=\"$base/$process_id\"\n",
             "session=agentapp_{agent_id}\n",
             "expected_window=\"p_$process_id\"\n",
             "watchdog_window=\"w_$process_id\"\n",
             "tombstone=\"$base/.acknowledged-$process_id-{acknowledgement_key}\"\n",
+            "legacy_tombstone=\"$base/.acknowledged-$process_id-{legacy_acknowledgement_key}\"\n",
             "agentapp_ack_preflight_root() {{\n",
             "  for entry in \"$root\"/* \"$root\"/.[!.]* \"$root\"/..?*; do\n",
             "    [ -e \"$entry\" ] || continue\n",
             "    name=${{entry##*/}}\n",
-            "    case \"$name\" in command.sh|watchdog.sh|output|stdin|go|go.tmp|release|status|status.tmp|state|state.tmp|owner|identity|thread-id|turn-id|call-id|attempt-generation|session-id|tty|acknowledgement-token|digest|window|process-identity|process-identity.tmp|controller|controller.tmp|lease|lease.tmp|lease-generation|lease-generation.tmp|recovery-required|recovery-required.tmp|transition-claim|terminal-claim|.transition-candidate.*|transition-claim.quarantine.*) ;; *) echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78 ;; esac\n",
+            "    case \"$name\" in command.sh|watchdog.sh|output|stdin|go|go.tmp|release|status|status.tmp|state|state.tmp|owner|identity|thread-id|turn-id|call-id|attempt-generation|session-id|tty|acknowledgement-token|digest|window|process-identity|process-identity.tmp|controller|controller.tmp|lease|lease.tmp|lease-generation|lease-generation.tmp|recovery-required|recovery-required.tmp|transition-claim|terminal-claim|.transition-candidate.*|transition-claim.quarantine.*) ;; proof-key|.proof-candidate.*) [ \"$root\" = \"$legacy_tombstone\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78; }} ;; *) echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78 ;; esac\n",
             "  done\n",
             "  if [ -d \"$root/terminal-claim\" ]; then\n",
             "    for terminal_entry in \"$root/terminal-claim\"/* \"$root/terminal-claim\"/.[!.]* \"$root/terminal-claim\"/..?*; do\n",
@@ -1499,10 +1524,26 @@ fn acknowledgement_command(
             "  rmdir \"$root/terminal-claim\" 2>/dev/null || true\n",
             "  rm -f \"$root\"/transition-claim.quarantine.*\n",
             "  rm -f \"$root/transition-claim\" \"$root\"/.transition-candidate.*\n",
+            "  rm -f \"$root\"/.proof-candidate.*\n",
             "}}\n",
             "if [ -e \"$tombstone\" ]; then\n",
             "  [ -d \"$tombstone\" ] && [ ! -e \"$root\" ] || {{ echo AGENTAPP_TMUX_ACK_TOMBSTONE_CONFLICT >&2; exit 78; }}\n",
             "  root=\"$tombstone\"\n",
+            "  agentapp_cleanup_ack_tombstone\n",
+            "  exit 0\n",
+            "fi\n",
+            "if [ -e \"$legacy_tombstone\" ]; then\n",
+            "  [ -d \"$legacy_tombstone\" ] && [ ! -e \"$root\" ] || {{ echo AGENTAPP_TMUX_ACK_TOMBSTONE_CONFLICT >&2; exit 78; }}\n",
+            "  root=\"$legacy_tombstone\"\n",
+            "  agentapp_ack_preflight_root\n",
+            "  legacy_proof_candidate=\"$root/.proof-candidate.{acknowledgement_key}.$$\"\n",
+            "  if [ ! -e \"$root/proof-key\" ]; then\n",
+            "    rm -f \"$legacy_proof_candidate\"\n",
+            "    ( umask 077; set -C; printf '%s\\n' {acknowledgement_key} > \"$legacy_proof_candidate\" ) || {{ echo AGENTAPP_TMUX_ACK_TOMBSTONE_PROOF_CONFLICT >&2; exit 78; }}\n",
+            "    ln \"$legacy_proof_candidate\" \"$root/proof-key\" 2>/dev/null || true\n",
+            "    rm -f \"$legacy_proof_candidate\"\n",
+            "  fi\n",
+            "  [ \"$(cat \"$root/proof-key\" 2>/dev/null || true)\" = {acknowledgement_key} ] || {{ echo AGENTAPP_TMUX_ACK_TOMBSTONE_PROOF_CONFLICT >&2; exit 78; }}\n",
             "  agentapp_cleanup_ack_tombstone\n",
             "  exit 0\n",
             "fi\n",
@@ -1527,7 +1568,7 @@ fn acknowledgement_command(
             "  [ \"$code\" = \"$expected_exit_code\" ] || {{ echo AGENTAPP_TMUX_ACK_EXIT_STATUS_CHANGED >&2; exit 78; }}\n",
             "  [ -r \"$root/output\" ] || {{ echo AGENTAPP_TMUX_ACK_OUTPUT_UNREADABLE >&2; exit 78; }}\n",
             "  output_size=$(wc -c < \"$root/output\" 2>/dev/null || printf '0'); output_size=$(printf '%s' \"$output_size\" | tr -d ' ')\n",
-            "  [ \"$output_size\" -ge \"$expected_range_end\" ] || {{ echo AGENTAPP_TMUX_ACK_OUTPUT_SHRANK >&2; exit 78; }}\n",
+            "  [ \"$output_size\" -eq \"$expected_range_end\" ] || {{ echo AGENTAPP_TMUX_ACK_OUTPUT_LENGTH_CHANGED >&2; exit 78; }}\n",
             "  range_len=$((expected_range_end - expected_range_start))\n",
             "  if [ \"$range_len\" -eq 0 ]; then observed_output_sha256=$(printf '' | agentapp_sha256_stdin); else observed_output_sha256=$(tail -c +$((expected_range_start + 1)) \"$root/output\" | head -c \"$range_len\" | agentapp_sha256_stdin); fi\n",
             "  [ \"$observed_output_sha256\" = \"$expected_output_sha256\" ] || {{ echo AGENTAPP_TMUX_ACK_OUTPUT_DIGEST_CHANGED >&2; exit 78; }}\n",
@@ -1624,6 +1665,7 @@ fn acknowledgement_command(
         token = shell_quote(acknowledgement.as_str()),
         owner = shell_quote(OWNERSHIP_MARKER),
         acknowledgement_key = acknowledgement_key,
+        legacy_acknowledgement_key = legacy_acknowledgement_key,
         expected_range_start = shell_quote(&expected_range_start),
         expected_range_end = shell_quote(&expected_range_end),
         expected_output_sha256 = shell_quote(&expected_output_sha256),

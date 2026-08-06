@@ -285,6 +285,7 @@ async fn persisted_originator(thread: &CodexThread) -> String {
             | RolloutItem::RemoteExecutionLaunchIntent(_)
             | RolloutItem::RemoteExecutionSessionPrepared(_)
             | RolloutItem::RemoteExecutionSessionCommitted(_)
+            | RolloutItem::RemoteExecutionSessionAcknowledged(_)
             | RolloutItem::EventMsg(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)

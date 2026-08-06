@@ -156,6 +156,7 @@ impl ModelContextScan {
             | RolloutItem::RemoteExecutionLaunchIntent(_)
             | RolloutItem::RemoteExecutionSessionPrepared(_)
             | RolloutItem::RemoteExecutionSessionCommitted(_)
+            | RolloutItem::RemoteExecutionSessionAcknowledged(_)
             | RolloutItem::WorldState(_) => {}
         }
 

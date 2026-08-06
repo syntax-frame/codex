@@ -284,7 +284,8 @@ impl Session {
                 | RolloutItem::RemoteExecutionProtocolMarker(_)
                 | RolloutItem::RemoteExecutionLaunchIntent(_)
                 | RolloutItem::RemoteExecutionSessionPrepared(_)
-                | RolloutItem::RemoteExecutionSessionCommitted(_) => {}
+                | RolloutItem::RemoteExecutionSessionCommitted(_)
+                | RolloutItem::RemoteExecutionSessionAcknowledged(_) => {}
             }
 
             if base_replacement_history.is_some()
@@ -376,7 +377,8 @@ impl Session {
                 | RolloutItem::RemoteExecutionProtocolMarker(_)
                 | RolloutItem::RemoteExecutionLaunchIntent(_)
                 | RolloutItem::RemoteExecutionSessionPrepared(_)
-                | RolloutItem::RemoteExecutionSessionCommitted(_) => {}
+                | RolloutItem::RemoteExecutionSessionCommitted(_)
+                | RolloutItem::RemoteExecutionSessionAcknowledged(_) => {}
             }
         }
 
@@ -426,6 +428,7 @@ impl Session {
                 | RolloutItem::RemoteExecutionLaunchIntent(_)
                 | RolloutItem::RemoteExecutionSessionPrepared(_)
                 | RolloutItem::RemoteExecutionSessionCommitted(_)
+                | RolloutItem::RemoteExecutionSessionAcknowledged(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::EventMsg(_) => {
                     unreachable!("only world-state replay items are collected")

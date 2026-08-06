@@ -127,6 +127,7 @@ use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::RemoteExecutionLaunchIntent;
 use codex_protocol::protocol::RemoteExecutionProtocolMarker;
 use codex_protocol::protocol::RemoteExecutionReceiptKind;
+use codex_protocol::protocol::RemoteExecutionSessionAcknowledged;
 use codex_protocol::protocol::RemoteExecutionSessionCommitted;
 use codex_protocol::protocol::RemoteExecutionSessionPrepared;
 use codex_protocol::protocol::RemoteExecutionTerminalStatus;
@@ -204,13 +205,6 @@ fn remote_receipt_output_digest(text: &str) -> String {
 /// rejected when one is available.
 fn remote_receipt_output_is_success_compatible(success: Option<bool>) -> bool {
     success != Some(false)
-}
-
-fn terminal_status_observed_exit_code(status: &RemoteExecutionTerminalStatus) -> i32 {
-    match status {
-        RemoteExecutionTerminalStatus::Exited(exit_code) => *exit_code,
-        RemoteExecutionTerminalStatus::Terminated => 143,
-    }
 }
 
 fn prepared_remote_receipt_digest(
@@ -492,6 +486,68 @@ fn missing_background_session_commits(
             .then(left.range_end.cmp(&right.range_end))
     });
     Ok(missing)
+}
+
+fn acknowledged_background_session_receipts(
+    history: &[RolloutItem],
+) -> CodexResult<HashSet<(String, String, String)>> {
+    let mut commits =
+        HashMap::<(String, String, String), Vec<(usize, &RemoteExecutionSessionCommitted)>>::new();
+    for (index, item) in history.iter().enumerate() {
+        if let RolloutItem::RemoteExecutionSessionCommitted(committed) = item {
+            commits
+                .entry((
+                    committed.thread_id.clone(),
+                    committed.receipt_turn_id.clone(),
+                    committed.receipt_call_id.clone(),
+                ))
+                .or_default()
+                .push((index, committed));
+        }
+    }
+
+    let mut acknowledged = HashMap::new();
+    for (marker_index, item) in history.iter().enumerate() {
+        let RolloutItem::RemoteExecutionSessionAcknowledged(marker) = item else {
+            continue;
+        };
+        let key = (
+            marker.thread_id.clone(),
+            marker.receipt_turn_id.clone(),
+            marker.receipt_call_id.clone(),
+        );
+        let Some(matching_commits) = commits.get(&key) else {
+            return Err(CodexErr::Fatal(format!(
+                "terminal acknowledgement marker lacks commit for receipt {}",
+                marker.receipt_call_id
+            )));
+        };
+        let [(commit_index, committed)] = matching_commits.as_slice() else {
+            return Err(CodexErr::Fatal(format!(
+                "terminal acknowledgement marker has ambiguous commit for receipt {}",
+                marker.receipt_call_id
+            )));
+        };
+        if marker_index <= *commit_index
+            || !committed.terminal
+            || marker.session_id != committed.session_id
+            || marker.prepared_receipt_digest != committed.prepared_receipt_digest
+        {
+            return Err(CodexErr::Fatal(format!(
+                "terminal acknowledgement marker lacks exact durable authority for receipt {}",
+                marker.receipt_call_id
+            )));
+        }
+        if let Some(existing) = acknowledged.insert(key, marker)
+            && existing != marker
+        {
+            return Err(CodexErr::Fatal(format!(
+                "conflicting terminal acknowledgement markers for receipt {}",
+                marker.receipt_call_id
+            )));
+        }
+    }
+    Ok(acknowledged.into_keys().collect())
 }
 
 fn latest_committed_background_session<'a>(
@@ -1960,15 +2016,32 @@ impl Session {
                 "background session commit did not become durably visible".to_string(),
             ));
         }
+        let acknowledged_receipts = acknowledged_background_session_receipts(&history.items)?;
+        let active_thread_id = self.thread_id.to_string();
         for committed in history.items.iter().filter_map(|item| match item {
             RolloutItem::RemoteExecutionSessionCommitted(committed)
-                if committed.thread_id == self.thread_id.to_string() =>
+                if committed.thread_id == active_thread_id =>
             {
                 Some(committed)
             }
             _ => None,
         }) {
             if !committed.terminal {
+                self.services
+                    .unified_exec_manager
+                    .acknowledge_output_receipt(
+                        &committed.receipt_turn_id,
+                        &committed.receipt_call_id,
+                    )
+                    .await;
+                continue;
+            }
+            let receipt_key = (
+                committed.thread_id.clone(),
+                committed.receipt_turn_id.clone(),
+                committed.receipt_call_id.clone(),
+            );
+            if acknowledged_receipts.contains(&receipt_key) {
                 self.services
                     .unified_exec_manager
                     .acknowledge_output_receipt(
@@ -2008,34 +2081,28 @@ impl Session {
                         committed.session_id
                     ))
                 })?;
-            if prepared.terminal_acknowledgement_token.as_ref() != Some(token) {
-                return Err(CodexErr::Fatal(format!(
-                    "terminal background session {} has conflicting acknowledgement authority",
-                    committed.session_id
-                )));
-            }
+            let terminal_output_digest = committed
+                .terminal_output_digest
+                .as_ref()
+                .filter(|digest| !digest.is_empty())
+                .ok_or_else(|| {
+                    CodexErr::Fatal(format!(
+                        "terminal background session {} lacks durable output authority",
+                        committed.session_id
+                    ))
+                })?;
             let terminal_status = committed.terminal_status.as_ref().ok_or_else(|| {
                 CodexErr::Fatal(format!(
                     "terminal background session {} lacks durable terminal status",
                     committed.session_id
                 ))
             })?;
-            let observed_exit_code = terminal_status_observed_exit_code(terminal_status);
-            let (verified_token, verified_output_digest, verified_status) = self
-                .verify_terminal_remote_receipt(
-                    prepared,
-                    committed.range_start,
-                    committed.range_end,
-                    observed_exit_code,
-                )
-                .await?;
-            if verified_token != *token
-                || committed.terminal_output_digest.as_deref()
-                    != Some(verified_output_digest.as_str())
-                || committed.terminal_status.as_ref() != Some(&verified_status)
+            if prepared.terminal_acknowledgement_token.as_ref() != Some(token)
+                || prepared.terminal_output_digest.as_ref() != Some(terminal_output_digest)
+                || prepared.terminal_status.as_ref() != Some(terminal_status)
             {
                 return Err(CodexErr::Fatal(format!(
-                    "terminal background session {} changed before acknowledgement",
+                    "terminal background session {} has conflicting acknowledgement authority",
                     committed.session_id
                 )));
             }
@@ -2056,6 +2123,12 @@ impl Session {
                     committed.session_id, prepared.environment_id
                 )));
             }
+            // The ordered Prepared/output/Commit chain above is the durable
+            // local authority. Do not reconcile the live descriptor here: a
+            // previous acknowledgement may already have atomically retired it
+            // to a tombstone. The backend acknowledgement revalidates the
+            // terminal proof on first use and makes tombstone retries
+            // idempotent.
             environment
                 .get_exec_backend()
                 .acknowledge_consumed(
@@ -2063,10 +2136,10 @@ impl Session {
                         .with_terminal_proof(codex_exec_server::TerminalAcknowledgementProof {
                             range_start: committed.range_start,
                             range_end: committed.range_end,
-                            output_sha256: verified_output_digest,
-                            status: match verified_status {
+                            output_sha256: terminal_output_digest.clone(),
+                            status: match terminal_status {
                                 RemoteExecutionTerminalStatus::Exited(exit_code) => {
-                                    codex_exec_server::RecoveredExecutionStatus::Exited(exit_code)
+                                    codex_exec_server::RecoveredExecutionStatus::Exited(*exit_code)
                                 }
                                 RemoteExecutionTerminalStatus::Terminated => {
                                     codex_exec_server::RecoveredExecutionStatus::Terminated
@@ -2081,6 +2154,23 @@ impl Session {
                         committed.session_id
                     ))
                 })?;
+            let marker = RolloutItem::RemoteExecutionSessionAcknowledged(
+                RemoteExecutionSessionAcknowledged {
+                    thread_id: committed.thread_id.clone(),
+                    receipt_turn_id: committed.receipt_turn_id.clone(),
+                    receipt_call_id: committed.receipt_call_id.clone(),
+                    session_id: committed.session_id,
+                    prepared_receipt_digest: committed.prepared_receipt_digest.clone(),
+                },
+            );
+            live_thread
+                .append_items(&[marker])
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+            live_thread
+                .flush()
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
             self.services
                 .unified_exec_manager
                 .acknowledge_output_receipt(&committed.receipt_turn_id, &committed.receipt_call_id)

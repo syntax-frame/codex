@@ -891,6 +891,214 @@ fn acknowledgement_resolves_one_descriptor_without_scanning() {
     assert!(rename < destructive_cleanup);
 }
 
+#[cfg(unix)]
+#[test]
+fn acknowledgement_recovers_dead_stale_claim_and_replays_from_tombstone() {
+    use std::fs;
+
+    let token = "0123456789abcdef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (home, root, path) = terminal_acknowledgement_fixture(token);
+    let acknowledgement = terminal_acknowledgement(token.to_string());
+
+    let first = run_acknowledgement(&home, &path, &acknowledgement);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(!root.exists());
+
+    let base = root.parent().expect("agent descriptor base");
+    let tombstones = fs::read_dir(base)
+        .expect("read descriptor base")
+        .map(|entry| entry.expect("descriptor entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".acknowledged-0123456789abcdef-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(
+        fs::read_dir(&tombstones[0])
+            .expect("read acknowledgement tombstone")
+            .count(),
+        0
+    );
+
+    let replay = run_acknowledgement(&home, &path, &acknowledgement);
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(!root.exists());
+    assert_eq!(
+        fs::read_dir(&tombstones[0])
+            .expect("read replayed acknowledgement tombstone")
+            .count(),
+        0
+    );
+
+    let conflicting = conflicting_terminal_acknowledgement(token);
+    let conflicting_replay = run_acknowledgement(&home, &path, &conflicting);
+    assert!(!conflicting_replay.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflicting_replay.stderr).contains("AGENTAPP_TMUX_ACK_UNKNOWN")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn acknowledgement_rejects_conflicting_proof_without_consuming_stale_claim() {
+    use std::fs;
+
+    let token = "0123456789abcdef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (home, root, path) = terminal_acknowledgement_fixture(token);
+    let acknowledgement = conflicting_terminal_acknowledgement(token);
+
+    let output = run_acknowledgement(&home, &path, &acknowledgement);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("AGENTAPP_TMUX_ACK_OUTPUT_DIGEST_CHANGED")
+    );
+    assert!(root.exists());
+    let transition_claim =
+        fs::read_to_string(root.join("transition-claim")).expect("stale transition claim");
+    assert!(transition_claim.starts_with("acknowledgement|k_"));
+    assert_eq!(
+        fs::read_dir(&root)
+            .expect("stale descriptor entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".transition-candidate.k_"))
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_dir(root.parent().expect("agent descriptor base"))
+            .expect("read descriptor base")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".acknowledged-"))
+            })
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn acknowledgement_rejects_output_appended_after_the_committed_terminal_cursor() {
+    use std::fs;
+
+    let token = "0123456789abcdef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (home, root, path) = terminal_acknowledgement_fixture(token);
+    fs::write(root.join("output"), "abcdefx").expect("append uncommitted output byte");
+
+    let output = run_acknowledgement(&home, &path, &terminal_acknowledgement(token.to_string()));
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("AGENTAPP_TMUX_ACK_OUTPUT_LENGTH_CHANGED")
+    );
+    assert!(root.exists());
+    assert!(root.join("transition-claim").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn acknowledgement_rejects_noncanonical_token_and_digest_before_remote_lookup() {
+    let home = tempfile::tempdir().expect("temp home");
+    let invalid_token = terminal_acknowledgement("0123456789abcdef-deadbeef".to_string());
+    let token_output = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(acknowledgement_command("agent", &invalid_token))
+        .env("HOME", home.path())
+        .output()
+        .expect("reject malformed acknowledgement token");
+    assert!(!token_output.status.success());
+    assert!(String::from_utf8_lossy(&token_output.stderr).contains("AGENTAPP_TMUX_ACK_BAD_TOKEN"));
+
+    let token = "0123456789abcdef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let invalid_digest = RecoveredExecutionAcknowledgement::new(token.to_string())
+        .with_terminal_proof(TerminalAcknowledgementProof {
+            range_start: 0,
+            range_end: 6,
+            output_sha256: "ABC".to_string(),
+            status: RecoveredExecutionStatus::Exited(0),
+        });
+    let digest_output = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(acknowledgement_command("agent", &invalid_digest))
+        .env("HOME", home.path())
+        .output()
+        .expect("reject malformed acknowledgement digest");
+    assert!(!digest_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&digest_output.stderr)
+            .contains("AGENTAPP_TMUX_ACK_PROOF_MALFORMED")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn acknowledgement_legacy_token_tombstone_is_bound_once_to_the_durable_terminal_proof() {
+    use sha2::Digest;
+    use sha2::Sha256;
+    use std::fs;
+
+    let token = "0123456789abcdef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (home, root, path) = terminal_acknowledgement_fixture(token);
+    let base = root.parent().expect("agent descriptor base");
+    let legacy_key = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let legacy_tombstone = base.join(format!(".acknowledged-0123456789abcdef-{legacy_key}"));
+    fs::remove_dir_all(&root).expect("simulate legacy acknowledgement cleanup");
+    fs::create_dir(&legacy_tombstone).expect("legacy acknowledgement tombstone");
+
+    let acknowledgement = terminal_acknowledgement(token.to_string());
+    let migration = run_acknowledgement(&home, &path, &acknowledgement);
+    assert!(
+        migration.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migration.stderr)
+    );
+    let proof_key = fs::read_to_string(legacy_tombstone.join("proof-key"))
+        .expect("proof-bound legacy tombstone");
+    assert_eq!(proof_key.len(), 65);
+
+    let replay = run_acknowledgement(&home, &path, &acknowledgement);
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(legacy_tombstone.join("proof-key"))
+            .expect("replayed proof-bound legacy tombstone"),
+        proof_key
+    );
+
+    let conflicting =
+        run_acknowledgement(&home, &path, &conflicting_terminal_acknowledgement(token));
+    assert!(!conflicting.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflicting.stderr)
+            .contains("AGENTAPP_TMUX_ACK_TOMBSTONE_PROOF_CONFLICT")
+    );
+    assert_eq!(
+        fs::read_to_string(legacy_tombstone.join("proof-key"))
+            .expect("unchanged proof-bound legacy tombstone"),
+        proof_key
+    );
+}
+
 #[test]
 fn watchdog_classifies_expiry_without_destructive_takeover() {
     let params = exec_params("process", "sleep 30");
@@ -1098,4 +1306,87 @@ fn terminal_acknowledgement_with_status(
             status,
         },
     )
+}
+
+fn conflicting_terminal_acknowledgement(token: &str) -> RecoveredExecutionAcknowledgement {
+    RecoveredExecutionAcknowledgement::new(token.to_string()).with_terminal_proof(
+        TerminalAcknowledgementProof {
+            range_start: 0,
+            range_end: 6,
+            output_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            status: RecoveredExecutionStatus::Exited(0),
+        },
+    )
+}
+
+#[cfg(unix)]
+fn terminal_acknowledgement_fixture(
+    token: &str,
+) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    use sha2::Digest;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("temp home");
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin");
+    let tmux = bin.join("tmux");
+    fs::write(
+        &tmux,
+        "#!/bin/sh\ncase \"$1\" in\n  list-windows) echo \"can't find session: fixture\" >&2; exit 1 ;;\n  kill-window) exit 0 ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .expect("fake tmux");
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+
+    let process_id = token.split_once('-').expect("acknowledgement token").0;
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(stable_identifier("agent"))
+        .join(process_id);
+    fs::create_dir_all(root.join("terminal-claim")).expect("descriptor root");
+    for (name, value) in [
+        ("acknowledgement-token", token),
+        ("owner", "agentapp-tmux-v2"),
+        ("state", "completed"),
+        ("status", "0"),
+        ("output", "abcdef"),
+        ("terminal-claim/kind", "completed"),
+        ("window", "p_0123456789abcdef"),
+        ("controller", "0:controller"),
+    ] {
+        fs::write(root.join(name), value).expect("descriptor field");
+    }
+    let legacy_key = format!("{:x}", sha2::Sha256::digest(token.as_bytes()));
+    let claim = format!(
+        "acknowledgement|k_{legacy_key}|0:controller|2147483647|2147483647|p_0123456789abcdef|-|-\n"
+    );
+    let transition_candidate =
+        root.join(format!(".transition-candidate.k_{legacy_key}.2147483647"));
+    fs::write(&transition_candidate, &claim).expect("stale acknowledgement candidate");
+    fs::hard_link(&transition_candidate, root.join("transition-claim"))
+        .expect("stale acknowledgement claim hard link");
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (home, root, path)
+}
+
+#[cfg(unix)]
+fn run_acknowledgement(
+    home: &tempfile::TempDir,
+    path: &str,
+    acknowledgement: &RecoveredExecutionAcknowledgement,
+) -> std::process::Output {
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(acknowledgement_command("agent", acknowledgement))
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .output()
+        .expect("run acknowledgement")
 }

@@ -405,6 +405,7 @@ impl ThreadHistoryBuilder {
             | RolloutItem::RemoteExecutionLaunchIntent(_)
             | RolloutItem::RemoteExecutionSessionPrepared(_)
             | RolloutItem::RemoteExecutionSessionCommitted(_)
+            | RolloutItem::RemoteExecutionSessionAcknowledged(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::SessionMeta(_) => {}

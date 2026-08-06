@@ -2223,6 +2223,7 @@ async fn resume_candidate_matches_cwd(
             | RolloutItem::RemoteExecutionLaunchIntent(_)
             | RolloutItem::RemoteExecutionSessionPrepared(_)
             | RolloutItem::RemoteExecutionSessionCommitted(_)
+            | RolloutItem::RemoteExecutionSessionAcknowledged(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::EventMsg(_) => None,

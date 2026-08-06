@@ -238,6 +238,9 @@ fn rollout_item_type(item: &RolloutItem) -> String {
         | RolloutItem::RemoteExecutionSessionCommitted(_) => {
             "remote_execution_protocol_marker".to_string()
         }
+        RolloutItem::RemoteExecutionSessionAcknowledged(_) => {
+            "remote_execution_session_acknowledged".to_string()
+        }
         RolloutItem::Compacted(_) => "compacted".to_string(),
         RolloutItem::TurnContext(_) => "turn_context".to_string(),
         RolloutItem::WorldState(_) => "world_state".to_string(),

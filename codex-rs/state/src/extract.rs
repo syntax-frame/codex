@@ -27,7 +27,8 @@ pub fn apply_rollout_item(
         | RolloutItem::RemoteExecutionProtocolMarker(_)
         | RolloutItem::RemoteExecutionLaunchIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
-        | RolloutItem::RemoteExecutionSessionCommitted(_) => {}
+        | RolloutItem::RemoteExecutionSessionCommitted(_)
+        | RolloutItem::RemoteExecutionSessionAcknowledged(_) => {}
         RolloutItem::Compacted(_) => {}
         RolloutItem::WorldState(_) => {}
     }
@@ -59,6 +60,7 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::RemoteExecutionLaunchIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
+        | RolloutItem::RemoteExecutionSessionAcknowledged(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::WorldState(_) => false,
     }

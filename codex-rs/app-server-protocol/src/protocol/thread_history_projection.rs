@@ -81,6 +81,7 @@ pub fn project_rollout_line(line: &RolloutLine) -> ThreadHistoryChangeSet {
         | RolloutItem::RemoteExecutionLaunchIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
+        | RolloutItem::RemoteExecutionSessionAcknowledged(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)

@@ -300,6 +300,7 @@ impl ThreadMetadataSync {
                 | RolloutItem::RemoteExecutionLaunchIntent(_)
                 | RolloutItem::RemoteExecutionSessionPrepared(_)
                 | RolloutItem::RemoteExecutionSessionCommitted(_)
+                | RolloutItem::RemoteExecutionSessionAcknowledged(_)
                 | RolloutItem::Compacted(_)
                 | RolloutItem::WorldState(_) => {}
             }

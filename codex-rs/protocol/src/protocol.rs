@@ -2703,6 +2703,7 @@ impl InitialHistory {
                 | RolloutItem::RemoteExecutionLaunchIntent(_)
                 | RolloutItem::RemoteExecutionSessionPrepared(_)
                 | RolloutItem::RemoteExecutionSessionCommitted(_)
+                | RolloutItem::RemoteExecutionSessionAcknowledged(_)
                 | RolloutItem::Compacted(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::EventMsg(_) => None,
@@ -3043,6 +3044,7 @@ fn multi_agent_version_from_items(
             | RolloutItem::RemoteExecutionLaunchIntent(_)
             | RolloutItem::RemoteExecutionSessionPrepared(_)
             | RolloutItem::RemoteExecutionSessionCommitted(_)
+            | RolloutItem::RemoteExecutionSessionAcknowledged(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::EventMsg(_) => None,
@@ -3235,6 +3237,9 @@ pub enum RolloutItem {
     RemoteExecutionSessionPrepared(RemoteExecutionSessionPrepared),
     /// Active durable cursor/index for restoring a background execution.
     RemoteExecutionSessionCommitted(RemoteExecutionSessionCommitted),
+    /// Persistence-only evidence that a terminal remote descriptor was
+    /// successfully acknowledged after its local receipt commit became durable.
+    RemoteExecutionSessionAcknowledged(RemoteExecutionSessionAcknowledged),
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
@@ -3342,6 +3347,17 @@ pub struct RemoteExecutionSessionCommitted {
     /// Exact verified remote terminal status copied from the Prepared receipt.
     pub terminal_status: Option<RemoteExecutionTerminalStatus>,
     pub terminal: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+pub struct RemoteExecutionSessionAcknowledged {
+    pub thread_id: String,
+    pub receipt_turn_id: String,
+    pub receipt_call_id: String,
+    pub session_id: i32,
+    /// Binds this acknowledgement to the exact terminal Prepared receipt and
+    /// its matching durable Commit.
+    pub prepared_receipt_digest: String,
 }
 
 /// Persisted comparison state used to resume model-visible world-state diffing.

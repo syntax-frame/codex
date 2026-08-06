@@ -453,6 +453,106 @@ fn terminal_background_commit_retires_the_session_index() {
 }
 
 #[test]
+fn terminal_acknowledgement_marker_requires_one_exact_prior_commit() {
+    let RolloutItem::RemoteExecutionSessionPrepared(mut prepared) =
+        background_prepared(41, "poll-1", 7)
+    else {
+        unreachable!();
+    };
+    prepared.terminal_candidate = true;
+    prepared.terminal_acknowledgement_token = Some("terminal-token".to_string());
+    prepared.terminal_output_digest = Some(remote_receipt_bytes_digest(b"terminal"));
+    prepared.terminal_status = Some(RemoteExecutionTerminalStatus::Exited(0));
+    let prepared = RolloutItem::RemoteExecutionSessionPrepared(prepared);
+    let output = background_output("poll-1");
+    let committed = missing_background_session_commits(&[prepared.clone(), output.clone()])
+        .expect("terminal commit")[0]
+        .clone();
+    let marker =
+        RolloutItem::RemoteExecutionSessionAcknowledged(RemoteExecutionSessionAcknowledged {
+            thread_id: committed.thread_id.clone(),
+            receipt_turn_id: committed.receipt_turn_id.clone(),
+            receipt_call_id: committed.receipt_call_id.clone(),
+            session_id: committed.session_id,
+            prepared_receipt_digest: committed.prepared_receipt_digest.clone(),
+        });
+    let marker = persisted_rollout_item(&marker);
+    let commit = RolloutItem::RemoteExecutionSessionCommitted(committed);
+
+    let acknowledged = acknowledged_background_session_receipts(&[
+        prepared.clone(),
+        output.clone(),
+        commit.clone(),
+        marker.clone(),
+    ])
+    .expect("exact acknowledgement marker");
+    assert!(acknowledged.contains(&(
+        "thread".to_string(),
+        "receipt-turn".to_string(),
+        "poll-1".to_string(),
+    )));
+
+    assert!(
+        acknowledged_background_session_receipts(&[
+            prepared.clone(),
+            output.clone(),
+            marker.clone(),
+            commit.clone(),
+        ])
+        .is_err()
+    );
+    let duplicate = acknowledged_background_session_receipts(&[
+        prepared.clone(),
+        output.clone(),
+        commit.clone(),
+        marker.clone(),
+        marker.clone(),
+    ])
+    .expect("identical acknowledgement replay");
+    assert_eq!(duplicate.len(), 1);
+    let RolloutItem::RemoteExecutionSessionAcknowledged(mut wrong_session) = marker.clone() else {
+        unreachable!();
+    };
+    wrong_session.session_id += 1;
+    assert!(
+        acknowledged_background_session_receipts(&[
+            prepared.clone(),
+            output.clone(),
+            commit.clone(),
+            RolloutItem::RemoteExecutionSessionAcknowledged(wrong_session),
+        ])
+        .is_err()
+    );
+    let RolloutItem::RemoteExecutionSessionCommitted(mut nonterminal_commit) = commit.clone()
+    else {
+        unreachable!();
+    };
+    nonterminal_commit.terminal = false;
+    assert!(
+        acknowledged_background_session_receipts(&[
+            prepared.clone(),
+            output.clone(),
+            RolloutItem::RemoteExecutionSessionCommitted(nonterminal_commit),
+            marker.clone(),
+        ])
+        .is_err()
+    );
+    let RolloutItem::RemoteExecutionSessionAcknowledged(mut conflicting) = marker else {
+        unreachable!();
+    };
+    conflicting.prepared_receipt_digest = "conflicting".to_string();
+    assert!(
+        acknowledged_background_session_receipts(&[
+            prepared,
+            output,
+            commit,
+            RolloutItem::RemoteExecutionSessionAcknowledged(conflicting),
+        ])
+        .is_err()
+    );
+}
+
+#[test]
 fn latest_committed_background_session_pairs_the_exact_receipt() {
     let initial = background_prepared(41, "exec-41", 3);
     let initial_output = background_output("exec-41");
@@ -577,43 +677,83 @@ fn committed_delivery_unknown_write_round_trip_is_restart_idempotent() {
 }
 
 #[test]
-fn terminal_status_maps_to_observed_exit_code_for_reverification() {
-    assert_eq!(
-        terminal_status_observed_exit_code(&RemoteExecutionTerminalStatus::Exited(17)),
-        17
-    );
-    assert_eq!(
-        terminal_status_observed_exit_code(&RemoteExecutionTerminalStatus::Terminated),
-        143
-    );
-}
-
-#[test]
-fn terminal_acknowledgement_reverifies_raw_output_digest_and_status() {
+fn terminal_acknowledgement_retries_from_durable_commit_without_pre_reconciliation() {
     let session = include_str!("mod.rs");
     let finalize = session
         .find("pub(crate) async fn finalize_background_session_receipts")
         .expect("finalize method");
-    let verify_before_ack = session[finalize..]
-        .find("verify_terminal_remote_receipt")
-        .expect("terminal proof reverified before acknowledgement")
+    let finalize_end = session[finalize..]
+        .find("pub(crate) async fn restore_committed_background_sessions")
+        .expect("next method")
         + finalize;
-    let digest_check = session[verify_before_ack..]
-        .find("verified_output_digest")
-        .expect("verified raw byte digest is compared")
-        + verify_before_ack;
-    let status_check = session[verify_before_ack..]
-        .find("verified_status")
-        .expect("verified terminal status is compared")
-        + verify_before_ack;
-    let acknowledge = session[verify_before_ack..]
+    let finalize_body = &session[finalize..finalize_end];
+    assert!(!finalize_body.contains("verify_terminal_remote_receipt"));
+    assert!(!finalize_body.contains(".reconcile("));
+    for durable_authority in [
+        ".terminal_acknowledgement_token",
+        ".terminal_output_digest",
+        "committed.terminal_status",
+        "range_start: committed.range_start",
+        "range_end: committed.range_end",
+        "output_sha256: terminal_output_digest.clone()",
+    ] {
+        assert!(
+            finalize_body.contains(durable_authority),
+            "missing durable acknowledgement authority: {durable_authority}"
+        );
+    }
+    let proof = finalize_body
+        .find(".with_terminal_proof")
+        .expect("durable terminal proof");
+    let acknowledge = finalize_body
         .find(".acknowledge_consumed")
-        .expect("backend acknowledgement")
-        + verify_before_ack;
+        .expect("idempotent backend acknowledgement");
 
-    assert!(verify_before_ack < acknowledge);
-    assert!(digest_check < acknowledge);
-    assert!(status_check < acknowledge);
+    assert!(acknowledge < proof);
+}
+
+#[test]
+fn terminal_acknowledgement_is_marked_durable_before_local_receipt_release() {
+    let session = include_str!("mod.rs");
+    let finalize = session
+        .find("pub(crate) async fn finalize_background_session_receipts")
+        .expect("finalize method");
+    let finalize_end = session[finalize..]
+        .find("pub(crate) async fn restore_committed_background_sessions")
+        .expect("next method")
+        + finalize;
+    let finalize_body = &session[finalize..finalize_end];
+    let durable_marker_scan = finalize_body
+        .find("acknowledged_background_session_receipts")
+        .expect("durable acknowledgement scan");
+    let marker_skip = finalize_body
+        .find("acknowledged_receipts.contains")
+        .expect("already acknowledged receipt skip");
+    let remote_ack = finalize_body
+        .find(".acknowledge_consumed")
+        .expect("remote acknowledgement");
+    let marker = finalize_body
+        .find("RolloutItem::RemoteExecutionSessionAcknowledged")
+        .expect("durable acknowledgement marker");
+    let marker_append = finalize_body[marker..]
+        .find(".append_items(&[marker])")
+        .expect("marker append")
+        + marker;
+    let marker_flush = finalize_body[marker_append..]
+        .find(".flush()")
+        .expect("marker flush")
+        + marker_append;
+    let local_release = finalize_body[marker_flush..]
+        .find(".acknowledge_output_receipt")
+        .expect("local receipt release")
+        + marker_flush;
+
+    assert!(durable_marker_scan < marker_skip);
+    assert!(marker_skip < remote_ack);
+    assert!(remote_ack < marker);
+    assert!(marker < marker_append);
+    assert!(marker_append < marker_flush);
+    assert!(marker_flush < local_release);
 }
 
 #[test]
@@ -3663,6 +3803,7 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
         | RolloutItem::RemoteExecutionLaunchIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
+        | RolloutItem::RemoteExecutionSessionAcknowledged(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::EventMsg(_) => None,
@@ -3723,6 +3864,7 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         | RolloutItem::RemoteExecutionLaunchIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
+        | RolloutItem::RemoteExecutionSessionAcknowledged(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)

@@ -1207,6 +1207,7 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
         | RolloutItem::RemoteExecutionLaunchIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
+        | RolloutItem::RemoteExecutionSessionAcknowledged(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)

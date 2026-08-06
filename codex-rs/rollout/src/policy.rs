@@ -14,7 +14,8 @@ pub fn is_persisted_rollout_item(item: &RolloutItem, history_mode: ThreadHistory
         | RolloutItem::RemoteExecutionProtocolMarker(_)
         | RolloutItem::RemoteExecutionLaunchIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
-        | RolloutItem::RemoteExecutionSessionCommitted(_) => true,
+        | RolloutItem::RemoteExecutionSessionCommitted(_)
+        | RolloutItem::RemoteExecutionSessionAcknowledged(_) => true,
         RolloutItem::EventMsg(ev) => should_persist_event_msg(ev, history_mode),
         // Persist Codex executive markers so we can analyze flows (e.g., compaction, API turns).
         RolloutItem::Compacted(_)
