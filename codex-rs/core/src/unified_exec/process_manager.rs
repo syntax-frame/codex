@@ -484,6 +484,86 @@ impl UnifiedExecProcessManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn restore_terminal_background_process(
+        &self,
+        recovered: &codex_exec_server::RecoveredExecution,
+        committed_output_cursor: u64,
+        session: &Arc<crate::session::session::Session>,
+        original_call_id: String,
+        cwd: PathUri,
+        hook_command: String,
+        tty: bool,
+    ) -> Result<(), UnifiedExecError> {
+        let process_id = recovered.session_id.ok_or_else(|| {
+            UnifiedExecError::create_process(
+                "terminal background recovery lacks original integer session id".to_string(),
+            )
+        })?;
+        let exit_code = match &recovered.status {
+            codex_exec_server::RecoveredExecutionStatus::Exited(exit_code) => *exit_code,
+            codex_exec_server::RecoveredExecutionStatus::Terminated => 143,
+            _ => {
+                return Err(UnifiedExecError::create_process(format!(
+                    "background session {process_id} is not terminal"
+                )));
+            }
+        };
+        if !recovered.terminal_verified_dead
+            || recovered.delivery_unknown
+            || recovered.committed_output_cursor
+                != u64::try_from(recovered.output.len()).unwrap_or(u64::MAX)
+            || recovered.committed_output_cursor < committed_output_cursor
+        {
+            return Err(UnifiedExecError::create_process(format!(
+                "background session {process_id} lacks exact terminal recovery proof"
+            )));
+        }
+        {
+            let mut store = self.process_store.lock().await;
+            if !store.reserve_exact(process_id) {
+                return Err(UnifiedExecError::create_process(format!(
+                    "cannot restore terminal background session {process_id}: id collision"
+                )));
+            }
+        }
+        let started = codex_exec_server::StartedExecProcess::from_recovered_terminal(
+            process_id,
+            &recovered.output,
+            committed_output_cursor,
+            exit_code,
+            tty,
+        )
+        .map_err(|error| UnifiedExecError::create_process(error.to_string()))?;
+        let process = Arc::new(
+            UnifiedExecProcess::from_exec_server_started(started, /*detach_on_drop*/ true).await?,
+        );
+        let entry = ProcessEntry {
+            process,
+            call_id: original_call_id,
+            process_id,
+            cwd,
+            initial_exec_command_active: Arc::new(AtomicBool::new(false)),
+            hook_command,
+            tty,
+            network_approval: None,
+            session: Arc::downgrade(session),
+            last_used: Instant::now(),
+            pending_receipt: None,
+            receipt_frozen: false,
+        };
+        let mut store = self.process_store.lock().await;
+        if store.processes.contains_key(&process_id)
+            || !store.reserved_process_ids.contains(&process_id)
+        {
+            return Err(UnifiedExecError::create_process(format!(
+                "terminal background session {process_id} reservation was lost"
+            )));
+        }
+        store.processes.insert(process_id, entry);
+        Ok(())
+    }
+
     /// Reattaches an exact durable backend execution under its original user-visible ID.
     ///
     /// The reservation is deliberately retained when backend adoption fails: dropping it
@@ -920,12 +1000,57 @@ impl UnifiedExecProcessManager {
         if !request.input.is_empty() {
             if !tty {
                 if request.input == INTERRUPT {
+                    // A remote non-TTY interrupt cannot be deduplicated by the
+                    // stdin write-ID protocol. Persist the side-effect intent
+                    // first so a crash after signal delivery is classified as
+                    // delivery-unknown and never replays a second signal.
+                    if process.detaches_on_drop() {
+                        let interaction = request.interaction_event.as_ref().ok_or_else(|| {
+                            UnifiedExecError::create_process(format!(
+                                "durable remote session {process_id} requires interrupt intent \
+                                 context"
+                            ))
+                        })?;
+                        interaction
+                            .session
+                            .persist_remote_execution_write_intent(
+                                process_id,
+                                interaction.receipt_turn_id,
+                                interaction.call_id,
+                                request.input,
+                            )
+                            .await
+                            .map_err(|error| UnifiedExecError::create_process(error.to_string()))?;
+                    }
                     process.interrupt().await?;
                 } else {
                     return Err(UnifiedExecError::StdinClosed);
                 }
             } else {
-                match process.write(request.input.as_bytes()).await {
+                let durable_write_id = if process.detaches_on_drop() {
+                    let interaction = request.interaction_event.as_ref().ok_or_else(|| {
+                        UnifiedExecError::create_process(format!(
+                            "durable remote session {process_id} requires stdin intent context"
+                        ))
+                    })?;
+                    interaction
+                        .session
+                        .persist_remote_execution_write_intent(
+                            process_id,
+                            interaction.receipt_turn_id,
+                            interaction.call_id,
+                            request.input,
+                        )
+                        .await
+                        .map(Some)
+                        .map_err(|error| UnifiedExecError::create_process(error.to_string()))?
+                } else {
+                    None
+                };
+                match process
+                    .write(request.input.as_bytes(), durable_write_id.as_deref())
+                    .await
+                {
                     Ok(()) => {
                         // Give the remote process a brief window to react so that we are
                         // more likely to capture its output in the poll below.
@@ -1023,7 +1148,7 @@ impl UnifiedExecProcessManager {
                 {
                     return Err(fail_process_with_message(entry.process.as_ref(), message));
                 }
-                if request.input.is_empty() && request.interaction_event.is_some() {
+                if request.interaction_event.is_some() && process.detaches_on_drop() {
                     let mut store = self.process_store.lock().await;
                     if !store.reserve_exact(request.process_id) {
                         return Err(UnifiedExecError::create_process(format!(
@@ -1060,7 +1185,7 @@ impl UnifiedExecProcessManager {
             hook_command: Some(hook_command),
         };
 
-        if request.input.is_empty()
+        if process.detaches_on_drop()
             && let Some(interaction) = request.interaction_event.as_ref()
         {
             self.begin_output_receipt(
@@ -1076,7 +1201,13 @@ impl UnifiedExecProcessManager {
                     request.process_id,
                     interaction.receipt_turn_id,
                     interaction.call_id,
+                    if request.input.is_empty() {
+                        codex_protocol::protocol::RemoteExecutionReceiptKind::EmptyPoll
+                    } else {
+                        codex_protocol::protocol::RemoteExecutionReceiptKind::NonemptyWrite
+                    },
                     collected_output.absolute_range(),
+                    collected_output.total_bytes() == 0,
                     response.process_id.is_none(),
                     response.exit_code,
                     &response.response_text(),

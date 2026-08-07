@@ -820,7 +820,9 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
         )
         .await?;
 
-    process.write(b"printf 'remote-unified-exec\\n'\n").await?;
+    process
+        .write(b"printf 'remote-unified-exec\\n'\n", None)
+        .await?;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let crate::unified_exec::process::OutputHandles {

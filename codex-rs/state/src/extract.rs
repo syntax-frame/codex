@@ -26,9 +26,12 @@ pub fn apply_rollout_item(
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::RemoteExecutionProtocolMarker(_)
         | RolloutItem::RemoteExecutionLaunchIntent(_)
+        | RolloutItem::RemoteExecutionWriteRequest(_)
+        | RolloutItem::RemoteExecutionWriteIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
-        | RolloutItem::RemoteExecutionSessionAcknowledged(_) => {}
+        | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+        | RolloutItem::RemoteExecutionSessionReleased(_) => {}
         RolloutItem::Compacted(_) => {}
         RolloutItem::WorldState(_) => {}
     }
@@ -58,9 +61,12 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::RemoteExecutionProtocolMarker(_)
         | RolloutItem::RemoteExecutionLaunchIntent(_)
+        | RolloutItem::RemoteExecutionWriteRequest(_)
+        | RolloutItem::RemoteExecutionWriteIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
         | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+        | RolloutItem::RemoteExecutionSessionReleased(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::WorldState(_) => false,
     }

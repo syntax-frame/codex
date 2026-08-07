@@ -283,9 +283,12 @@ async fn persisted_originator(thread: &CodexThread) -> String {
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::RemoteExecutionProtocolMarker(_)
             | RolloutItem::RemoteExecutionLaunchIntent(_)
+            | RolloutItem::RemoteExecutionWriteRequest(_)
+            | RolloutItem::RemoteExecutionWriteIntent(_)
             | RolloutItem::RemoteExecutionSessionPrepared(_)
             | RolloutItem::RemoteExecutionSessionCommitted(_)
             | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+            | RolloutItem::RemoteExecutionSessionReleased(_)
             | RolloutItem::EventMsg(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)

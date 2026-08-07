@@ -7,6 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -131,6 +132,8 @@ use codex_protocol::protocol::RemoteExecutionSessionAcknowledged;
 use codex_protocol::protocol::RemoteExecutionSessionCommitted;
 use codex_protocol::protocol::RemoteExecutionSessionPrepared;
 use codex_protocol::protocol::RemoteExecutionTerminalStatus;
+use codex_protocol::protocol::RemoteExecutionWriteIntent;
+use codex_protocol::protocol::RemoteExecutionWriteRequest;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -488,9 +491,79 @@ fn missing_background_session_commits(
     Ok(missing)
 }
 
-fn acknowledged_background_session_receipts(
+fn completed_nonempty_write_after_commit(
     history: &[RolloutItem],
-) -> CodexResult<HashSet<(String, String, String)>> {
+    session_id: i32,
+    commit_index: usize,
+) -> CodexResult<Option<String>> {
+    let completed_calls = history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. }) => {
+                Some(call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    for item in history.iter().skip(commit_index.saturating_add(1)) {
+        let RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+            ..
+        }) = item
+        else {
+            continue;
+        };
+        if name != "write_stdin" || !completed_calls.contains(call_id.as_str()) {
+            continue;
+        }
+        let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
+            continue;
+        };
+        let matching_session = arguments
+            .get("session_id")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            == Some(session_id);
+        let nonempty = arguments
+            .get("chars")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|chars| !chars.is_empty());
+        if matching_session && nonempty {
+            return Ok(Some(call_id.clone()));
+        }
+    }
+    Ok(None)
+}
+
+type RemoteReceiptMarkerSelector =
+    for<'a> fn(&'a RolloutItem) -> Option<&'a RemoteExecutionSessionAcknowledged>;
+
+fn acknowledged_remote_receipt_marker(
+    item: &RolloutItem,
+) -> Option<&RemoteExecutionSessionAcknowledged> {
+    match item {
+        RolloutItem::RemoteExecutionSessionAcknowledged(marker) => Some(marker),
+        _ => None,
+    }
+}
+
+fn released_remote_receipt_marker(
+    item: &RolloutItem,
+) -> Option<&RemoteExecutionSessionAcknowledged> {
+    match item {
+        RolloutItem::RemoteExecutionSessionReleased(marker) => Some(marker),
+        _ => None,
+    }
+}
+
+fn validated_background_session_receipt_marker_indices(
+    history: &[RolloutItem],
+    marker_name: &str,
+    select_marker: RemoteReceiptMarkerSelector,
+) -> CodexResult<HashMap<(String, String, String), usize>> {
     let mut commits =
         HashMap::<(String, String, String), Vec<(usize, &RemoteExecutionSessionCommitted)>>::new();
     for (index, item) in history.iter().enumerate() {
@@ -506,9 +579,9 @@ fn acknowledged_background_session_receipts(
         }
     }
 
-    let mut acknowledged = HashMap::new();
+    let mut markers = HashMap::new();
     for (marker_index, item) in history.iter().enumerate() {
-        let RolloutItem::RemoteExecutionSessionAcknowledged(marker) = item else {
+        let Some(marker) = select_marker(item) else {
             continue;
         };
         let key = (
@@ -518,13 +591,13 @@ fn acknowledged_background_session_receipts(
         );
         let Some(matching_commits) = commits.get(&key) else {
             return Err(CodexErr::Fatal(format!(
-                "terminal acknowledgement marker lacks commit for receipt {}",
+                "terminal {marker_name} marker lacks commit for receipt {}",
                 marker.receipt_call_id
             )));
         };
         let [(commit_index, committed)] = matching_commits.as_slice() else {
             return Err(CodexErr::Fatal(format!(
-                "terminal acknowledgement marker has ambiguous commit for receipt {}",
+                "terminal {marker_name} marker has ambiguous commit for receipt {}",
                 marker.receipt_call_id
             )));
         };
@@ -534,41 +607,87 @@ fn acknowledged_background_session_receipts(
             || marker.prepared_receipt_digest != committed.prepared_receipt_digest
         {
             return Err(CodexErr::Fatal(format!(
-                "terminal acknowledgement marker lacks exact durable authority for receipt {}",
+                "terminal {marker_name} marker lacks exact durable authority for receipt {}",
                 marker.receipt_call_id
             )));
         }
-        if let Some(existing) = acknowledged.insert(key, marker)
-            && existing != marker
+        if let Some((_, existing)) = markers.get(&key) {
+            if *existing != marker {
+                return Err(CodexErr::Fatal(format!(
+                    "conflicting terminal {marker_name} markers for receipt {}",
+                    marker.receipt_call_id
+                )));
+            }
+        } else {
+            markers.insert(key, (marker_index, marker));
+        }
+    }
+    Ok(markers
+        .into_iter()
+        .map(|(key, (index, _))| (key, index))
+        .collect())
+}
+
+fn acknowledged_background_session_receipts(
+    history: &[RolloutItem],
+) -> CodexResult<HashSet<(String, String, String)>> {
+    Ok(validated_background_session_receipt_marker_indices(
+        history,
+        "acknowledgement",
+        acknowledged_remote_receipt_marker,
+    )?
+    .into_keys()
+    .collect())
+}
+
+fn released_background_session_receipts(
+    history: &[RolloutItem],
+) -> CodexResult<HashSet<(String, String, String)>> {
+    let acknowledged = validated_background_session_receipt_marker_indices(
+        history,
+        "acknowledgement",
+        acknowledged_remote_receipt_marker,
+    )?;
+    let released = validated_background_session_receipt_marker_indices(
+        history,
+        "release",
+        released_remote_receipt_marker,
+    )?;
+    for (key, release_index) in &released {
+        if acknowledged
+            .get(key)
+            .is_none_or(|acknowledgement_index| acknowledgement_index >= release_index)
         {
             return Err(CodexErr::Fatal(format!(
-                "conflicting terminal acknowledgement markers for receipt {}",
-                marker.receipt_call_id
+                "terminal release marker lacks preceding acknowledgement for receipt {}",
+                key.2
             )));
         }
     }
-    Ok(acknowledged.into_keys().collect())
+    Ok(released.into_keys().collect())
 }
 
-fn latest_committed_background_session<'a>(
+fn latest_committed_background_session_entry<'a>(
     history: &'a [RolloutItem],
     thread_id: &str,
     session_id: i32,
 ) -> CodexResult<(
+    usize,
     &'a RemoteExecutionSessionCommitted,
     &'a RemoteExecutionSessionPrepared,
 )> {
-    let committed = history
+    let (committed_index, committed) = history
         .iter()
-        .filter_map(|item| match item {
+        .enumerate()
+        .filter_map(|(index, item)| match item {
             RolloutItem::RemoteExecutionSessionCommitted(committed)
                 if committed.thread_id == thread_id && committed.session_id == session_id =>
             {
-                Some(committed)
+                Some((index, committed))
             }
             _ => None,
         })
-        .last()
+        .next_back()
         .ok_or_else(|| {
             CodexErr::Fatal(format!(
                 "pending nonempty write targets unrecoverable session {session_id}"
@@ -594,7 +713,7 @@ fn latest_committed_background_session<'a>(
             }
             _ => None,
         })
-        .last()
+        .next_back()
         .ok_or_else(|| {
             CodexErr::Fatal(format!(
                 "committed background session {session_id} lacks preparation metadata"
@@ -608,6 +727,19 @@ fn latest_committed_background_session<'a>(
             "committed background session {session_id} conflicts with preparation metadata"
         )));
     }
+    Ok((committed_index, committed, prepared))
+}
+
+fn latest_committed_background_session<'a>(
+    history: &'a [RolloutItem],
+    thread_id: &str,
+    session_id: i32,
+) -> CodexResult<(
+    &'a RemoteExecutionSessionCommitted,
+    &'a RemoteExecutionSessionPrepared,
+)> {
+    let (_, committed, prepared) =
+        latest_committed_background_session_entry(history, thread_id, session_id)?;
     Ok((committed, prepared))
 }
 
@@ -729,6 +861,164 @@ fn delivery_unknown_remote_write_output(
     successful_remote_poll_output(pending, text)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PendingNonemptyWriteRequest {
+    input: String,
+    yield_time_ms: u64,
+    max_output_tokens: Option<usize>,
+    truncation_policy: TruncationPolicy,
+}
+
+fn remote_write_request_order_is_valid(
+    committed_index: usize,
+    marker_index: usize,
+    call_index: usize,
+    request_index: Option<usize>,
+) -> bool {
+    committed_index < marker_index
+        && marker_index < call_index
+        && request_index.is_none_or(|request_index| call_index < request_index)
+}
+
+fn pending_nonempty_write_request(
+    history: &[RolloutItem],
+    thread_id: &str,
+    pending: &codex_exec_server::PendingWriteInteraction,
+) -> CodexResult<PendingNonemptyWriteRequest> {
+    let matching = history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            RolloutItem::ResponseItem(
+                response @ ResponseItem::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                },
+            ) if call_id == &pending.call_id => Some((index, response, name, arguments)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [(call_index, response, name, arguments)] = matching.as_slice() else {
+        return Err(CodexErr::Fatal(format!(
+            "pending stdin call {} lacks one exact durable function call",
+            pending.call_id
+        )));
+    };
+    let arguments: serde_json::Value = serde_json::from_str(arguments).map_err(|error| {
+        CodexErr::Fatal(format!(
+            "pending stdin call {} has invalid arguments: {error}",
+            pending.call_id
+        ))
+    })?;
+    let session_id = arguments
+        .get("session_id")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let input = match arguments.get("chars") {
+        None => "",
+        Some(value) => value.as_str().ok_or_else(|| {
+            CodexErr::Fatal(format!(
+                "pending stdin call {} has invalid chars",
+                pending.call_id
+            ))
+        })?,
+    };
+    let yield_time_ms = match arguments.get("yield_time_ms") {
+        None => crate::unified_exec::MIN_YIELD_TIME_MS,
+        Some(value) => value.as_u64().ok_or_else(|| {
+            CodexErr::Fatal(format!(
+                "pending stdin call {} has invalid yield_time_ms",
+                pending.call_id
+            ))
+        })?,
+    };
+    let max_output_tokens = match arguments.get("max_output_tokens") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let value = value.as_u64().ok_or_else(|| {
+                CodexErr::Fatal(format!(
+                    "pending stdin call {} has invalid max_output_tokens",
+                    pending.call_id
+                ))
+            })?;
+            Some(usize::try_from(value).map_err(|_| {
+                CodexErr::Fatal(format!(
+                    "pending stdin call {} max_output_tokens is unsupported",
+                    pending.call_id
+                ))
+            })?)
+        }
+    };
+    if name.as_str() != "write_stdin"
+        || response.turn_id() != Some(pending.turn_id.as_str())
+        || session_id != Some(pending.session_id)
+        || input.is_empty()
+    {
+        return Err(CodexErr::Fatal(format!(
+            "pending stdin call {} conflicts with its recovery identity",
+            pending.call_id
+        )));
+    }
+    let matching_requests = history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            RolloutItem::RemoteExecutionWriteRequest(request)
+                if request.receipt_turn_id == pending.turn_id
+                    && request.receipt_call_id == pending.call_id =>
+            {
+                Some((index, request))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [(request_index, request)] = matching_requests.as_slice() else {
+        return Err(CodexErr::Fatal(format!(
+            "pending stdin call {} lacks one exact durable replay request",
+            pending.call_id
+        )));
+    };
+    let (committed_index, committed, _) =
+        latest_committed_background_session_entry(history, thread_id, pending.session_id)?;
+    if committed_index >= *call_index || *call_index >= *request_index {
+        return Err(CodexErr::Fatal(format!(
+            "pending stdin call {} has invalid commit-call-request ordering",
+            pending.call_id
+        )));
+    }
+    let input_len = u64::try_from(input.len()).map_err(|_| {
+        CodexErr::Fatal(format!(
+            "pending stdin call {} input length is unsupported",
+            pending.call_id
+        ))
+    })?;
+    if request.thread_id != thread_id
+        || request.exec_turn_id != committed.exec_turn_id
+        || request.exec_call_id != committed.exec_call_id
+        || request.attempt_generation != committed.attempt_generation
+        || request.session_id != pending.session_id
+        || request.command_digest != committed.command_digest
+        || request.committed_output_cursor != committed.range_end
+        || request.input_sha256 != remote_receipt_bytes_digest(input.as_bytes())
+        || request.input_len != input_len
+        || request.yield_time_ms != yield_time_ms
+        || request.max_output_tokens != max_output_tokens
+    {
+        return Err(CodexErr::Fatal(format!(
+            "pending stdin call {} conflicts with its durable replay request",
+            pending.call_id
+        )));
+    }
+    Ok(PendingNonemptyWriteRequest {
+        input: input.to_string(),
+        yield_time_ms,
+        max_output_tokens,
+        truncation_policy: request.truncation_policy,
+    })
+}
+
 fn remote_poll_output_matches(
     item: &RolloutItem,
     pending: &codex_exec_server::PendingWriteInteraction,
@@ -806,7 +1096,7 @@ fn prepared_empty_poll_repair(
         })
         .collect::<Vec<_>>();
     let output_to_append = match existing_outputs.as_slice() {
-        [] => Some(expected_output.clone()),
+        [] => Some(expected_output),
         [existing]
             if remote_poll_output_matches(existing, pending, &prepared.receipt_output_text) =>
         {
@@ -1896,7 +2186,8 @@ impl Session {
         &self,
         turn_context: &TurnContext,
     ) -> CodexResult<()> {
-        self.finalize_background_session_receipts().await?;
+        self.retry_background_session_receipt_maintenance("turn_start")
+            .await?;
         let requires_durable_marker = turn_context.config.features.enabled(Feature::UnifiedExec)
             && (turn_context
                 .environments
@@ -1909,7 +2200,7 @@ impl Session {
                 || turn_context
                     .environments
                     .starting()
-                    .any(|environment| environment.supports_durable_remote_exec_recovery()));
+                    .any(super::environment_selection::StartingTurnEnvironment::supports_durable_remote_exec_recovery));
         if !requires_durable_marker {
             return Ok(());
         }
@@ -1973,6 +2264,7 @@ impl Session {
             protocol_version: 2,
             identity_schema: "thread-turn-call-generation".to_string(),
             descriptor_before_go: true,
+            stdin_intent_before_write: true,
         });
         live_thread
             .append_items(&[marker])
@@ -1984,11 +2276,11 @@ impl Session {
             .map_err(|error| CodexErr::Io(std::io::Error::other(error)))
     }
 
-    pub(crate) async fn finalize_background_session_receipts(&self) -> CodexResult<()> {
+    async fn persist_missing_background_session_commits(&self) -> CodexResult<()> {
         let Some(live_thread) = self.live_thread() else {
             return Ok(());
         };
-        let mut history = live_thread
+        let history = live_thread
             .load_history(/*include_archived*/ true)
             .await
             .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
@@ -2006,17 +2298,29 @@ impl Session {
                 .flush()
                 .await
                 .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
-            history = live_thread
-                .load_history(/*include_archived*/ true)
-                .await
-                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
         }
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
         if !missing_background_session_commits(&history.items)?.is_empty() {
             return Err(CodexErr::Fatal(
                 "background session commit did not become durably visible".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    async fn finalize_background_session_remote_receipts(&self) -> CodexResult<()> {
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(());
+        };
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
         let acknowledged_receipts = acknowledged_background_session_receipts(&history.items)?;
+        let released_receipts = released_background_session_receipts(&history.items)?;
         let active_thread_id = self.thread_id.to_string();
         for committed in history.items.iter().filter_map(|item| match item {
             RolloutItem::RemoteExecutionSessionCommitted(committed)
@@ -2041,7 +2345,7 @@ impl Session {
                 committed.receipt_turn_id.clone(),
                 committed.receipt_call_id.clone(),
             );
-            if acknowledged_receipts.contains(&receipt_key) {
+            if released_receipts.contains(&receipt_key) {
                 self.services
                     .unified_exec_manager
                     .acknowledge_output_receipt(
@@ -2051,6 +2355,7 @@ impl Session {
                     .await;
                 continue;
             }
+            let already_acknowledged = acknowledged_receipts.contains(&receipt_key);
             let prepared = history
                 .items
                 .iter()
@@ -2123,48 +2428,90 @@ impl Session {
                     committed.session_id, prepared.environment_id
                 )));
             }
-            // The ordered Prepared/output/Commit chain above is the durable
-            // local authority. Do not reconcile the live descriptor here: a
-            // previous acknowledgement may already have atomically retired it
-            // to a tombstone. The backend acknowledgement revalidates the
-            // terminal proof on first use and makes tombstone retries
-            // idempotent.
-            environment
-                .get_exec_backend()
-                .acknowledge_consumed(
-                    codex_exec_server::RecoveredExecutionAcknowledgement::new(token.clone())
-                        .with_terminal_proof(codex_exec_server::TerminalAcknowledgementProof {
-                            range_start: committed.range_start,
-                            range_end: committed.range_end,
-                            output_sha256: terminal_output_digest.clone(),
-                            status: match terminal_status {
-                                RemoteExecutionTerminalStatus::Exited(exit_code) => {
-                                    codex_exec_server::RecoveredExecutionStatus::Exited(*exit_code)
-                                }
-                                RemoteExecutionTerminalStatus::Terminated => {
-                                    codex_exec_server::RecoveredExecutionStatus::Terminated
-                                }
-                            },
-                        }),
+            let acknowledgement =
+                codex_exec_server::RecoveredExecutionAcknowledgement::new(token.clone())
+                    .with_terminal_proof(codex_exec_server::TerminalAcknowledgementProof {
+                        range_start: committed.range_start,
+                        range_end: committed.range_end,
+                        output_sha256: terminal_output_digest.clone(),
+                        status: match terminal_status {
+                            RemoteExecutionTerminalStatus::Exited(exit_code) => {
+                                codex_exec_server::RecoveredExecutionStatus::Exited(*exit_code)
+                            }
+                            RemoteExecutionTerminalStatus::Terminated => {
+                                codex_exec_server::RecoveredExecutionStatus::Terminated
+                            }
+                        },
+                    });
+            let receipt_marker = RemoteExecutionSessionAcknowledged {
+                thread_id: committed.thread_id.clone(),
+                receipt_turn_id: committed.receipt_turn_id.clone(),
+                receipt_call_id: committed.receipt_call_id.clone(),
+                session_id: committed.session_id,
+                prepared_receipt_digest: committed.prepared_receipt_digest.clone(),
+            };
+            if !already_acknowledged {
+                // The ordered Prepared/output/Commit chain above is the durable
+                // local authority. Do not reconcile the live descriptor here:
+                // acknowledgement atomically retires it to a proof-keyed
+                // tombstone and is idempotent if its response was lost.
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    environment
+                        .get_exec_backend()
+                        .acknowledge_consumed(acknowledgement.clone()),
                 )
                 .await
+                .map_err(|_| {
+                    CodexErr::Fatal(format!(
+                        "timed out retiring terminal background session {}",
+                        committed.session_id
+                    ))
+                })?
                 .map_err(|error| {
                     CodexErr::Fatal(format!(
                         "failed to retire terminal background session {}: {error}",
                         committed.session_id
                     ))
                 })?;
-            let marker = RolloutItem::RemoteExecutionSessionAcknowledged(
-                RemoteExecutionSessionAcknowledged {
-                    thread_id: committed.thread_id.clone(),
-                    receipt_turn_id: committed.receipt_turn_id.clone(),
-                    receipt_call_id: committed.receipt_call_id.clone(),
-                    session_id: committed.session_id,
-                    prepared_receipt_digest: committed.prepared_receipt_digest.clone(),
-                },
-            );
+                let marker =
+                    RolloutItem::RemoteExecutionSessionAcknowledged(receipt_marker.clone());
+                live_thread
+                    .append_items(&[marker])
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+                live_thread
+                    .flush()
+                    .await
+                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+            }
+            // Only the durable local acknowledgement marker authorizes
+            // deletion of the exact proof-bound tombstone. Failure remains
+            // retryable because the acknowledgement marker stays in the
+            // rollout; a second marker records successful deletion so later
+            // turns never contact SSH again for this receipt.
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                environment
+                    .get_exec_backend()
+                    .release_acknowledged(acknowledgement),
+            )
+            .await
+            .map_err(|_| {
+                CodexErr::Fatal(format!(
+                    "timed out releasing terminal acknowledgement metadata for session {}",
+                    committed.session_id
+                ))
+            })?
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to release terminal acknowledgement metadata for session {}: {error}",
+                    committed.session_id
+                ))
+            })?;
+            let release_marker = RolloutItem::RemoteExecutionSessionReleased(receipt_marker);
             live_thread
-                .append_items(&[marker])
+                .append_items(&[release_marker])
                 .await
                 .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
             live_thread
@@ -2179,8 +2526,27 @@ impl Session {
         Ok(())
     }
 
+    async fn retry_background_session_receipt_maintenance(
+        &self,
+        checkpoint: &'static str,
+    ) -> CodexResult<()> {
+        // Commit backfill is local cursor authority and must fail closed.
+        // Only remote acknowledgement/tombstone retirement is best effort.
+        self.persist_missing_background_session_commits().await?;
+        if let Err(error) = self.finalize_background_session_remote_receipts().await {
+            warn!(
+                thread_id = %self.thread_id,
+                checkpoint,
+                error = %error,
+                "deferred remote execution receipt maintenance remains retryable"
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) async fn restore_committed_background_sessions(self: &Arc<Self>) -> CodexResult<()> {
-        self.finalize_background_session_receipts().await?;
+        self.retry_background_session_receipt_maintenance("session_restore")
+            .await?;
         let Some(live_thread) = self.live_thread() else {
             return Ok(());
         };
@@ -2188,15 +2554,27 @@ impl Session {
             .load_history(/*include_archived*/ true)
             .await
             .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
-        let mut latest = HashMap::<i32, RemoteExecutionSessionCommitted>::new();
-        for item in &history.items {
+        let mut latest = HashMap::<i32, (usize, RemoteExecutionSessionCommitted)>::new();
+        for (index, item) in history.items.iter().enumerate() {
             if let RolloutItem::RemoteExecutionSessionCommitted(committed) = item
                 && committed.thread_id == self.thread_id.to_string()
             {
-                latest.insert(committed.session_id, committed.clone());
+                latest.insert(committed.session_id, (index, committed.clone()));
             }
         }
-        for committed in latest.into_values().filter(|commit| !commit.terminal) {
+        for (commit_index, committed) in latest.into_values().filter(|(_, commit)| !commit.terminal)
+        {
+            if let Some(call_id) = completed_nonempty_write_after_commit(
+                &history.items,
+                committed.session_id,
+                commit_index,
+            )? {
+                return Err(CodexErr::Fatal(format!(
+                    "background session {} has completed nonempty write_stdin call {call_id} \
+                     without a durable stdout cursor receipt; resume is fail-closed",
+                    committed.session_id
+                )));
+            }
             let prepared = history
                 .items
                 .iter()
@@ -2213,7 +2591,7 @@ impl Session {
                     }
                     _ => None,
                 })
-                .last()
+                .next_back()
                 .ok_or_else(|| {
                     CodexErr::Fatal(format!(
                         "committed background session {} lacks adoption metadata",
@@ -2243,29 +2621,144 @@ impl Session {
                     committed.session_id
                 ))
             })?;
-            self.services
-                .unified_exec_manager
-                .adopt_background_process(
-                    environment.as_ref(),
-                    codex_exec_server::AdoptionRequest {
-                        identity: codex_exec_server::ExecutionIdentity {
-                            thread_id: committed.thread_id.clone(),
-                            turn_id: committed.exec_turn_id.clone(),
-                            call_id: committed.exec_call_id.clone(),
-                            attempt_generation: committed.attempt_generation,
-                        },
-                        expected_command_digest: committed.command_digest.clone(),
-                        original_session_id: Some(committed.session_id),
-                        committed_output_cursor: committed.range_end,
-                        tty: prepared.tty,
-                    },
-                    self,
-                    committed.exec_call_id,
-                    cwd,
-                    prepared.hook_command.clone(),
-                )
-                .await
-                .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+            let identity = codex_exec_server::ExecutionIdentity {
+                thread_id: committed.thread_id.clone(),
+                turn_id: committed.exec_turn_id.clone(),
+                call_id: committed.exec_call_id.clone(),
+                attempt_generation: committed.attempt_generation,
+            };
+            let reconciliation_request = codex_exec_server::ReconciliationRequest {
+                thread_id: committed.thread_id.clone(),
+                incomplete_executions: vec![codex_exec_server::IncompleteExecution {
+                    turn_id: committed.exec_turn_id.clone(),
+                    call_id: committed.exec_call_id.clone(),
+                    attempt_generation: committed.attempt_generation,
+                    expected_command_digest: Some(committed.command_digest.clone()),
+                    expected_session_id: Some(committed.session_id),
+                    expected_tty: Some(prepared.tty),
+                    protocol_evidence: codex_exec_server::RemoteExecutionProtocolEvidence::V2Proven,
+                }],
+                pending_writes: Vec::new(),
+            };
+            let mut adoption_error = None;
+            let mut restored = false;
+            for attempt in 0..2 {
+                let mut recovered = environment
+                    .get_exec_backend()
+                    .reconcile(reconciliation_request.clone())
+                    .await
+                    .map_err(|error| {
+                        CodexErr::Fatal(format!(
+                            "failed to reconcile committed background session {}: {error}",
+                            committed.session_id
+                        ))
+                    })?;
+                let [execution] = recovered.as_mut_slice() else {
+                    return Err(CodexErr::Fatal(format!(
+                        "committed background session {} did not resolve to one exact descriptor",
+                        committed.session_id
+                    )));
+                };
+                if execution.identity != identity
+                    || execution.command_digest.as_deref()
+                        != Some(committed.command_digest.as_str())
+                    || execution.session_id != Some(committed.session_id)
+                    || execution.committed_output_cursor < committed.range_end
+                    || execution.output.len() as u64 != execution.committed_output_cursor
+                    || execution.delivery_unknown
+                {
+                    return Err(CodexErr::Fatal(format!(
+                        "committed background session {} conflicts with durable recovery authority",
+                        committed.session_id
+                    )));
+                }
+                match &execution.status {
+                    codex_exec_server::RecoveredExecutionStatus::Running => {
+                        if execution.terminal_verified_dead {
+                            return Err(CodexErr::Fatal(format!(
+                                "running background session {} has contradictory terminal proof",
+                                committed.session_id
+                            )));
+                        }
+                        match self
+                            .services
+                            .unified_exec_manager
+                            .adopt_background_process(
+                                environment.as_ref(),
+                                codex_exec_server::AdoptionRequest {
+                                    identity: identity.clone(),
+                                    expected_command_digest: committed.command_digest.clone(),
+                                    original_session_id: Some(committed.session_id),
+                                    committed_output_cursor: committed.range_end,
+                                    tty: prepared.tty,
+                                },
+                                self,
+                                committed.exec_call_id.clone(),
+                                cwd.clone(),
+                                prepared.hook_command.clone(),
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                restored = true;
+                                break;
+                            }
+                            Err(error) if attempt == 0 => {
+                                adoption_error = Some(error.to_string());
+                                self.services
+                                    .unified_exec_manager
+                                    .release_process_id(committed.session_id)
+                                    .await;
+                                continue;
+                            }
+                            Err(error) => {
+                                return Err(CodexErr::Fatal(format!(
+                                    "failed to adopt running background session {} after \
+                                     reconciliation: {error}",
+                                    committed.session_id
+                                )));
+                            }
+                        }
+                    }
+                    codex_exec_server::RecoveredExecutionStatus::Exited(_)
+                    | codex_exec_server::RecoveredExecutionStatus::Terminated => {
+                        if !execution.terminal_verified_dead {
+                            return Err(CodexErr::Fatal(format!(
+                                "terminal background session {} lacks exact death proof",
+                                committed.session_id
+                            )));
+                        }
+                        self.services
+                            .unified_exec_manager
+                            .restore_terminal_background_process(
+                                execution,
+                                committed.range_end,
+                                self,
+                                committed.exec_call_id.clone(),
+                                cwd.clone(),
+                                prepared.hook_command.clone(),
+                                prepared.tty,
+                            )
+                            .await
+                            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+                        restored = true;
+                        break;
+                    }
+                    _ => {
+                        return Err(CodexErr::Fatal(format!(
+                            "committed background session {} is not safely recoverable",
+                            committed.session_id
+                        )));
+                    }
+                }
+            }
+            if !restored {
+                return Err(CodexErr::Fatal(format!(
+                    "background session {} changed during adoption and was not restored: {}",
+                    committed.session_id,
+                    adoption_error.unwrap_or_default()
+                )));
+            }
         }
         Ok(())
     }
@@ -2298,12 +2791,18 @@ impl Session {
         // its receipt commit was not. Then recover Prepared receipts by
         // appending their exact stored model-facing output; never poll those
         // sessions again.
-        self.finalize_background_session_receipts().await?;
+        self.retry_background_session_receipt_maintenance("resume_repair")
+            .await?;
         let mut polls_requiring_adoption = Vec::new();
-        let mut nonempty_writes = Vec::new();
+        let mut ambiguous_nonempty_writes = Vec::new();
+        let mut proven_unsent_nonempty_writes = Vec::new();
         for pending in pending_writes {
             if !pending.input_is_empty {
-                nonempty_writes.push(pending.clone());
+                if pending.pre_send_intent_required && !pending.pre_send_intent_persisted {
+                    proven_unsent_nonempty_writes.push(pending.clone());
+                } else {
+                    ambiguous_nonempty_writes.push(pending.clone());
+                }
                 continue;
             }
             let live_thread = self
@@ -2336,7 +2835,7 @@ impl Session {
                 .await?;
         }
 
-        for pending in &nonempty_writes {
+        for pending in &ambiguous_nonempty_writes {
             self.repair_pending_nonempty_write_before_reconstruction(pending)
                 .await?;
         }
@@ -2346,6 +2845,11 @@ impl Session {
         // durable. This restores the original integer session identity without
         // relaunching the command.
         self.restore_committed_background_sessions().await?;
+
+        for pending in &proven_unsent_nonempty_writes {
+            self.replay_proven_unsent_nonempty_write_before_reconstruction(pending)
+                .await?;
+        }
 
         for pending in &polls_requiring_adoption {
             let live_thread = self
@@ -2439,6 +2943,74 @@ impl Session {
                 )
             })?;
         Ok(())
+    }
+
+    async fn replay_proven_unsent_nonempty_write_before_reconstruction(
+        self: &Arc<Self>,
+        pending: &codex_exec_server::PendingWriteInteraction,
+    ) -> CodexResult<()> {
+        if pending.input_is_empty
+            || !pending.pre_send_intent_required
+            || pending.pre_send_intent_persisted
+        {
+            return Err(CodexErr::Fatal(format!(
+                "stdin call {} lacks proven-unsent recovery authority",
+                pending.call_id
+            )));
+        }
+        let live_thread = self
+            .live_thread_for_persistence("replay proven-unsent remote stdin")
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        if history.items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::RemoteExecutionWriteIntent(intent)
+                    if intent.receipt_turn_id == pending.turn_id
+                        && intent.receipt_call_id == pending.call_id
+            ) || matches!(
+                item,
+                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. })
+                    if call_id == &pending.call_id
+            )
+        }) {
+            return Err(CodexErr::Fatal(format!(
+                "proven-unsent stdin call {} changed before replay",
+                pending.call_id
+            )));
+        }
+        let request =
+            pending_nonempty_write_request(&history.items, &self.thread_id.to_string(), pending)?;
+        let response = self
+            .services
+            .unified_exec_manager
+            .write_stdin(crate::unified_exec::WriteStdinRequest {
+                process_id: pending.session_id,
+                input: &request.input,
+                yield_time_ms: request.yield_time_ms,
+                max_output_tokens: request.max_output_tokens,
+                truncation_policy: request.truncation_policy,
+                interaction_event: Some(crate::unified_exec::WriteStdinInteractionEvent {
+                    session: self,
+                    turn: None,
+                    receipt_turn_id: &pending.turn_id,
+                    call_id: &pending.call_id,
+                }),
+            })
+            .await
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        let output = successful_remote_poll_output(pending, response.response_text());
+        live_thread
+            .append_items(std::slice::from_ref(&output))
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))
     }
 
     async fn repair_pending_nonempty_write_before_reconstruction(
@@ -2687,7 +3259,459 @@ impl Session {
         }
         self.commit_prepared_remote_session_after_output(&pending.turn_id, &pending.call_id)
             .await?;
-        self.finalize_background_session_receipts().await
+        self.retry_background_session_receipt_maintenance("stdin_recovery")
+            .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn persist_remote_execution_write_request(
+        &self,
+        session_id: i32,
+        receipt_turn_id: &str,
+        receipt_call_id: &str,
+        input: &str,
+        yield_time_ms: u64,
+        max_output_tokens: Option<usize>,
+        truncation_policy: TruncationPolicy,
+    ) -> CodexResult<bool> {
+        if input.is_empty() {
+            return Err(CodexErr::Fatal(
+                "remote stdin replay request requires nonempty input".to_string(),
+            ));
+        }
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(false);
+        };
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let thread_id = self.thread_id.to_string();
+        if !history.items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::RemoteExecutionSessionCommitted(committed)
+                    if committed.thread_id == thread_id
+                        && committed.session_id == session_id
+            )
+        }) {
+            // Native-local sessions do not participate in remote replay.
+            return Ok(false);
+        }
+        let (committed_index, committed, _) =
+            latest_committed_background_session_entry(&history.items, &thread_id, session_id)?;
+        let input_len = u64::try_from(input.len()).map_err(|_| {
+            CodexErr::Fatal(format!(
+                "remote stdin request {receipt_call_id} input length is unsupported"
+            ))
+        })?;
+        let expected = RemoteExecutionWriteRequest {
+            thread_id: thread_id.clone(),
+            exec_turn_id: committed.exec_turn_id.clone(),
+            exec_call_id: committed.exec_call_id.clone(),
+            receipt_turn_id: receipt_turn_id.to_string(),
+            receipt_call_id: receipt_call_id.to_string(),
+            attempt_generation: committed.attempt_generation,
+            session_id,
+            command_digest: committed.command_digest.clone(),
+            committed_output_cursor: committed.range_end,
+            input_sha256: remote_receipt_bytes_digest(input.as_bytes()),
+            input_len,
+            yield_time_ms,
+            max_output_tokens,
+            truncation_policy,
+        };
+        let mut valid_marker_count = 0usize;
+        let mut exact_call_count = 0usize;
+        let mut exact_request_count = 0usize;
+        let mut valid_marker_index = None;
+        let mut exact_call_index = None;
+        let mut exact_request_index = None;
+        for (item_index, item) in history.items.iter().enumerate() {
+            match item {
+                RolloutItem::RemoteExecutionProtocolMarker(marker)
+                    if marker.turn_id == receipt_turn_id =>
+                {
+                    if marker.thread_id != thread_id
+                        || marker.protocol_version != 2
+                        || marker.identity_schema != "thread-turn-call-generation"
+                        || !marker.descriptor_before_go
+                        || !marker.stdin_intent_before_write
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote stdin call {receipt_call_id} lacks durable-v2 request authority"
+                        )));
+                    }
+                    valid_marker_count += 1;
+                    valid_marker_index = Some(item_index);
+                }
+                RolloutItem::ResponseItem(
+                    response @ ResponseItem::FunctionCall {
+                        call_id,
+                        name,
+                        arguments,
+                        ..
+                    },
+                ) if call_id == receipt_call_id => {
+                    let arguments: serde_json::Value =
+                        serde_json::from_str(arguments).map_err(|error| {
+                            CodexErr::Fatal(format!(
+                                "remote stdin call {receipt_call_id} has invalid arguments: {error}"
+                            ))
+                        })?;
+                    let persisted_session_id = arguments
+                        .get("session_id")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok());
+                    let persisted_input = match arguments.get("chars") {
+                        None => "",
+                        Some(value) => value.as_str().ok_or_else(|| {
+                            CodexErr::Fatal(format!(
+                                "remote stdin call {receipt_call_id} has invalid chars"
+                            ))
+                        })?,
+                    };
+                    let persisted_yield_time_ms = match arguments.get("yield_time_ms") {
+                        None => crate::unified_exec::MIN_YIELD_TIME_MS,
+                        Some(value) => value.as_u64().ok_or_else(|| {
+                            CodexErr::Fatal(format!(
+                                "remote stdin call {receipt_call_id} has invalid yield_time_ms"
+                            ))
+                        })?,
+                    };
+                    let persisted_max_output_tokens = match arguments.get("max_output_tokens") {
+                        None | Some(serde_json::Value::Null) => None,
+                        Some(value) => Some(
+                            value
+                                .as_u64()
+                                .and_then(|value| usize::try_from(value).ok())
+                                .ok_or_else(|| {
+                                    CodexErr::Fatal(format!(
+                                        "remote stdin call {receipt_call_id} has invalid \
+                                         max_output_tokens"
+                                    ))
+                                })?,
+                        ),
+                    };
+                    if name != "write_stdin"
+                        || response.turn_id() != Some(receipt_turn_id)
+                        || persisted_session_id != Some(session_id)
+                        || persisted_input.as_bytes() != input.as_bytes()
+                        || persisted_yield_time_ms != yield_time_ms
+                        || persisted_max_output_tokens != max_output_tokens
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote stdin call {receipt_call_id} conflicts with its replay request"
+                        )));
+                    }
+                    exact_call_count += 1;
+                    exact_call_index = Some(item_index);
+                }
+                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. })
+                    if call_id == receipt_call_id =>
+                {
+                    return Err(CodexErr::Fatal(format!(
+                        "remote stdin call {receipt_call_id} already has an output"
+                    )));
+                }
+                RolloutItem::RemoteExecutionWriteRequest(request)
+                    if request.receipt_turn_id == receipt_turn_id
+                        && request.receipt_call_id == receipt_call_id =>
+                {
+                    if request != &expected {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote stdin call {receipt_call_id} has a conflicting replay request"
+                        )));
+                    }
+                    exact_request_count += 1;
+                    exact_request_index = Some(item_index);
+                }
+                RolloutItem::RemoteExecutionWriteIntent(intent)
+                    if intent.receipt_turn_id == receipt_turn_id
+                        && intent.receipt_call_id == receipt_call_id =>
+                {
+                    return Err(CodexErr::Fatal(format!(
+                        "remote stdin call {receipt_call_id} already reached its side-effect intent"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        if valid_marker_count != 1 || exact_call_count != 1 || exact_request_count > 1 {
+            return Err(CodexErr::Fatal(format!(
+                "remote stdin call {receipt_call_id} lacks unique replay-request ordering"
+            )));
+        }
+        let (Some(marker_index), Some(call_index)) = (valid_marker_index, exact_call_index) else {
+            return Err(CodexErr::Fatal(format!(
+                "remote stdin call {receipt_call_id} lacks durable ordering indices"
+            )));
+        };
+        if !remote_write_request_order_is_valid(
+            committed_index,
+            marker_index,
+            call_index,
+            exact_request_index,
+        ) {
+            return Err(CodexErr::Fatal(format!(
+                "remote stdin call {receipt_call_id} has invalid commit-marker-call-request ordering"
+            )));
+        }
+        if exact_request_count == 0 {
+            live_thread
+                .append_items(&[RolloutItem::RemoteExecutionWriteRequest(expected.clone())])
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        }
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let persisted = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let persisted_request = pending_nonempty_write_request(
+            &persisted.items,
+            &thread_id,
+            &codex_exec_server::PendingWriteInteraction {
+                call_id: receipt_call_id.to_string(),
+                turn_id: receipt_turn_id.to_string(),
+                session_id,
+                input_is_empty: false,
+                pre_send_intent_required: true,
+                pre_send_intent_persisted: false,
+                protocol_evidence: codex_exec_server::RemoteExecutionProtocolEvidence::V2Proven,
+            },
+        )?;
+        if persisted_request.input.as_bytes() != input.as_bytes()
+            || persisted_request.yield_time_ms != yield_time_ms
+            || persisted_request.max_output_tokens != max_output_tokens
+            || persisted_request.truncation_policy != truncation_policy
+        {
+            return Err(CodexErr::Fatal(format!(
+                "remote stdin call {receipt_call_id} replay request did not become durably exact"
+            )));
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn persist_remote_execution_write_intent(
+        &self,
+        session_id: i32,
+        receipt_turn_id: &str,
+        receipt_call_id: &str,
+        input: &str,
+    ) -> CodexResult<String> {
+        if input.is_empty() {
+            return Err(CodexErr::Fatal(
+                "remote stdin intent requires nonempty input".to_string(),
+            ));
+        }
+        let live_thread = self
+            .live_thread_for_persistence("persist remote stdin intent")
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        // The function call is appended before tool dispatch, but it may still
+        // be buffered. This barrier makes the call durable before we derive
+        // and append the side-effect intent that follows it.
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let thread_id = self.thread_id.to_string();
+        let (committed, _prepared) =
+            latest_committed_background_session(&history.items, &thread_id, session_id)?;
+        let input_len = u64::try_from(input.len()).map_err(|_| {
+            CodexErr::Fatal(format!(
+                "remote stdin intent {receipt_call_id} input length is unsupported"
+            ))
+        })?;
+        let input_sha256 = remote_receipt_bytes_digest(input.as_bytes());
+        let write_id_material = format!(
+            "agentapp-remote-stdin-v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            thread_id,
+            committed.exec_turn_id,
+            committed.exec_call_id,
+            committed.attempt_generation,
+            receipt_turn_id,
+            receipt_call_id,
+            session_id,
+            committed.range_end,
+            input_sha256,
+        );
+        let write_id = format!("{:x}", Sha256::digest(write_id_material.as_bytes()));
+        let expected = RemoteExecutionWriteIntent {
+            thread_id: thread_id.clone(),
+            exec_turn_id: committed.exec_turn_id.clone(),
+            exec_call_id: committed.exec_call_id.clone(),
+            receipt_turn_id: receipt_turn_id.to_string(),
+            receipt_call_id: receipt_call_id.to_string(),
+            attempt_generation: committed.attempt_generation,
+            session_id,
+            command_digest: committed.command_digest.clone(),
+            committed_output_cursor: committed.range_end,
+            write_id: write_id.clone(),
+            input_sha256,
+            input_len,
+        };
+        let matching_requests = history
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                RolloutItem::RemoteExecutionWriteRequest(request)
+                    if request.receipt_turn_id == receipt_turn_id
+                        && request.receipt_call_id == receipt_call_id =>
+                {
+                    Some((index, request))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(request_index, request)] = matching_requests.as_slice() else {
+            return Err(CodexErr::Fatal(format!(
+                "remote stdin call {receipt_call_id} lacks one exact replay request"
+            )));
+        };
+        if request.thread_id != expected.thread_id
+            || request.exec_turn_id != expected.exec_turn_id
+            || request.exec_call_id != expected.exec_call_id
+            || request.receipt_turn_id != expected.receipt_turn_id
+            || request.receipt_call_id != expected.receipt_call_id
+            || request.attempt_generation != expected.attempt_generation
+            || request.session_id != expected.session_id
+            || request.command_digest != expected.command_digest
+            || request.committed_output_cursor != expected.committed_output_cursor
+            || request.input_sha256 != expected.input_sha256
+            || request.input_len != expected.input_len
+        {
+            return Err(CodexErr::Fatal(format!(
+                "remote stdin call {receipt_call_id} replay request conflicts with its intent"
+            )));
+        }
+
+        let mut valid_marker_count = 0usize;
+        let mut exact_call_count = 0usize;
+        let mut exact_intent_count = 0usize;
+        for (item_index, item) in history.items.iter().enumerate() {
+            match item {
+                RolloutItem::RemoteExecutionProtocolMarker(marker)
+                    if marker.turn_id == receipt_turn_id =>
+                {
+                    if marker.thread_id != thread_id
+                        || marker.protocol_version != 2
+                        || marker.identity_schema != "thread-turn-call-generation"
+                        || !marker.descriptor_before_go
+                        || !marker.stdin_intent_before_write
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote stdin call {receipt_call_id} lacks durable-v2 protocol authority"
+                        )));
+                    }
+                    valid_marker_count += 1;
+                }
+                RolloutItem::ResponseItem(
+                    response @ ResponseItem::FunctionCall {
+                        call_id,
+                        name,
+                        arguments,
+                        ..
+                    },
+                ) if call_id == receipt_call_id => {
+                    let arguments: serde_json::Value =
+                        serde_json::from_str(arguments).map_err(|error| {
+                            CodexErr::Fatal(format!(
+                                "remote stdin call {receipt_call_id} has invalid arguments: {error}"
+                            ))
+                        })?;
+                    let persisted_session_id = arguments
+                        .get("session_id")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok());
+                    let persisted_input = arguments
+                        .get("chars")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if name != "write_stdin"
+                        || response.turn_id() != Some(receipt_turn_id)
+                        || persisted_session_id != Some(session_id)
+                        || persisted_input.as_bytes() != input.as_bytes()
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote stdin call {receipt_call_id} conflicts with its dispatch"
+                        )));
+                    }
+                    exact_call_count += 1;
+                }
+                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. })
+                    if call_id == receipt_call_id =>
+                {
+                    return Err(CodexErr::Fatal(format!(
+                        "remote stdin call {receipt_call_id} already has an output"
+                    )));
+                }
+                RolloutItem::RemoteExecutionWriteIntent(intent)
+                    if intent.receipt_turn_id == receipt_turn_id
+                        && intent.receipt_call_id == receipt_call_id =>
+                {
+                    if item_index <= *request_index || intent != &expected {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote stdin call {receipt_call_id} has conflicting durable intent"
+                        )));
+                    }
+                    exact_intent_count += 1;
+                }
+                _ => {}
+            }
+        }
+        if valid_marker_count != 1 || exact_call_count != 1 || exact_intent_count > 1 {
+            return Err(CodexErr::Fatal(format!(
+                "remote stdin call {receipt_call_id} lacks unique durable ordering"
+            )));
+        }
+        if exact_intent_count == 0 {
+            live_thread
+                .append_items(&[RolloutItem::RemoteExecutionWriteIntent(expected.clone())])
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        }
+        live_thread
+            .flush()
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+
+        // Re-read the serialized rollout rather than trusting the in-memory
+        // append. Remote input is allowed only after the exact intent survives
+        // the real persistence representation.
+        let persisted = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let persisted_intents = persisted
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    RolloutItem::RemoteExecutionWriteIntent(intent) if intent == &expected
+                )
+            })
+            .count();
+        if persisted_intents != 1 {
+            return Err(CodexErr::Fatal(format!(
+                "remote stdin call {receipt_call_id} intent did not become durably visible"
+            )));
+        }
+        Ok(write_id)
     }
 
     pub(crate) async fn persist_remote_execution_launch_intent(
@@ -3059,7 +4083,9 @@ impl Session {
         session_id: i32,
         receipt_turn_id: &str,
         receipt_call_id: &str,
+        receipt_kind: RemoteExecutionReceiptKind,
         observed_range: Option<(u64, u64)>,
+        observed_output_empty: bool,
         terminal: bool,
         terminal_exit_code: Option<i32>,
         receipt_output_text: &str,
@@ -3090,7 +4116,15 @@ impl Session {
         };
         if committed.terminal {
             return Err(CodexErr::Fatal(format!(
-                "empty poll targets retired background session {session_id}"
+                "write interaction targets retired background session {session_id}"
+            )));
+        }
+        if !matches!(
+            receipt_kind,
+            RemoteExecutionReceiptKind::EmptyPoll | RemoteExecutionReceiptKind::NonemptyWrite
+        ) {
+            return Err(CodexErr::Fatal(format!(
+                "write interaction {receipt_call_id} has an invalid receipt kind"
             )));
         }
         let base = history
@@ -3107,7 +4141,7 @@ impl Session {
                 }
                 _ => None,
             })
-            .last()
+            .next_back()
             .ok_or_else(|| {
                 CodexErr::Fatal(format!(
                     "committed background session {session_id} lacks preparation metadata"
@@ -3116,10 +4150,10 @@ impl Session {
         let range_start = committed.range_end;
         let range_end = match observed_range {
             Some((start, end)) if start == range_start && end >= start => end,
-            None if receipt_output_text.is_empty() => range_start,
+            None if observed_output_empty => range_start,
             _ => {
                 return Err(CodexErr::Fatal(format!(
-                    "background poll {receipt_call_id} lacks one exact contiguous backend range"
+                    "background write {receipt_call_id} lacks one exact contiguous backend range"
                 )));
             }
         };
@@ -3127,7 +4161,7 @@ impl Session {
         {
             let observed_exit_code = terminal_exit_code.ok_or_else(|| {
                 CodexErr::Fatal(format!(
-                    "terminal background poll {receipt_call_id} lacks its rendered exit code"
+                    "terminal background write {receipt_call_id} lacks its rendered exit code"
                 ))
             })?;
             let (token, output_digest, status) = self
@@ -3140,7 +4174,7 @@ impl Session {
         let prepared = RemoteExecutionSessionPrepared {
             receipt_turn_id: receipt_turn_id.to_string(),
             receipt_call_id: receipt_call_id.to_string(),
-            receipt_kind: RemoteExecutionReceiptKind::EmptyPoll,
+            receipt_kind,
             range_start,
             range_end,
             receipt_output_digest: remote_receipt_output_digest(receipt_output_text),
@@ -3160,7 +4194,7 @@ impl Session {
             )
         }) {
             return Err(CodexErr::Fatal(format!(
-                "duplicate background poll preparation {receipt_call_id}"
+                "duplicate background write preparation {receipt_call_id}"
             )));
         }
         live_thread
@@ -5174,7 +6208,34 @@ impl Session {
                 "duplicate prepared background sessions for call {receipt_call_id}"
             )));
         }
-        self.finalize_background_session_receipts().await?;
+        // The Prepared/output/Commit durability transaction is on the model
+        // turn's critical path. Remote descriptor retirement is maintenance,
+        // but the durable commit already authorizes releasing the in-memory
+        // receipt so a later same-turn call sees the normal terminal state.
+        self.persist_missing_background_session_commits().await?;
+        let history = live_thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        let _committed = history
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                RolloutItem::RemoteExecutionSessionCommitted(committed)
+                    if committed.thread_id == self.thread_id.to_string()
+                        && committed.receipt_turn_id == receipt_turn_id
+                        && committed.receipt_call_id == receipt_call_id =>
+                {
+                    Some(committed)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                CodexErr::Fatal(format!(
+                    "background session commit for call {receipt_call_id} is not durable"
+                ))
+            })?;
         self.services
             .unified_exec_manager
             .acknowledge_output_receipt(receipt_turn_id, receipt_call_id)

@@ -11,15 +11,59 @@ use tokio::sync::watch;
 
 use crate::ExecServerError;
 use crate::ProcessId;
+use crate::protocol::ByteChunk;
+use crate::protocol::ExecOutputStream;
 use crate::protocol::ExecParams;
 use crate::protocol::ExecutionIdentity;
 use crate::protocol::ProcessOutputChunk;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadResponse;
 use crate::protocol::WriteResponse;
+use crate::protocol::WriteStatus;
 
 pub struct StartedExecProcess {
     pub process: Arc<dyn ExecProcess>,
+}
+
+impl StartedExecProcess {
+    /// Reconstructs an already-terminal durable execution as a read-only
+    /// process handle. The retained suffix starts at the latest locally
+    /// committed cursor, so the next model poll receives each byte once while
+    /// terminal proof and acknowledgement remain remote-authoritative.
+    pub fn from_recovered_terminal(
+        process_id: i32,
+        output: &[u8],
+        committed_output_cursor: u64,
+        exit_code: i32,
+        tty: bool,
+    ) -> Result<Self, ExecServerError> {
+        let output_len = u64::try_from(output.len()).map_err(|_| {
+            ExecServerError::Protocol("recovered terminal output length is unsupported".to_string())
+        })?;
+        if committed_output_cursor > output_len {
+            return Err(ExecServerError::Protocol(
+                "recovered terminal cursor exceeds output".to_string(),
+            ));
+        }
+        let start = usize::try_from(committed_output_cursor).map_err(|_| {
+            ExecServerError::Protocol("recovered terminal cursor is unsupported".to_string())
+        })?;
+        let process = RecoveredTerminalExecProcess::new(
+            ProcessId::new(process_id.to_string()),
+            output[start..].to_vec(),
+            committed_output_cursor,
+            output_len,
+            exit_code,
+            if tty {
+                ExecOutputStream::Pty
+            } else {
+                ExecOutputStream::Stdout
+            },
+        );
+        Ok(Self {
+            process: Arc::new(process),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +191,12 @@ pub struct PendingWriteInteraction {
     pub turn_id: String,
     pub session_id: i32,
     pub input_is_empty: bool,
+    /// True only for a build-121+ turn whose protocol marker guarantees that
+    /// remote nonempty stdin cannot precede its durable write intent.
+    pub pre_send_intent_required: bool,
+    /// True only after the exact persisted intent has been validated against
+    /// the function call and committed background execution.
+    pub pre_send_intent_persisted: bool,
     pub protocol_evidence: RemoteExecutionProtocolEvidence,
 }
 
@@ -428,6 +478,112 @@ impl ExecProcessEventReceiver {
     }
 }
 
+struct RecoveredTerminalExecProcess {
+    process_id: ProcessId,
+    events: ExecProcessEventLog,
+    wake_tx: watch::Sender<u64>,
+    output: Option<ProcessOutputChunk>,
+    next_seq: u64,
+    exit_code: i32,
+}
+
+impl RecoveredTerminalExecProcess {
+    fn new(
+        process_id: ProcessId,
+        suffix: Vec<u8>,
+        absolute_start: u64,
+        absolute_end: u64,
+        exit_code: i32,
+        stream: ExecOutputStream,
+    ) -> Self {
+        let events = ExecProcessEventLog::new(3, suffix.len().max(1));
+        let mut next_seq = 0;
+        let output = if suffix.is_empty() {
+            None
+        } else {
+            next_seq += 1;
+            let output = ProcessOutputChunk {
+                seq: next_seq,
+                stream,
+                chunk: ByteChunk(suffix),
+                absolute_start: Some(absolute_start),
+                absolute_end: Some(absolute_end),
+            };
+            events.publish(ExecProcessEvent::Output(output.clone()));
+            Some(output)
+        };
+        next_seq += 1;
+        events.publish(ExecProcessEvent::Exited {
+            seq: next_seq,
+            exit_code,
+            sandbox_denied: Some(false),
+        });
+        next_seq += 1;
+        events.publish(ExecProcessEvent::Closed { seq: next_seq });
+        let (wake_tx, _wake_rx) = watch::channel(next_seq);
+        Self {
+            process_id,
+            events,
+            wake_tx,
+            output,
+            next_seq,
+            exit_code,
+        }
+    }
+}
+
+impl ExecProcess for RecoveredTerminalExecProcess {
+    fn process_id(&self) -> &ProcessId {
+        &self.process_id
+    }
+
+    fn subscribe_wake(&self) -> watch::Receiver<u64> {
+        self.wake_tx.subscribe()
+    }
+
+    fn subscribe_events(&self) -> ExecProcessEventReceiver {
+        self.events.subscribe()
+    }
+
+    fn read(
+        &self,
+        after_seq: Option<u64>,
+        _max_bytes: Option<usize>,
+        _wait_ms: Option<u64>,
+    ) -> ExecProcessFuture<'_, ReadResponse> {
+        let after_seq = after_seq.unwrap_or(0);
+        let chunks = self
+            .output
+            .iter()
+            .filter(|chunk| chunk.seq > after_seq)
+            .cloned()
+            .collect();
+        Box::pin(std::future::ready(Ok(ReadResponse {
+            chunks,
+            next_seq: self.next_seq,
+            exited: true,
+            exit_code: Some(self.exit_code),
+            closed: true,
+            failure: None,
+            sandbox_denied: false,
+        })))
+    }
+
+    fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(std::future::ready(Ok(WriteResponse {
+            status: WriteStatus::StdinClosed,
+        })))
+    }
+
+    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn terminate(&self) -> ExecProcessFuture<'_, ()> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
 /// Handle for an executor-managed process.
 ///
 /// Implementations must support both retained-output reads and pushed events:
@@ -449,6 +605,17 @@ pub trait ExecProcess: Send + Sync {
     ) -> ExecProcessFuture<'_, ReadResponse>;
 
     fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>;
+
+    /// Writes stdin with a caller-stable idempotency key when the caller has
+    /// durable side-effect authority. Backends without persistent execution
+    /// state may use the default write path.
+    fn write_with_id(
+        &self,
+        chunk: Vec<u8>,
+        _write_id: String,
+    ) -> ExecProcessFuture<'_, WriteResponse> {
+        self.write(chunk)
+    }
 
     fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>;
 
@@ -483,6 +650,61 @@ pub trait ExecBackend: Send + Sync {
         _acknowledgement: RecoveredExecutionAcknowledgement,
     ) -> ExecBackendAcknowledgeFuture<'_> {
         Box::pin(std::future::ready(Ok(())))
+    }
+
+    /// Deletes only the exact proof-bound acknowledgement tombstone after the
+    /// caller has made its local acknowledgement marker durable.
+    fn release_acknowledged(
+        &self,
+        _acknowledgement: RecoveredExecutionAcknowledgement,
+    ) -> ExecBackendAcknowledgeFuture<'_> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+#[cfg(test)]
+mod recovered_terminal_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovered_terminal_replays_only_uncommitted_suffix_then_exit() {
+        let started = StartedExecProcess::from_recovered_terminal(
+            41,
+            b"alreadynew",
+            7,
+            17,
+            /*tty*/ false,
+        )
+        .expect("recovered terminal process");
+        let response = started
+            .process
+            .read(None, None, None)
+            .await
+            .expect("read recovered terminal");
+
+        assert_eq!(response.chunks.len(), 1);
+        assert_eq!(response.chunks[0].chunk.0, b"new");
+        assert_eq!(response.chunks[0].absolute_start, Some(7));
+        assert_eq!(response.chunks[0].absolute_end, Some(10));
+        assert!(response.exited);
+        assert_eq!(response.exit_code, Some(17));
+        assert!(response.closed);
+        assert_eq!(
+            started
+                .process
+                .write(b"ignored".to_vec())
+                .await
+                .expect("closed stdin")
+                .status,
+            WriteStatus::StdinClosed
+        );
+    }
+
+    #[test]
+    fn recovered_terminal_rejects_cursor_beyond_output() {
+        assert!(
+            StartedExecProcess::from_recovered_terminal(41, b"short", 6, 0, /*tty*/ true,).is_err()
+        );
     }
 }
 

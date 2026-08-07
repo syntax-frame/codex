@@ -36,6 +36,10 @@ mod telemetry;
 mod trace_context;
 mod websocket_pong_watchdog;
 
+#[cfg(test)]
+#[path = "ssh_process_boundary_restart_real_tests.rs"]
+mod ssh_process_boundary_restart_real_tests;
+
 use codex_exec_server_protocol as protocol;
 
 pub use capability_discovery::CapabilityDiscoveryError;

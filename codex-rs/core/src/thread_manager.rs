@@ -67,6 +67,8 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RemoteExecutionLaunchIntent;
+use codex_protocol::protocol::RemoteExecutionWriteIntent;
+use codex_protocol::protocol::RemoteExecutionWriteRequest;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -95,6 +97,8 @@ use codex_thread_store::UpdateThreadMetadataParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -868,14 +872,20 @@ impl ThreadManager {
             (
                 usize,
                 String,
-                Option<(i32, bool)>,
+                Option<(i32, bool, String, u64, u64, Option<usize>)>,
                 RemoteExecutionProtocolEvidence,
+                bool,
             ),
         >::new();
         let mut outputs = HashSet::new();
-        let mut marker_state = HashMap::<String, Option<bool>>::new();
+        let mut marker_state = HashMap::<String, Option<(usize, bool, bool)>>::new();
         let mut launch_intents =
             HashMap::<(String, String, u32), RemoteExecutionLaunchIntent>::new();
+        let mut write_requests =
+            HashMap::<(String, String), (usize, RemoteExecutionWriteRequest)>::new();
+        let mut write_intents =
+            HashMap::<(String, String), (usize, RemoteExecutionWriteIntent)>::new();
+        let mut session_commits = Vec::new();
         let mut last_turn_id = None;
         for (rollout_index, item) in history.iter().enumerate() {
             let response_turn_id = match item {
@@ -894,7 +904,11 @@ impl ThreadManager {
                     marker_state
                         .entry(marker.turn_id.clone())
                         .and_modify(|state| *state = None)
-                        .or_insert(Some(valid));
+                        .or_insert(Some((
+                            rollout_index,
+                            valid,
+                            marker.stdin_intent_before_write,
+                        )));
                 }
                 RolloutItem::RemoteExecutionLaunchIntent(intent) => {
                     if intent.thread_id != thread_id
@@ -913,7 +927,7 @@ impl ThreadManager {
                         intent.attempt_generation,
                     );
                     let call_precedes_intent = calls.get(&intent.call_id).is_some_and(
-                        |(_, turn_id, interaction, protocol_evidence)| {
+                        |(_, turn_id, interaction, protocol_evidence, _)| {
                             turn_id == &intent.turn_id
                                 && interaction.is_none()
                                 && *protocol_evidence == RemoteExecutionProtocolEvidence::V2Proven
@@ -932,6 +946,190 @@ impl ThreadManager {
                         )));
                     }
                 }
+                RolloutItem::RemoteExecutionSessionCommitted(committed) => {
+                    session_commits.push((rollout_index, committed.clone()));
+                }
+                RolloutItem::RemoteExecutionWriteRequest(request) => {
+                    if request.thread_id != thread_id
+                        || request.session_id <= 0
+                        || request.command_digest.is_empty()
+                        || request.input_sha256.len() != 64
+                        || request.input_len == 0
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "invalid remote stdin replay request for call {}",
+                            request.receipt_call_id
+                        )));
+                    }
+                    let call_matches = calls.get(&request.receipt_call_id).is_some_and(
+                        |(_, turn_id, interaction, protocol_evidence, pre_send_intent_required)| {
+                            let Some((
+                                session_id,
+                                input_is_empty,
+                                input_sha256,
+                                input_len,
+                                yield_time_ms,
+                                max_output_tokens,
+                            )) = interaction
+                            else {
+                                return false;
+                            };
+                            turn_id == &request.receipt_turn_id
+                                && *session_id == request.session_id
+                                && !*input_is_empty
+                                && input_sha256 == &request.input_sha256
+                                && *input_len == request.input_len
+                                && *yield_time_ms == request.yield_time_ms
+                                && *max_output_tokens == request.max_output_tokens
+                                && *protocol_evidence == RemoteExecutionProtocolEvidence::V2Proven
+                                && *pre_send_intent_required
+                        },
+                    );
+                    let marker_index = marker_state
+                        .get(&request.receipt_turn_id)
+                        .copied()
+                        .flatten()
+                        .and_then(|(index, valid, _)| valid.then_some(index));
+                    let committed_matches = session_commits
+                        .iter()
+                        .rev()
+                        .find(|(commit_index, committed)| {
+                            *commit_index < rollout_index
+                                && committed.thread_id == request.thread_id
+                                && committed.session_id == request.session_id
+                        })
+                        .is_some_and(|(commit_index, committed)| {
+                            marker_index.is_some_and(|marker_index| *commit_index < marker_index)
+                                && !committed.terminal
+                                && committed.exec_turn_id == request.exec_turn_id
+                                && committed.exec_call_id == request.exec_call_id
+                                && committed.attempt_generation == request.attempt_generation
+                                && committed.command_digest == request.command_digest
+                                && committed.range_end == request.committed_output_cursor
+                        });
+                    if !call_matches
+                        || !committed_matches
+                        || outputs.contains(&request.receipt_call_id)
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote stdin replay request for call {} is early, late, or conflicts with durable session authority",
+                            request.receipt_call_id
+                        )));
+                    }
+                    let key = (
+                        request.receipt_turn_id.clone(),
+                        request.receipt_call_id.clone(),
+                    );
+                    if write_requests
+                        .insert(key, (rollout_index, request.clone()))
+                        .is_some()
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "duplicate remote stdin replay request for call {}",
+                            request.receipt_call_id
+                        )));
+                    }
+                }
+                RolloutItem::RemoteExecutionWriteIntent(intent) => {
+                    if intent.thread_id != thread_id
+                        || intent.session_id <= 0
+                        || intent.command_digest.is_empty()
+                        || intent.write_id.len() != 64
+                        || intent.input_sha256.len() != 64
+                        || intent.input_len == 0
+                        || !intent
+                            .write_id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "invalid remote stdin intent for call {}",
+                            intent.receipt_call_id
+                        )));
+                    }
+                    let call_matches = calls.get(&intent.receipt_call_id).is_some_and(
+                        |(_, turn_id, interaction, protocol_evidence, _)| {
+                            let Some((session_id, input_is_empty, input_sha256, input_len, _, _)) =
+                                interaction
+                            else {
+                                return false;
+                            };
+                            turn_id == &intent.receipt_turn_id
+                                && *session_id == intent.session_id
+                                && !*input_is_empty
+                                && input_sha256 == &intent.input_sha256
+                                && *input_len == intent.input_len
+                                && *protocol_evidence == RemoteExecutionProtocolEvidence::V2Proven
+                        },
+                    );
+                    let marker_index = marker_state
+                        .get(&intent.receipt_turn_id)
+                        .copied()
+                        .flatten()
+                        .and_then(|(index, valid, _)| valid.then_some(index));
+                    let committed_matches = session_commits
+                        .iter()
+                        .rev()
+                        .find(|(commit_index, committed)| {
+                            *commit_index < rollout_index
+                                && committed.thread_id == intent.thread_id
+                                && committed.session_id == intent.session_id
+                        })
+                        .is_some_and(|(commit_index, committed)| {
+                            marker_index.is_some_and(|marker_index| *commit_index < marker_index)
+                                && !committed.terminal
+                                && committed.exec_turn_id == intent.exec_turn_id
+                                && committed.exec_call_id == intent.exec_call_id
+                                && committed.attempt_generation == intent.attempt_generation
+                                && committed.command_digest == intent.command_digest
+                                && committed.range_end == intent.committed_output_cursor
+                        });
+                    let request_key = (
+                        intent.receipt_turn_id.clone(),
+                        intent.receipt_call_id.clone(),
+                    );
+                    let request_required = calls
+                        .get(&intent.receipt_call_id)
+                        .is_some_and(|(_, _, _, _, required)| *required);
+                    let request_matches = write_requests
+                        .get(&request_key)
+                        .map(|(request_index, request)| {
+                            *request_index < rollout_index
+                                && request.thread_id == intent.thread_id
+                                && request.exec_turn_id == intent.exec_turn_id
+                                && request.exec_call_id == intent.exec_call_id
+                                && request.attempt_generation == intent.attempt_generation
+                                && request.session_id == intent.session_id
+                                && request.command_digest == intent.command_digest
+                                && request.committed_output_cursor == intent.committed_output_cursor
+                                && request.input_sha256 == intent.input_sha256
+                                && request.input_len == intent.input_len
+                        })
+                        .unwrap_or(!request_required);
+                    if !call_matches
+                        || !committed_matches
+                        || !request_matches
+                        || outputs.contains(&intent.receipt_call_id)
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "remote stdin intent for call {} is early, late, or conflicts with durable session authority",
+                            intent.receipt_call_id
+                        )));
+                    }
+                    let key = (
+                        intent.receipt_turn_id.clone(),
+                        intent.receipt_call_id.clone(),
+                    );
+                    if write_intents
+                        .insert(key, (rollout_index, intent.clone()))
+                        .is_some()
+                    {
+                        return Err(CodexErr::Fatal(format!(
+                            "duplicate remote stdin intent for call {}",
+                            intent.receipt_call_id
+                        )));
+                    }
+                }
                 RolloutItem::ResponseItem(ResponseItem::FunctionCall {
                     call_id,
                     name,
@@ -946,11 +1144,14 @@ impl ThreadManager {
                             "supported remote call {call_id} has no durable turn identity"
                         ))
                     })?;
-                    let protocol_evidence = if marker_state.get(&turn_id) == Some(&Some(true)) {
+                    let marker = marker_state.get(&turn_id).copied().flatten();
+                    let protocol_evidence = if marker.is_some_and(|(_, valid, _)| valid) {
                         RemoteExecutionProtocolEvidence::V2Proven
                     } else {
                         RemoteExecutionProtocolEvidence::LegacyUnknown
                     };
+                    let pre_send_intent_required =
+                        marker.is_some_and(|(_, valid, intent_required)| valid && intent_required);
                     let interaction = if name == "write_stdin" {
                         let arguments: serde_json::Value =
                             serde_json::from_str(arguments).unwrap_or_default();
@@ -958,23 +1159,70 @@ impl ThreadManager {
                             .get("session_id")
                             .and_then(serde_json::Value::as_i64)
                             .and_then(|value| i32::try_from(value).ok());
-                        let chars = arguments
-                            .get("chars")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default();
+                        let chars = match arguments.get("chars") {
+                            None => "",
+                            Some(value) => value.as_str().ok_or_else(|| {
+                                CodexErr::Fatal(format!(
+                                    "write_stdin call {call_id} has invalid chars"
+                                ))
+                            })?,
+                        };
                         let session_id = session_id.ok_or_else(|| {
                             CodexErr::Fatal(format!(
                                 "write_stdin call {call_id} has no valid session_id"
                             ))
                         })?;
-                        Some((session_id, chars.is_empty()))
+                        let input_len = u64::try_from(chars.len()).map_err(|_| {
+                            CodexErr::Fatal(format!(
+                                "write_stdin call {call_id} input length is unsupported"
+                            ))
+                        })?;
+                        let input_digest = Sha256::digest(chars.as_bytes())
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect();
+                        let yield_time_ms = match arguments.get("yield_time_ms") {
+                            None => crate::unified_exec::MIN_YIELD_TIME_MS,
+                            Some(value) => value.as_u64().ok_or_else(|| {
+                                CodexErr::Fatal(format!(
+                                    "write_stdin call {call_id} has invalid yield_time_ms"
+                                ))
+                            })?,
+                        };
+                        let max_output_tokens = match arguments.get("max_output_tokens") {
+                            None | Some(serde_json::Value::Null) => None,
+                            Some(value) => Some(
+                                value
+                                    .as_u64()
+                                    .and_then(|value| usize::try_from(value).ok())
+                                    .ok_or_else(|| {
+                                        CodexErr::Fatal(format!(
+                                            "write_stdin call {call_id} has invalid max_output_tokens"
+                                        ))
+                                    })?,
+                            ),
+                        };
+                        Some((
+                            session_id,
+                            chars.is_empty(),
+                            input_digest,
+                            input_len,
+                            yield_time_ms,
+                            max_output_tokens,
+                        ))
                     } else {
                         None
                     };
                     if calls
                         .insert(
                             call_id.clone(),
-                            (rollout_index, turn_id, interaction, protocol_evidence),
+                            (
+                                rollout_index,
+                                turn_id,
+                                interaction,
+                                protocol_evidence,
+                                pre_send_intent_required,
+                            ),
                         )
                         .is_some()
                     {
@@ -999,7 +1247,7 @@ impl ThreadManager {
             .collect::<Vec<_>>();
         let unmatched_turns = unmatched
             .iter()
-            .map(|(_, (_, turn_id, _, _))| turn_id.as_str())
+            .map(|(_, (_, turn_id, _, _, _))| turn_id.as_str())
             .collect::<HashSet<_>>();
         if unmatched_turns.len() > 1 {
             return Err(CodexErr::Fatal(
@@ -1013,7 +1261,7 @@ impl ThreadManager {
                 "unmatched supported calls are not in the final active turn".to_string(),
             ));
         }
-        for ((turn_id, call_id, generation), _) in &launch_intents {
+        for (turn_id, call_id, generation) in launch_intents.keys() {
             if *generation == 1
                 && !launch_intents.contains_key(&(turn_id.clone(), call_id.clone(), 0))
             {
@@ -1024,11 +1272,13 @@ impl ThreadManager {
         }
         let mut incomplete_executions = unmatched
             .iter()
-            .filter(|(_, (_, _, interaction, _))| interaction.is_none())
-            .flat_map(|(call_id, (_, turn_id, _, protocol_evidence))| {
+            .filter(|(_, (_, _, interaction, _, _))| interaction.is_none())
+            .flat_map(|(call_id, (_, turn_id, _, protocol_evidence, _))| {
                 let protocol_evidence = if *protocol_evidence
                     == RemoteExecutionProtocolEvidence::V2Proven
-                    && marker_state.get(turn_id) == Some(&Some(true))
+                    && marker_state
+                        .get(turn_id)
+                        .is_some_and(|state| state.is_some_and(|(_, valid, _)| valid))
                 {
                     RemoteExecutionProtocolEvidence::V2Proven
                 } else {
@@ -1054,19 +1304,35 @@ impl ThreadManager {
         let mut pending_writes = unmatched
             .into_iter()
             .filter_map(
-                |(call_id, (rollout_index, turn_id, interaction, protocol_evidence))| {
-                    interaction.map(|(session_id, input_is_empty)| {
-                        (
-                            *rollout_index,
-                            codex_exec_server::PendingWriteInteraction {
-                                call_id: call_id.clone(),
-                                turn_id: turn_id.clone(),
-                                session_id,
-                                input_is_empty,
-                                protocol_evidence: *protocol_evidence,
-                            },
-                        )
-                    })
+                |(
+                    call_id,
+                    (
+                        rollout_index,
+                        turn_id,
+                        interaction,
+                        protocol_evidence,
+                        pre_send_intent_required,
+                    ),
+                )| {
+                    interaction
+                        .as_ref()
+                        .map(|(session_id, input_is_empty, _, _, _, _)| {
+                            let pre_send_intent_persisted =
+                                write_intents.contains_key(&(turn_id.clone(), call_id.to_string()));
+                            (
+                                *rollout_index,
+                                codex_exec_server::PendingWriteInteraction {
+                                    call_id: call_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    session_id: *session_id,
+                                    input_is_empty: *input_is_empty,
+                                    pre_send_intent_required: *pre_send_intent_required
+                                        && !*input_is_empty,
+                                    pre_send_intent_persisted,
+                                    protocol_evidence: *protocol_evidence,
+                                },
+                            )
+                        })
                 },
             )
             .collect::<Vec<_>>();
@@ -2206,13 +2472,11 @@ async fn append_recovered_execution_outputs_to_rollout(
     let conversation_id = resumed.conversation_id.to_string();
     let mut call_identities = HashSet::new();
     for item in resumed.history.iter() {
-        match item {
-            RolloutItem::ResponseItem(response @ ResponseItem::FunctionCall { call_id, .. }) => {
-                if let Some(turn_id) = response.turn_id() {
-                    call_identities.insert((turn_id.to_string(), call_id.to_string()));
-                }
-            }
-            _ => {}
+        if let RolloutItem::ResponseItem(response @ ResponseItem::FunctionCall { call_id, .. }) =
+            item
+            && let Some(turn_id) = response.turn_id()
+        {
+            call_identities.insert((turn_id.to_string(), call_id.to_string()));
         }
     }
     let reconciliation_request =
@@ -2575,7 +2839,7 @@ fn format_recovered_execution_output(execution: &RecoveredExecution) -> String {
             base64::engine::general_purpose::STANDARD.encode(&execution.output)
         ),
     };
-    format!("{terminal}\nOutput:\n{}", output)
+    format!("{terminal}\nOutput:\n{output}")
 }
 
 fn thread_store_rollout_read_error(err: ThreadStoreError) -> CodexErr {

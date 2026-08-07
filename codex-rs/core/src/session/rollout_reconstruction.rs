@@ -283,9 +283,12 @@ impl Session {
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::RemoteExecutionProtocolMarker(_)
                 | RolloutItem::RemoteExecutionLaunchIntent(_)
+                | RolloutItem::RemoteExecutionWriteRequest(_)
+                | RolloutItem::RemoteExecutionWriteIntent(_)
                 | RolloutItem::RemoteExecutionSessionPrepared(_)
                 | RolloutItem::RemoteExecutionSessionCommitted(_)
-                | RolloutItem::RemoteExecutionSessionAcknowledged(_) => {}
+                | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+                | RolloutItem::RemoteExecutionSessionReleased(_) => {}
             }
 
             if base_replacement_history.is_some()
@@ -376,9 +379,12 @@ impl Session {
                 | RolloutItem::SessionMeta(_)
                 | RolloutItem::RemoteExecutionProtocolMarker(_)
                 | RolloutItem::RemoteExecutionLaunchIntent(_)
+                | RolloutItem::RemoteExecutionWriteRequest(_)
+                | RolloutItem::RemoteExecutionWriteIntent(_)
                 | RolloutItem::RemoteExecutionSessionPrepared(_)
                 | RolloutItem::RemoteExecutionSessionCommitted(_)
-                | RolloutItem::RemoteExecutionSessionAcknowledged(_) => {}
+                | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+                | RolloutItem::RemoteExecutionSessionReleased(_) => {}
             }
         }
 
@@ -426,9 +432,12 @@ impl Session {
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::RemoteExecutionProtocolMarker(_)
                 | RolloutItem::RemoteExecutionLaunchIntent(_)
+                | RolloutItem::RemoteExecutionWriteRequest(_)
+                | RolloutItem::RemoteExecutionWriteIntent(_)
                 | RolloutItem::RemoteExecutionSessionPrepared(_)
                 | RolloutItem::RemoteExecutionSessionCommitted(_)
                 | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+                | RolloutItem::RemoteExecutionSessionReleased(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::EventMsg(_) => {
                     unreachable!("only world-state replay items are collected")

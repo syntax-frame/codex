@@ -66,9 +66,91 @@ fn background_output_for_turn_with_text(turn_id: &str, call_id: &str, text: &str
     })
 }
 
+fn write_stdin_call(turn_id: &str, call_id: &str, session_id: i32, chars: &str) -> RolloutItem {
+    let mut call = ResponseItem::FunctionCall {
+        id: None,
+        name: "write_stdin".to_string(),
+        namespace: None,
+        arguments: serde_json::json!({
+            "session_id": session_id,
+            "chars": chars,
+        })
+        .to_string(),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    call.set_turn_id_if_missing(turn_id);
+    RolloutItem::ResponseItem(call)
+}
+
 fn persisted_rollout_item(item: &RolloutItem) -> RolloutItem {
     let json = serde_json::to_string(item).expect("serialize rollout item");
     serde_json::from_str(&json).expect("deserialize rollout item")
+}
+
+#[test]
+fn completed_legacy_nonempty_write_after_latest_cursor_fails_closed() {
+    let prepared = background_prepared(41, "exec-41", 7);
+    let output = background_output("exec-41");
+    let committed = missing_background_session_commits(&[prepared.clone(), output.clone()])
+        .expect("initial receipt")
+        .pop()
+        .expect("initial commit");
+    let history = vec![
+        prepared,
+        output,
+        RolloutItem::RemoteExecutionSessionCommitted(committed),
+        write_stdin_call("stdin-turn", "stdin-legacy", 41, "continue\n"),
+        background_output_for_turn("stdin-turn", "stdin-legacy"),
+    ];
+
+    assert_eq!(
+        completed_nonempty_write_after_commit(&history, 41, 2)
+            .expect("legacy write classification"),
+        Some("stdin-legacy".to_string())
+    );
+    assert_eq!(
+        completed_nonempty_write_after_commit(&history, 42, 2)
+            .expect("other session classification"),
+        None
+    );
+}
+
+#[test]
+fn committed_nonempty_write_cursor_does_not_trigger_legacy_guard() {
+    let prepared = background_prepared(41, "exec-41", 7);
+    let output = background_output("exec-41");
+    let committed = missing_background_session_commits(&[prepared.clone(), output.clone()])
+        .expect("initial receipt")
+        .pop()
+        .expect("initial commit");
+    let mut write_prepared = match background_prepared(41, "stdin-1", 11) {
+        RolloutItem::RemoteExecutionSessionPrepared(prepared) => prepared,
+        _ => unreachable!(),
+    };
+    write_prepared.receipt_turn_id = "stdin-turn".to_string();
+    write_prepared.receipt_kind = RemoteExecutionReceiptKind::NonemptyWrite;
+    write_prepared.range_start = 7;
+    let write_output = background_output_for_turn("stdin-turn", "stdin-1");
+    let mut history = vec![
+        prepared,
+        output,
+        RolloutItem::RemoteExecutionSessionCommitted(committed),
+        write_stdin_call("stdin-turn", "stdin-1", 41, "continue\n"),
+        RolloutItem::RemoteExecutionSessionPrepared(write_prepared),
+        write_output,
+    ];
+    let latest = missing_background_session_commits(&history)
+        .expect("nonempty write receipt")
+        .pop()
+        .expect("nonempty write commit");
+    history.push(RolloutItem::RemoteExecutionSessionCommitted(latest));
+
+    assert_eq!(
+        completed_nonempty_write_after_commit(&history, 41, history.len() - 1)
+            .expect("committed write classification"),
+        None
+    );
 }
 
 #[test]
@@ -510,6 +592,53 @@ fn terminal_acknowledgement_marker_requires_one_exact_prior_commit() {
     ])
     .expect("identical acknowledgement replay");
     assert_eq!(duplicate.len(), 1);
+    let RolloutItem::RemoteExecutionSessionAcknowledged(release_marker) = marker.clone() else {
+        unreachable!();
+    };
+    let release_marker =
+        persisted_rollout_item(&RolloutItem::RemoteExecutionSessionReleased(release_marker));
+    let released = released_background_session_receipts(&[
+        prepared.clone(),
+        output.clone(),
+        commit.clone(),
+        marker.clone(),
+        release_marker.clone(),
+    ])
+    .expect("release after exact acknowledgement");
+    assert!(released.contains(&(
+        "thread".to_string(),
+        "receipt-turn".to_string(),
+        "poll-1".to_string(),
+    )));
+    assert!(
+        released_background_session_receipts(&[
+            prepared.clone(),
+            output.clone(),
+            commit.clone(),
+            release_marker.clone(),
+        ])
+        .is_err()
+    );
+    assert!(
+        released_background_session_receipts(&[
+            prepared.clone(),
+            output.clone(),
+            commit.clone(),
+            release_marker.clone(),
+            marker.clone(),
+        ])
+        .is_err()
+    );
+    let duplicate_release = released_background_session_receipts(&[
+        prepared.clone(),
+        output.clone(),
+        commit.clone(),
+        marker.clone(),
+        release_marker.clone(),
+        release_marker,
+    ])
+    .expect("identical release replay");
+    assert_eq!(duplicate_release.len(), 1);
     let RolloutItem::RemoteExecutionSessionAcknowledged(mut wrong_session) = marker.clone() else {
         unreachable!();
     };
@@ -613,6 +742,8 @@ fn committed_delivery_unknown_write_round_trip_is_restart_idempotent() {
         turn_id: "stdin-turn".to_string(),
         session_id: 41,
         input_is_empty: false,
+        pre_send_intent_required: false,
+        pre_send_intent_persisted: false,
         protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
     };
     let RolloutItem::RemoteExecutionSessionPrepared(mut delivery) =
@@ -677,10 +808,352 @@ fn committed_delivery_unknown_write_round_trip_is_restart_idempotent() {
 }
 
 #[test]
+fn pending_nonempty_write_replay_preserves_persisted_polling_parameters() {
+    let pending = PendingWriteInteraction {
+        call_id: "stdin-parameters".to_string(),
+        turn_id: "stdin-turn".to_string(),
+        session_id: 41,
+        input_is_empty: false,
+        pre_send_intent_required: true,
+        pre_send_intent_persisted: false,
+        protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+    };
+    let mut call = ResponseItem::FunctionCall {
+        id: None,
+        name: "write_stdin".to_string(),
+        namespace: None,
+        arguments: serde_json::json!({
+            "session_id": 41,
+            "chars": "continue\n",
+            "yield_time_ms": 4_321,
+            "max_output_tokens": 77,
+        })
+        .to_string(),
+        call_id: pending.call_id.clone(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    call.set_turn_id_if_missing(&pending.turn_id);
+    let prepared = background_prepared(41, "exec-41", 17);
+    let initial_output = background_output("exec-41");
+    let committed = missing_background_session_commits(&[prepared.clone(), initial_output.clone()])
+        .expect("valid committed background session")
+        .pop()
+        .expect("one committed background session");
+    let truncation_policy = TruncationPolicy::Bytes(2_048);
+    let request = RemoteExecutionWriteRequest {
+        thread_id: "thread".to_string(),
+        exec_turn_id: committed.exec_turn_id.clone(),
+        exec_call_id: committed.exec_call_id.clone(),
+        receipt_turn_id: pending.turn_id.clone(),
+        receipt_call_id: pending.call_id.clone(),
+        attempt_generation: committed.attempt_generation,
+        session_id: pending.session_id,
+        command_digest: committed.command_digest.clone(),
+        committed_output_cursor: committed.range_end,
+        input_sha256: remote_receipt_bytes_digest(b"continue\n"),
+        input_len: "continue\n".len() as u64,
+        yield_time_ms: 4_321,
+        max_output_tokens: Some(77),
+        truncation_policy,
+    };
+
+    assert_eq!(
+        pending_nonempty_write_request(
+            &[
+                prepared.clone(),
+                initial_output.clone(),
+                RolloutItem::RemoteExecutionSessionCommitted(committed.clone()),
+                RolloutItem::ResponseItem(call.clone()),
+                RolloutItem::RemoteExecutionWriteRequest(request.clone()),
+            ],
+            "thread",
+            &pending,
+        )
+        .expect("persisted write request"),
+        PendingNonemptyWriteRequest {
+            input: "continue\n".to_string(),
+            yield_time_ms: 4_321,
+            max_output_tokens: Some(77),
+            truncation_policy,
+        }
+    );
+
+    let ordering_error = pending_nonempty_write_request(
+        &[
+            prepared.clone(),
+            initial_output.clone(),
+            RolloutItem::RemoteExecutionSessionCommitted(committed.clone()),
+            RolloutItem::RemoteExecutionWriteRequest(request.clone()),
+            RolloutItem::ResponseItem(call.clone()),
+        ],
+        "thread",
+        &pending,
+    )
+    .expect_err("request before call must fail closed");
+    assert!(
+        ordering_error
+            .to_string()
+            .contains("invalid commit-call-request ordering")
+    );
+
+    let mut malformed_call = call;
+    let ResponseItem::FunctionCall { arguments, .. } = &mut malformed_call else {
+        panic!("function call");
+    };
+    *arguments = serde_json::json!({
+        "session_id": 41,
+        "chars": "continue\n",
+        "yield_time_ms": "4321",
+        "max_output_tokens": 77,
+    })
+    .to_string();
+    let malformed_error = pending_nonempty_write_request(
+        &[
+            prepared,
+            initial_output,
+            RolloutItem::RemoteExecutionSessionCommitted(committed),
+            RolloutItem::ResponseItem(malformed_call),
+            RolloutItem::RemoteExecutionWriteRequest(request),
+        ],
+        "thread",
+        &pending,
+    )
+    .expect_err("malformed persisted polling arguments must fail closed");
+    assert!(
+        malformed_error
+            .to_string()
+            .contains("invalid yield_time_ms")
+    );
+}
+
+#[test]
+fn remote_write_request_requires_commit_marker_call_request_order() {
+    assert!(remote_write_request_order_is_valid(0, 1, 2, Some(3)));
+    assert!(remote_write_request_order_is_valid(0, 1, 2, None));
+    assert!(
+        !remote_write_request_order_is_valid(1, 0, 2, Some(3)),
+        "a marker from before the latest committed cursor cannot authorize stdin"
+    );
+    assert!(!remote_write_request_order_is_valid(0, 2, 1, Some(3)));
+    assert!(!remote_write_request_order_is_valid(0, 1, 3, Some(2)));
+}
+
+#[tokio::test]
+async fn proven_unsent_nonempty_write_replays_once_and_persists_intent_before_input() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    attach_thread_persistence(&mut session).await;
+    let session = Arc::new(session);
+    let thread_id = session.thread_id.to_string();
+    let mut prepared = background_prepared(41, "exec-41", 17);
+    if let RolloutItem::RemoteExecutionSessionPrepared(prepared) = &mut prepared {
+        prepared.thread_id = thread_id.clone();
+    }
+    let initial_output = background_output("exec-41");
+    let committed = missing_background_session_commits(&[prepared.clone(), initial_output.clone()])
+        .expect("valid committed background session")
+        .pop()
+        .expect("one committed background session");
+    let input = "continue\n";
+    let mut call = ResponseItem::FunctionCall {
+        id: None,
+        name: "write_stdin".to_string(),
+        namespace: None,
+        arguments: serde_json::json!({
+            "session_id": 41,
+            "chars": input,
+        })
+        .to_string(),
+        call_id: "stdin-1".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    call.set_turn_id_if_missing("stdin-turn");
+    let input_sha256 = remote_receipt_bytes_digest(input.as_bytes());
+    let truncation_policy = TruncationPolicy::Bytes(2_048);
+    let write_request = RemoteExecutionWriteRequest {
+        thread_id: thread_id.clone(),
+        exec_turn_id: committed.exec_turn_id.clone(),
+        exec_call_id: committed.exec_call_id.clone(),
+        receipt_turn_id: "stdin-turn".to_string(),
+        receipt_call_id: "stdin-1".to_string(),
+        attempt_generation: committed.attempt_generation,
+        session_id: 41,
+        command_digest: committed.command_digest.clone(),
+        committed_output_cursor: committed.range_end,
+        input_sha256: input_sha256.clone(),
+        input_len: input.len() as u64,
+        yield_time_ms: crate::unified_exec::MIN_YIELD_TIME_MS,
+        max_output_tokens: None,
+        truncation_policy,
+    };
+    let live_thread = session
+        .live_thread_for_persistence("seed proven-unsent stdin test")
+        .expect("live thread");
+    live_thread
+        .append_items(&[
+            prepared,
+            initial_output,
+            RolloutItem::RemoteExecutionSessionCommitted(committed.clone()),
+            RolloutItem::RemoteExecutionProtocolMarker(RemoteExecutionProtocolMarker {
+                thread_id: thread_id.clone(),
+                turn_id: "stdin-turn".to_string(),
+                protocol_version: 2,
+                identity_schema: "thread-turn-call-generation".to_string(),
+                descriptor_before_go: true,
+                stdin_intent_before_write: true,
+            }),
+            RolloutItem::ResponseItem(call),
+            RolloutItem::RemoteExecutionWriteRequest(write_request),
+        ])
+        .await
+        .expect("append recovery authority");
+    live_thread.flush().await.expect("flush recovery authority");
+
+    let (process, _terminate_count, writes) =
+        crate::unified_exec::process_tests::remote_process_with_write_log(
+            codex_exec_server::WriteStatus::Accepted,
+            /*terminate_error*/ None,
+            /*detach_on_drop*/ true,
+        )
+        .await;
+    session
+        .services
+        .unified_exec_manager
+        .insert_process_for_session_teardown_test(41, Arc::new(process), &session)
+        .await;
+    let pending = PendingWriteInteraction {
+        call_id: "stdin-1".to_string(),
+        turn_id: "stdin-turn".to_string(),
+        session_id: 41,
+        input_is_empty: false,
+        pre_send_intent_required: true,
+        pre_send_intent_persisted: false,
+        protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+    };
+
+    session
+        .replay_proven_unsent_nonempty_write_before_reconstruction(&pending)
+        .await
+        .expect("proven-unsent input should replay");
+    assert_eq!(*writes.lock().await, vec![input.as_bytes().to_vec()]);
+    session
+        .commit_prepared_remote_session_after_output("stdin-turn", "stdin-1")
+        .await
+        .expect("commit nonempty write cursor receipt");
+
+    let persisted = live_thread
+        .load_history(/*include_archived*/ true)
+        .await
+        .expect("reload persisted replay");
+    let intents = persisted
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::RemoteExecutionWriteIntent(intent) => Some(intent.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let prepared_write = persisted
+        .items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::RemoteExecutionSessionPrepared(prepared)
+                if prepared.receipt_call_id == "stdin-1" =>
+            {
+                Some(prepared)
+            }
+            _ => None,
+        })
+        .expect("prepared nonempty write receipt");
+    let committed_write = persisted
+        .items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::RemoteExecutionSessionCommitted(committed)
+                if committed.receipt_call_id == "stdin-1" =>
+            {
+                Some(committed)
+            }
+            _ => None,
+        })
+        .expect("committed nonempty write receipt");
+    assert_eq!(
+        prepared_write.receipt_kind,
+        RemoteExecutionReceiptKind::NonemptyWrite
+    );
+    assert_eq!(prepared_write.range_start, committed.range_end);
+    assert_eq!(prepared_write.range_end, committed.range_end);
+    assert_eq!(committed_write.range_start, committed.range_end);
+    assert_eq!(committed_write.range_end, committed.range_end);
+    let expected_write_id = format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "agentapp-remote-stdin-v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                thread_id,
+                committed.exec_turn_id,
+                committed.exec_call_id,
+                committed.attempt_generation,
+                "stdin-turn",
+                "stdin-1",
+                41,
+                committed.range_end,
+                input_sha256,
+            )
+            .as_bytes()
+        )
+    );
+    assert_eq!(
+        intents,
+        vec![RemoteExecutionWriteIntent {
+            thread_id,
+            exec_turn_id: committed.exec_turn_id,
+            exec_call_id: committed.exec_call_id,
+            receipt_turn_id: "stdin-turn".to_string(),
+            receipt_call_id: "stdin-1".to_string(),
+            attempt_generation: committed.attempt_generation,
+            session_id: 41,
+            command_digest: committed.command_digest,
+            committed_output_cursor: committed.range_end,
+            write_id: expected_write_id,
+            input_sha256,
+            input_len: input.len() as u64,
+        }]
+    );
+    assert_eq!(
+        persisted
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                        call_id,
+                        ..
+                    }) if call_id == "stdin-1"
+                )
+            })
+            .count(),
+        1
+    );
+
+    session
+        .replay_proven_unsent_nonempty_write_before_reconstruction(&pending)
+        .await
+        .expect_err("durable intent and output must prevent duplicate replay");
+    let mut ambiguous = pending;
+    ambiguous.pre_send_intent_persisted = true;
+    session
+        .replay_proven_unsent_nonempty_write_before_reconstruction(&ambiguous)
+        .await
+        .expect_err("persisted intent must never use proven-unsent replay");
+    assert_eq!(*writes.lock().await, vec![input.as_bytes().to_vec()]);
+}
+
+#[test]
 fn terminal_acknowledgement_retries_from_durable_commit_without_pre_reconciliation() {
     let session = include_str!("mod.rs");
     let finalize = session
-        .find("pub(crate) async fn finalize_background_session_receipts")
+        .find("async fn finalize_background_session_remote_receipts")
         .expect("finalize method");
     let finalize_end = session[finalize..]
         .find("pub(crate) async fn restore_committed_background_sessions")
@@ -709,14 +1182,14 @@ fn terminal_acknowledgement_retries_from_durable_commit_without_pre_reconciliati
         .find(".acknowledge_consumed")
         .expect("idempotent backend acknowledgement");
 
-    assert!(acknowledge < proof);
+    assert!(proof < acknowledge);
 }
 
 #[test]
-fn terminal_acknowledgement_is_marked_durable_before_local_receipt_release() {
+fn terminal_acknowledgement_and_release_are_each_marked_durable() {
     let session = include_str!("mod.rs");
     let finalize = session
-        .find("pub(crate) async fn finalize_background_session_receipts")
+        .find("async fn finalize_background_session_remote_receipts")
         .expect("finalize method");
     let finalize_end = session[finalize..]
         .find("pub(crate) async fn restore_committed_background_sessions")
@@ -726,9 +1199,15 @@ fn terminal_acknowledgement_is_marked_durable_before_local_receipt_release() {
     let durable_marker_scan = finalize_body
         .find("acknowledged_background_session_receipts")
         .expect("durable acknowledgement scan");
+    let durable_release_scan = finalize_body
+        .find("released_background_session_receipts")
+        .expect("durable release scan");
+    let released_skip = finalize_body
+        .find("released_receipts.contains")
+        .expect("already released receipt skip");
     let marker_skip = finalize_body
         .find("acknowledged_receipts.contains")
-        .expect("already acknowledged receipt skip");
+        .expect("already acknowledged receipt detection");
     let remote_ack = finalize_body
         .find(".acknowledge_consumed")
         .expect("remote acknowledgement");
@@ -743,17 +1222,34 @@ fn terminal_acknowledgement_is_marked_durable_before_local_receipt_release() {
         .find(".flush()")
         .expect("marker flush")
         + marker_append;
-    let local_release = finalize_body[marker_flush..]
-        .find(".acknowledge_output_receipt")
-        .expect("local receipt release")
+    let remote_release = finalize_body[marker_flush..]
+        .find(".release_acknowledged")
+        .expect("proof-bound tombstone release")
         + marker_flush;
+    let release_marker = finalize_body[remote_release..]
+        .find("RolloutItem::RemoteExecutionSessionReleased")
+        .expect("durable release marker")
+        + remote_release;
+    let release_append = finalize_body[release_marker..]
+        .find(".append_items(&[release_marker])")
+        .expect("release marker append")
+        + release_marker;
+    let release_flush = finalize_body[release_append..]
+        .find(".flush()")
+        .expect("release marker flush")
+        + release_append;
 
     assert!(durable_marker_scan < marker_skip);
+    assert!(durable_release_scan < released_skip);
+    assert!(released_skip < marker_skip);
     assert!(marker_skip < remote_ack);
     assert!(remote_ack < marker);
     assert!(marker < marker_append);
     assert!(marker_append < marker_flush);
-    assert!(marker_flush < local_release);
+    assert!(marker_flush < remote_release);
+    assert!(remote_release < release_marker);
+    assert!(release_marker < release_append);
+    assert!(release_append < release_flush);
 }
 
 #[test]
@@ -789,6 +1285,46 @@ fn background_receipt_transition_orders_prepared_output_and_commit_barriers() {
 }
 
 #[test]
+fn terminal_remote_retirement_is_not_on_the_model_output_critical_path() {
+    let session = include_str!("mod.rs");
+    let commit = session
+        .find("async fn commit_prepared_remote_session_after_output")
+        .expect("commit method");
+    let commit_end = session[commit..]
+        .find("pub(crate) async fn record_step_world_state_if_changed")
+        .expect("next method")
+        + commit;
+    let commit_body = &session[commit..commit_end];
+
+    assert!(commit_body.contains("persist_missing_background_session_commits"));
+    assert!(commit_body.contains("acknowledge_output_receipt"));
+    assert!(!commit_body.contains("finalize_background_session_receipts"));
+    assert!(!commit_body.contains("acknowledge_consumed"));
+    assert!(!commit_body.contains("release_acknowledged"));
+    assert!(!commit_body.contains("get_exec_backend"));
+}
+
+#[test]
+fn deferred_receipt_maintenance_keeps_local_commit_backfill_fail_closed() {
+    let session = include_str!("mod.rs");
+    let retry = session
+        .find("async fn retry_background_session_receipt_maintenance")
+        .expect("retry helper");
+    let retry_end = session[retry..]
+        .find("pub(crate) async fn restore_committed_background_sessions")
+        .expect("next method")
+        + retry;
+    let body = &session[retry..retry_end];
+    let commit_backfill = body
+        .find("persist_missing_background_session_commits().await?")
+        .expect("fatal local commit backfill");
+    let best_effort_remote = body
+        .find("if let Err(error) = self.finalize_background_session_remote_receipts().await")
+        .expect("best-effort remote-only maintenance");
+    assert!(commit_backfill < best_effort_remote);
+}
+
+#[test]
 fn resumed_writes_are_repaired_before_resume_returns() {
     let manager = include_str!("../thread_manager.rs");
     let session = include_str!("mod.rs");
@@ -821,8 +1357,8 @@ fn resumed_writes_are_repaired_before_resume_returns() {
         .expect("delivery-unknown receipt is committed after output")
         + output;
     let finalize = session[commit..]
-        .find("finalize_background_session_receipts")
-        .expect("existing finalizer acknowledges after commit")
+        .find("retry_background_session_receipt_maintenance(\"stdin_recovery\")")
+        .expect("deferred finalizer is retried after commit")
         + commit;
     let redaction = session[repair_impl..]
         .find(".redact_serializable(initial_history)")
@@ -856,6 +1392,8 @@ fn pending_empty_poll(session_id: i32, turn_id: &str, call_id: &str) -> PendingW
         turn_id: turn_id.to_string(),
         session_id,
         input_is_empty: true,
+        pre_send_intent_required: false,
+        pre_send_intent_persisted: false,
         protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
     }
 }
@@ -3801,9 +4339,12 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::RemoteExecutionProtocolMarker(_)
         | RolloutItem::RemoteExecutionLaunchIntent(_)
+        | RolloutItem::RemoteExecutionWriteRequest(_)
+        | RolloutItem::RemoteExecutionWriteIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
         | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+        | RolloutItem::RemoteExecutionSessionReleased(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
         | RolloutItem::EventMsg(_) => None,
@@ -3862,9 +4403,12 @@ async fn record_initial_history_assigns_and_persists_id_for_forked_response_item
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::RemoteExecutionProtocolMarker(_)
         | RolloutItem::RemoteExecutionLaunchIntent(_)
+        | RolloutItem::RemoteExecutionWriteRequest(_)
+        | RolloutItem::RemoteExecutionWriteIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
         | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+        | RolloutItem::RemoteExecutionSessionReleased(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)

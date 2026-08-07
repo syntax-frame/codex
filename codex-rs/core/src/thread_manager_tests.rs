@@ -23,12 +23,17 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::RemoteExecutionLaunchIntent;
 use codex_protocol::protocol::RemoteExecutionProtocolMarker;
+use codex_protocol::protocol::RemoteExecutionReceiptKind;
+use codex_protocol::protocol::RemoteExecutionSessionCommitted;
+use codex_protocol::protocol::RemoteExecutionWriteIntent;
+use codex_protocol::protocol::RemoteExecutionWriteRequest;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_utils_path_uri::PathUri;
@@ -67,14 +72,24 @@ fn scanner_output(call_id: &str, turn_id: &str) -> RolloutItem {
     RolloutItem::ResponseItem(item)
 }
 
-fn scanner_marker(thread_id: &str, turn_id: &str, protocol_version: u32) -> RolloutItem {
+fn scanner_marker_with_stdin_intent(
+    thread_id: &str,
+    turn_id: &str,
+    protocol_version: u32,
+    stdin_intent_before_write: bool,
+) -> RolloutItem {
     RolloutItem::RemoteExecutionProtocolMarker(RemoteExecutionProtocolMarker {
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
         protocol_version,
         identity_schema: "thread-turn-call-generation".to_string(),
         descriptor_before_go: true,
+        stdin_intent_before_write,
     })
+}
+
+fn scanner_marker(thread_id: &str, turn_id: &str, protocol_version: u32) -> RolloutItem {
+    scanner_marker_with_stdin_intent(thread_id, turn_id, protocol_version, true)
 }
 
 fn scanner_launch_intent(
@@ -92,6 +107,93 @@ fn scanner_launch_intent(
         command_digest: digest.to_string(),
         original_session_id: 4242,
         tty: false,
+    })
+}
+
+fn scanner_committed_session(
+    thread_id: &str,
+    session_id: i32,
+    command_digest: &str,
+    cursor: u64,
+) -> RolloutItem {
+    RolloutItem::RemoteExecutionSessionCommitted(RemoteExecutionSessionCommitted {
+        thread_id: thread_id.to_string(),
+        exec_turn_id: "exec-turn".to_string(),
+        exec_call_id: "exec-call".to_string(),
+        receipt_turn_id: "exec-turn".to_string(),
+        receipt_call_id: "exec-call".to_string(),
+        receipt_kind: RemoteExecutionReceiptKind::InitialExec,
+        attempt_generation: 0,
+        session_id,
+        command_digest: command_digest.to_string(),
+        range_start: 0,
+        range_end: cursor,
+        receipt_output_digest: "receipt-output".to_string(),
+        prepared_receipt_digest: "prepared-receipt".to_string(),
+        terminal_acknowledgement_token: None,
+        terminal_output_digest: None,
+        terminal_status: None,
+        terminal: false,
+    })
+}
+
+fn scanner_write_intent(
+    thread_id: &str,
+    turn_id: &str,
+    call_id: &str,
+    session_id: i32,
+    command_digest: &str,
+    cursor: u64,
+    input: &str,
+) -> RolloutItem {
+    let input_sha256 = Sha256::digest(input.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    RolloutItem::RemoteExecutionWriteIntent(RemoteExecutionWriteIntent {
+        thread_id: thread_id.to_string(),
+        exec_turn_id: "exec-turn".to_string(),
+        exec_call_id: "exec-call".to_string(),
+        receipt_turn_id: turn_id.to_string(),
+        receipt_call_id: call_id.to_string(),
+        attempt_generation: 0,
+        session_id,
+        command_digest: command_digest.to_string(),
+        committed_output_cursor: cursor,
+        write_id: "a".repeat(64),
+        input_sha256,
+        input_len: input.len() as u64,
+    })
+}
+
+fn scanner_write_request(
+    thread_id: &str,
+    turn_id: &str,
+    call_id: &str,
+    session_id: i32,
+    command_digest: &str,
+    cursor: u64,
+    input: &str,
+) -> RolloutItem {
+    let input_sha256 = Sha256::digest(input.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    RolloutItem::RemoteExecutionWriteRequest(RemoteExecutionWriteRequest {
+        thread_id: thread_id.to_string(),
+        exec_turn_id: "exec-turn".to_string(),
+        exec_call_id: "exec-call".to_string(),
+        receipt_turn_id: turn_id.to_string(),
+        receipt_call_id: call_id.to_string(),
+        attempt_generation: 0,
+        session_id,
+        command_digest: command_digest.to_string(),
+        committed_output_cursor: cursor,
+        input_sha256,
+        input_len: input.len() as u64,
+        yield_time_ms: crate::unified_exec::MIN_YIELD_TIME_MS,
+        max_output_tokens: None,
+        truncation_policy: TruncationPolicy::Bytes(2_048),
     })
 }
 
@@ -289,6 +391,215 @@ fn active_tail_scanner_supports_exec_and_preserves_write_interaction() {
     assert_eq!(request.pending_writes[0].turn_id, "turn-1");
     assert_eq!(request.pending_writes[0].session_id, 42);
     assert!(request.pending_writes[0].input_is_empty);
+    assert!(!request.pending_writes[0].pre_send_intent_required);
+    assert!(!request.pending_writes[0].pre_send_intent_persisted);
+}
+
+#[test]
+fn scanner_classifies_build121_nonempty_stdin_intent_exactly() {
+    let input = "continue\n";
+    let base = vec![
+        scanner_committed_session("thread", 42, "command-digest", 17),
+        scanner_marker("thread", "write-turn", 2),
+        scanner_call(
+            "write_stdin",
+            "write-call",
+            "write-turn",
+            r#"{"session_id":42,"chars":"continue\n"}"#,
+        ),
+    ];
+
+    let without_intent =
+        ThreadManager::scan_active_remote_calls("thread".to_string(), &base).expect("scan");
+    assert_eq!(without_intent.pending_writes.len(), 1);
+    assert!(without_intent.pending_writes[0].pre_send_intent_required);
+    assert!(!without_intent.pending_writes[0].pre_send_intent_persisted);
+
+    let mut with_intent = base.clone();
+    with_intent.push(scanner_write_request(
+        "thread",
+        "write-turn",
+        "write-call",
+        42,
+        "command-digest",
+        17,
+        input,
+    ));
+    with_intent.push(scanner_write_intent(
+        "thread",
+        "write-turn",
+        "write-call",
+        42,
+        "command-digest",
+        17,
+        input,
+    ));
+    let request =
+        ThreadManager::scan_active_remote_calls("thread".to_string(), &with_intent).expect("scan");
+    assert!(request.pending_writes[0].pre_send_intent_required);
+    assert!(request.pending_writes[0].pre_send_intent_persisted);
+
+    let mut conflicting = base;
+    conflicting.push(scanner_write_request(
+        "thread",
+        "write-turn",
+        "write-call",
+        42,
+        "command-digest",
+        17,
+        input,
+    ));
+    conflicting.push(scanner_write_intent(
+        "thread",
+        "write-turn",
+        "write-call",
+        42,
+        "command-digest",
+        17,
+        "different\n",
+    ));
+    ThreadManager::scan_active_remote_calls("thread".to_string(), &conflicting)
+        .expect_err("conflicting stdin intent must fail closed");
+}
+
+#[test]
+fn scanner_never_classifies_a_persisted_remote_interrupt_as_proven_unsent() {
+    let input = "\u{3}";
+    let arguments = serde_json::json!({
+        "session_id": 42,
+        "chars": input,
+    })
+    .to_string();
+    let history = vec![
+        scanner_committed_session("thread", 42, "command-digest", 17),
+        scanner_marker("thread", "interrupt-turn", 2),
+        scanner_call(
+            "write_stdin",
+            "interrupt-call",
+            "interrupt-turn",
+            &arguments,
+        ),
+        scanner_write_request(
+            "thread",
+            "interrupt-turn",
+            "interrupt-call",
+            42,
+            "command-digest",
+            17,
+            input,
+        ),
+        scanner_write_intent(
+            "thread",
+            "interrupt-turn",
+            "interrupt-call",
+            42,
+            "command-digest",
+            17,
+            input,
+        ),
+    ];
+
+    let request =
+        ThreadManager::scan_active_remote_calls("thread".to_string(), &history).expect("scan");
+    assert_eq!(request.pending_writes.len(), 1);
+    assert!(!request.pending_writes[0].input_is_empty);
+    assert!(request.pending_writes[0].pre_send_intent_required);
+    assert!(
+        request.pending_writes[0].pre_send_intent_persisted,
+        "restart must take delivery-unknown recovery and never send a second interrupt"
+    );
+}
+
+#[test]
+fn scanner_accepts_persisted_stdin_intent_under_legacy_v2_marker_without_proven_unsent_replay() {
+    let history = vec![
+        scanner_committed_session("thread", 42, "command-digest", 17),
+        scanner_marker_with_stdin_intent("thread", "write-turn", 2, false),
+        scanner_call(
+            "write_stdin",
+            "write-call",
+            "write-turn",
+            r#"{"session_id":42,"chars":"continue\n"}"#,
+        ),
+        scanner_write_intent(
+            "thread",
+            "write-turn",
+            "write-call",
+            42,
+            "command-digest",
+            17,
+            "continue\n",
+        ),
+    ];
+
+    let request =
+        ThreadManager::scan_active_remote_calls("thread".to_string(), &history).expect("scan");
+    assert_eq!(request.pending_writes.len(), 1);
+    assert!(!request.pending_writes[0].pre_send_intent_required);
+    assert!(request.pending_writes[0].pre_send_intent_persisted);
+}
+
+#[test]
+fn scanner_rejects_stdin_intent_bound_to_an_earlier_session_cursor() {
+    let history = vec![
+        scanner_committed_session("thread", 42, "command-digest", 17),
+        scanner_committed_session("thread", 42, "command-digest", 29),
+        scanner_marker("thread", "write-turn", 2),
+        scanner_call(
+            "write_stdin",
+            "write-call",
+            "write-turn",
+            r#"{"session_id":42,"chars":"continue\n"}"#,
+        ),
+        scanner_write_request(
+            "thread",
+            "write-turn",
+            "write-call",
+            42,
+            "command-digest",
+            17,
+            "continue\n",
+        ),
+        scanner_write_intent(
+            "thread",
+            "write-turn",
+            "write-call",
+            42,
+            "command-digest",
+            17,
+            "continue\n",
+        ),
+    ];
+
+    ThreadManager::scan_active_remote_calls("thread".to_string(), &history)
+        .expect_err("an earlier matching commit must not supersede the latest exact cursor");
+}
+
+#[test]
+fn scanner_rejects_stdin_request_when_commit_follows_turn_marker() {
+    let input = "continue\n";
+    let history = vec![
+        scanner_marker("thread", "write-turn", 2),
+        scanner_committed_session("thread", 42, "command-digest", 17),
+        scanner_call(
+            "write_stdin",
+            "write-call",
+            "write-turn",
+            r#"{"session_id":42,"chars":"continue\n"}"#,
+        ),
+        scanner_write_request(
+            "thread",
+            "write-turn",
+            "write-call",
+            42,
+            "command-digest",
+            17,
+            input,
+        ),
+    ];
+
+    ThreadManager::scan_active_remote_calls("thread".to_string(), &history)
+        .expect_err("a marker from before the committed cursor must not authorize stdin");
 }
 
 #[test]

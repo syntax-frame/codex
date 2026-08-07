@@ -65,6 +65,15 @@ impl RemoteExecProcess {
         self.session.write(chunk).await
     }
 
+    async fn write_with_id(
+        &self,
+        chunk: Vec<u8>,
+        write_id: String,
+    ) -> Result<WriteResponse, crate::ExecServerError> {
+        trace!("exec process durable write");
+        self.session.write_with_id(chunk, write_id).await
+    }
+
     async fn signal(&self, signal: ProcessSignal) -> Result<(), crate::ExecServerError> {
         trace!("exec process signal");
         self.session.signal(signal).await
@@ -100,6 +109,14 @@ impl ExecProcess for RemoteExecProcess {
 
     fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
         Box::pin(RemoteExecProcess::write(self, chunk))
+    }
+
+    fn write_with_id(
+        &self,
+        chunk: Vec<u8>,
+        write_id: String,
+    ) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(RemoteExecProcess::write_with_id(self, chunk, write_id))
     }
 
     fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {

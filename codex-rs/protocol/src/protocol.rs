@@ -2701,9 +2701,12 @@ impl InitialHistory {
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::RemoteExecutionProtocolMarker(_)
                 | RolloutItem::RemoteExecutionLaunchIntent(_)
+                | RolloutItem::RemoteExecutionWriteRequest(_)
+                | RolloutItem::RemoteExecutionWriteIntent(_)
                 | RolloutItem::RemoteExecutionSessionPrepared(_)
                 | RolloutItem::RemoteExecutionSessionCommitted(_)
                 | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+                | RolloutItem::RemoteExecutionSessionReleased(_)
                 | RolloutItem::Compacted(_)
                 | RolloutItem::WorldState(_)
                 | RolloutItem::EventMsg(_) => None,
@@ -3042,9 +3045,12 @@ fn multi_agent_version_from_items(
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::RemoteExecutionProtocolMarker(_)
             | RolloutItem::RemoteExecutionLaunchIntent(_)
+            | RolloutItem::RemoteExecutionWriteRequest(_)
+            | RolloutItem::RemoteExecutionWriteIntent(_)
             | RolloutItem::RemoteExecutionSessionPrepared(_)
             | RolloutItem::RemoteExecutionSessionCommitted(_)
             | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+            | RolloutItem::RemoteExecutionSessionReleased(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::EventMsg(_) => None,
@@ -3233,6 +3239,13 @@ pub enum RolloutItem {
     /// Persistence-only authority proving the exact immutable parameters that
     /// were durably committed before a remote process launch.
     RemoteExecutionLaunchIntent(RemoteExecutionLaunchIntent),
+    /// Persistence-only replay parameters written before a nonempty
+    /// `write_stdin` can reach its remote side-effect barrier.
+    RemoteExecutionWriteRequest(RemoteExecutionWriteRequest),
+    /// Persistence-only authority proving a nonempty `write_stdin` call and
+    /// its exact background-session cursor were durable before remote input
+    /// delivery was attempted.
+    RemoteExecutionWriteIntent(RemoteExecutionWriteIntent),
     /// Inactive durable candidate for restoring a background execution.
     RemoteExecutionSessionPrepared(RemoteExecutionSessionPrepared),
     /// Active durable cursor/index for restoring a background execution.
@@ -3240,6 +3253,9 @@ pub enum RolloutItem {
     /// Persistence-only evidence that a terminal remote descriptor was
     /// successfully acknowledged after its local receipt commit became durable.
     RemoteExecutionSessionAcknowledged(RemoteExecutionSessionAcknowledged),
+    /// Persistence-only evidence that the exact proof-bound acknowledgement
+    /// tombstone was deleted after acknowledgement became durable locally.
+    RemoteExecutionSessionReleased(RemoteExecutionSessionAcknowledged),
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
@@ -3253,6 +3269,11 @@ pub struct RemoteExecutionProtocolMarker {
     pub protocol_version: u32,
     pub identity_schema: String,
     pub descriptor_before_go: bool,
+    /// Build-121+ turns set this to prove that a missing write intent means
+    /// nonempty stdin was never sent. Older durable-v2 turns deserialize this
+    /// as false and retain conservative delivery-unknown recovery.
+    #[serde(default)]
+    pub stdin_intent_before_write: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -3267,10 +3288,49 @@ pub struct RemoteExecutionLaunchIntent {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+pub struct RemoteExecutionWriteRequest {
+    pub thread_id: String,
+    pub exec_turn_id: String,
+    pub exec_call_id: String,
+    pub receipt_turn_id: String,
+    pub receipt_call_id: String,
+    pub attempt_generation: u32,
+    pub session_id: i32,
+    pub command_digest: String,
+    pub committed_output_cursor: u64,
+    pub input_sha256: String,
+    pub input_len: u64,
+    pub yield_time_ms: u64,
+    pub max_output_tokens: Option<usize>,
+    pub truncation_policy: TruncationPolicy,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+pub struct RemoteExecutionWriteIntent {
+    pub thread_id: String,
+    pub exec_turn_id: String,
+    pub exec_call_id: String,
+    pub receipt_turn_id: String,
+    pub receipt_call_id: String,
+    pub attempt_generation: u32,
+    pub session_id: i32,
+    pub command_digest: String,
+    pub committed_output_cursor: u64,
+    /// Caller-stable idempotency key that is persisted before any remote
+    /// input side effect and reused across RPC/server recovery.
+    pub write_id: String,
+    /// SHA-256 and byte length bind the intent to the persisted function-call
+    /// arguments without copying sensitive stdin into persistence metadata.
+    pub input_sha256: String,
+    pub input_len: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteExecutionReceiptKind {
     InitialExec,
     EmptyPoll,
+    NonemptyWrite,
     DeliveryUnknownWrite,
 }
 

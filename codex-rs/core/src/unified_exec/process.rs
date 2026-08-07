@@ -151,7 +151,11 @@ impl UnifiedExecProcess {
         }
     }
 
-    pub(super) async fn write(&self, data: &[u8]) -> Result<(), UnifiedExecError> {
+    pub(super) async fn write(
+        &self,
+        data: &[u8],
+        durable_write_id: Option<&str>,
+    ) -> Result<(), UnifiedExecError> {
         match &self.process_handle {
             ProcessHandle::Local(process_handle) => process_handle
                 .writer_sender()
@@ -159,7 +163,14 @@ impl UnifiedExecProcess {
                 .await
                 .map_err(|_| UnifiedExecError::WriteToStdin),
             ProcessHandle::ExecServer(process_handle) => {
-                match process_handle.write(data.to_vec()).await {
+                let response = if let Some(write_id) = durable_write_id {
+                    process_handle
+                        .write_with_id(data.to_vec(), write_id.to_string())
+                        .await
+                } else {
+                    process_handle.write(data.to_vec()).await
+                };
+                match response {
                     Ok(response) => match response.status {
                         WriteStatus::Accepted => Ok(()),
                         WriteStatus::UnknownProcess | WriteStatus::StdinClosed => {

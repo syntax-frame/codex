@@ -74,9 +74,12 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::RemoteExecutionProtocolMarker(_)
         | RolloutItem::RemoteExecutionLaunchIntent(_)
+        | RolloutItem::RemoteExecutionWriteRequest(_)
+        | RolloutItem::RemoteExecutionWriteIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
-        | RolloutItem::RemoteExecutionSessionAcknowledged(_) => false,
+        | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+        | RolloutItem::RemoteExecutionSessionReleased(_) => false,
         // Full-history forks preserve the cached prompt prefix and can keep diffing
         // from the parent's durable baseline. Truncated forks drop part of that prompt,
         // so they must rebuild context on their first child turn.

@@ -6,6 +6,7 @@ use pretty_assertions::assert_eq;
 use super::MonitorExitClassification;
 use super::TmuxProcessDescriptor;
 use super::acknowledgement_command;
+use super::acknowledgement_release_command;
 use super::exact_reconciliation_command;
 use super::parse_monitor_exit_classification;
 use super::parse_recovered_executions;
@@ -289,6 +290,105 @@ fn bootstrap_serializes_and_publishes_running_before_releasing_fast_command() {
 }
 
 #[test]
+fn durable_stdin_claim_precedes_delivery_and_result_follows_it() {
+    let descriptor =
+        TmuxProcessDescriptor::new("agent", "controller", &exec_params("process", "read value"));
+    let command = descriptor.durable_write_command(b"hello\n", "durable-write");
+    let claim = command
+        .find("ln \"$claim_candidate\" \"$claim\"")
+        .expect("durable remote write claim");
+    let delivery = command
+        .find("cat \"$data_candidate\" > \"$root/stdin\"")
+        .expect("stdin side effect");
+    let result = command
+        .find("mv \"$result_candidate\" \"$result\"")
+        .expect("durable remote write result");
+    assert!(claim < delivery);
+    assert!(delivery < result);
+    assert!(command[claim..delivery].contains("rm -f \"$claim_candidate\""));
+    assert!(!command[claim..result].contains("rm -f \"$claim\""));
+    assert!(command.contains("AGENTAPP_TMUX_STDIN_DELIVERY_UNKNOWN"));
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_stdin_replay_returns_the_persisted_result_without_redelivery() {
+    let input = b"hello durable stdin\n";
+    let (home, root, descriptor) = durable_write_fixture();
+    let fifo = root.join("stdin");
+    let fifo_for_reader = fifo;
+    let reader = std::thread::spawn(move || std::fs::read(fifo_for_reader).expect("read fifo"));
+    let command = descriptor.durable_write_command(input, "write-call-1");
+    let first = run_durable_write_command(&home, &command, input);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(reader.join().expect("join fifo reader"), input);
+
+    let replay = run_durable_write_command(&home, &command, input);
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(
+        std::fs::read_dir(&root)
+            .expect("descriptor entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("stdin-write-"))
+            })
+            .count(),
+        2
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_stdin_rpc_loss_after_delivery_fails_closed_without_redelivery() {
+    let input = b"deliver only once\n";
+    let (home, root, descriptor) = durable_write_fixture();
+    let fifo_for_reader = root.join("stdin");
+    let reader = std::thread::spawn(move || std::fs::read(fifo_for_reader).expect("read fifo"));
+    let command = descriptor
+        .durable_write_command(input, "write-call-cutpoint")
+        .replacen(
+            "cat \"$data_candidate\" > \"$root/stdin\"\n",
+            "cat \"$data_candidate\" > \"$root/stdin\"\nkill -KILL $$\n",
+            1,
+        );
+    let interrupted = run_durable_write_command(&home, &command, input);
+    assert!(!interrupted.status.success());
+    assert_eq!(reader.join().expect("join fifo reader"), input);
+
+    let retry = run_durable_write_command(
+        &home,
+        &descriptor.durable_write_command(input, "write-call-cutpoint"),
+        input,
+    );
+    assert!(!retry.status.success());
+    assert!(
+        String::from_utf8_lossy(&retry.stderr).contains("AGENTAPP_TMUX_STDIN_DELIVERY_UNKNOWN")
+    );
+    assert!(
+        std::fs::read_dir(&root)
+            .expect("descriptor entries")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".claim"))
+            })
+    );
+}
+
+#[test]
 fn inert_legacy_descriptor_is_quarantined_but_live_window_is_refused() {
     let params = exec_params("process", "sleep 30");
     let descriptor = TmuxProcessDescriptor::new("agent", "1720000000000-controller", &params);
@@ -346,7 +446,7 @@ fn reconciliation_queries_only_explicit_identity_paths() {
         command
             .matches("windows=$(LC_ALL=C tmux list-windows")
             .count(),
-        2
+        4
     );
     assert!(
         command
@@ -516,6 +616,12 @@ fn absent_or_malformed_process_identity_never_verifies_terminal_death() {
         assert!(
             output.status.success(),
             "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "reconciliation control commands must not emit stderr because SSH \
+             transports merge it with the protocol reply: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         let recovered =
@@ -889,6 +995,27 @@ fn acknowledgement_resolves_one_descriptor_without_scanning() {
         .rfind("agentapp_cleanup_ack_tombstone")
         .expect("idempotent tombstone cleanup");
     assert!(rename < destructive_cleanup);
+
+    let final_proof = command
+        .rfind("agentapp_ack_terminal_proof")
+        .expect("final proof before claim");
+    let watchdog_retirement = command
+        .rfind("tmux kill-window")
+        .expect("watchdog retirement before claim");
+    let preflight = command
+        .rfind("agentapp_ack_preflight_root")
+        .expect("descriptor preflight before claim");
+    let claim = command
+        .find("ln \"$transition_candidate\" \"$root/transition-claim\"")
+        .expect("atomic acknowledgement claim");
+    assert!(final_proof < watchdog_retirement);
+    assert!(watchdog_retirement < preflight);
+    assert!(preflight < claim);
+    let claimed_transaction = &command[claim..rename];
+    assert!(!claimed_transaction.contains("agentapp_ack_terminal_proof"));
+    assert!(!claimed_transaction.contains("agentapp_ack_windows"));
+    assert!(!claimed_transaction.contains("agentapp_ack_preflight_root"));
+    assert!(!claimed_transaction.contains("tmux "));
 }
 
 #[cfg(unix)]
@@ -946,6 +1073,151 @@ fn acknowledgement_recovers_dead_stale_claim_and_replays_from_tombstone() {
     assert!(
         String::from_utf8_lossy(&conflicting_replay.stderr).contains("AGENTAPP_TMUX_ACK_UNKNOWN")
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn acknowledgement_signal_traps_release_the_exact_live_claim() {
+    use std::fs;
+
+    let token = "0123456789abcdef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (home, root, path) = terminal_acknowledgement_fixture(token);
+    let acknowledgement = terminal_acknowledgement(token.to_string());
+    let command = acknowledgement_command("agent", &acknowledgement).replacen(
+        "trap 'interrupt_ack_claim 143' TERM\n",
+        "trap 'interrupt_ack_claim 143' TERM\nkill -TERM $$\n",
+        1,
+    );
+    let interrupted = run_acknowledgement_command(&home, &path, command);
+    assert!(!interrupted.status.success());
+    assert!(root.exists());
+    assert!(!root.join("transition-claim").exists());
+
+    let replay = run_acknowledgement(&home, &path, &acknowledgement);
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(!root.exists());
+    let tombstones = fs::read_dir(root.parent().expect("descriptor base"))
+        .expect("read descriptor base")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".acknowledged-"))
+        })
+        .count();
+    assert_eq!(tombstones, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn acknowledgement_untrappable_loss_is_quarantined_and_retried() {
+    let token = "0123456789abcdef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (home, root, path) = terminal_acknowledgement_fixture(token);
+    let acknowledgement = terminal_acknowledgement(token.to_string());
+    let command = acknowledgement_command("agent", &acknowledgement).replacen(
+        "trap 'interrupt_ack_claim 143' TERM\n",
+        "trap 'interrupt_ack_claim 143' TERM\nkill -KILL $$\n",
+        1,
+    );
+    let interrupted = run_acknowledgement_command(&home, &path, command);
+    assert!(!interrupted.status.success());
+    assert!(root.join("transition-claim").exists());
+
+    let replay = run_acknowledgement(&home, &path, &acknowledgement);
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(!root.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn acknowledgement_release_deletes_only_the_exact_empty_proof_tombstone() {
+    use std::fs;
+
+    let token = "0123456789abcdef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (home, root, path) = terminal_acknowledgement_fixture(token);
+    let acknowledgement = terminal_acknowledgement(token.to_string());
+    let acknowledged = run_acknowledgement(&home, &path, &acknowledgement);
+    assert!(
+        acknowledged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&acknowledged.stderr)
+    );
+    let base = root.parent().expect("agent descriptor base");
+    let tombstone = fs::read_dir(base)
+        .expect("read descriptor base")
+        .map(|entry| entry.expect("descriptor entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".acknowledged-0123456789abcdef-"))
+        })
+        .expect("proof-bound tombstone");
+
+    let released = run_acknowledgement_release(&home, &path, &acknowledgement);
+    assert!(
+        released.status.success(),
+        "{}",
+        String::from_utf8_lossy(&released.stderr)
+    );
+    assert!(!tombstone.exists());
+
+    let replay = run_acknowledgement_release(&home, &path, &acknowledgement);
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn acknowledgement_release_rejects_live_roots_and_unexpected_tombstone_contents() {
+    use std::fs;
+
+    let token = "0123456789abcdef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (home, root, path) = terminal_acknowledgement_fixture(token);
+    let acknowledgement = terminal_acknowledgement(token.to_string());
+    assert!(
+        run_acknowledgement(&home, &path, &acknowledgement)
+            .status
+            .success()
+    );
+    let base = root.parent().expect("agent descriptor base");
+    let tombstone = fs::read_dir(base)
+        .expect("read descriptor base")
+        .map(|entry| entry.expect("descriptor entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".acknowledged-0123456789abcdef-"))
+        })
+        .expect("proof-bound tombstone");
+    fs::write(tombstone.join("unexpected"), "do not delete").expect("unexpected entry");
+    let unexpected = run_acknowledgement_release(&home, &path, &acknowledgement);
+    assert!(!unexpected.status.success());
+    assert!(
+        String::from_utf8_lossy(&unexpected.stderr)
+            .contains("AGENTAPP_TMUX_RELEASE_UNEXPECTED_ENTRY")
+    );
+    assert!(tombstone.join("unexpected").exists());
+
+    fs::remove_file(tombstone.join("unexpected")).expect("remove test entry");
+    fs::create_dir(&root).expect("simulate conflicting live descriptor root");
+    let live = run_acknowledgement_release(&home, &path, &acknowledgement);
+    assert!(!live.status.success());
+    assert!(
+        String::from_utf8_lossy(&live.stderr).contains("AGENTAPP_TMUX_RELEASE_LIVE_ROOT_PRESENT")
+    );
+    assert!(tombstone.exists());
 }
 
 #[cfg(unix)]
@@ -1382,11 +1654,98 @@ fn run_acknowledgement(
     path: &str,
     acknowledgement: &RecoveredExecutionAcknowledgement,
 ) -> std::process::Output {
+    run_acknowledgement_command(
+        home,
+        path,
+        acknowledgement_command("agent", acknowledgement),
+    )
+}
+
+#[cfg(unix)]
+fn run_acknowledgement_command(
+    home: &tempfile::TempDir,
+    path: &str,
+    command: String,
+) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+
+    let mut child = std::process::Command::new("/bin/sh");
+    child
+        .arg("-c")
+        .arg(command)
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .process_group(0);
+    child.output().expect("run acknowledgement")
+}
+
+#[cfg(unix)]
+fn run_acknowledgement_release(
+    home: &tempfile::TempDir,
+    path: &str,
+    acknowledgement: &RecoveredExecutionAcknowledgement,
+) -> std::process::Output {
     std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg(acknowledgement_command("agent", acknowledgement))
+        .arg(acknowledgement_release_command("agent", acknowledgement))
         .env("HOME", home.path())
         .env("PATH", path)
         .output()
-        .expect("run acknowledgement")
+        .expect("run acknowledgement release")
+}
+
+#[cfg(unix)]
+fn durable_write_fixture() -> (tempfile::TempDir, std::path::PathBuf, TmuxProcessDescriptor) {
+    use std::fs;
+
+    let home = tempfile::tempdir().expect("temp home");
+    let descriptor =
+        TmuxProcessDescriptor::new("agent", "controller", &exec_params("process", "read value"));
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&descriptor.agent_id)
+        .join(&descriptor.process_id);
+    fs::create_dir_all(&root).expect("descriptor root");
+    for (name, value) in [
+        ("owner", "agentapp-tmux-v2"),
+        ("controller", descriptor.controller_id.as_str()),
+        ("digest", descriptor.command_digest.as_str()),
+    ] {
+        fs::write(root.join(name), value).expect("descriptor authority");
+    }
+    let fifo = root.join("stdin");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("create stdin fifo");
+    assert!(status.success());
+    (home, root, descriptor)
+}
+
+#[cfg(unix)]
+fn run_durable_write_command(
+    home: &tempfile::TempDir,
+    command: &str,
+    input: &[u8],
+) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run durable stdin command");
+    child
+        .stdin
+        .take()
+        .expect("durable stdin pipe")
+        .write_all(input)
+        .expect("send durable stdin bytes");
+    child.wait_with_output().expect("wait for durable stdin")
 }

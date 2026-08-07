@@ -390,6 +390,20 @@ impl ExecBackend for SshProcessBackend {
             }
         })
     }
+
+    fn release_acknowledged(
+        &self,
+        acknowledgement: crate::RecoveredExecutionAcknowledgement,
+    ) -> crate::process::ExecBackendAcknowledgeFuture<'_> {
+        Box::pin(async move {
+            match self.tmux_mode {
+                SshTmuxMode::Required | SshTmuxMode::Preferred => {
+                    tmux::release_acknowledged(self, &acknowledgement).await
+                }
+                SshTmuxMode::Disabled => Ok(()),
+            }
+        })
+    }
 }
 
 /// Build the remote command line, honoring cwd and env from [`ExecParams`].
@@ -480,6 +494,7 @@ struct RetainedChunk {
 enum ChannelCommand {
     Write {
         data: Vec<u8>,
+        write_id: Option<String>,
         ack: oneshot::Sender<Result<(), String>>,
     },
     Signal(Sig),
@@ -569,6 +584,14 @@ impl ExecProcessImpl for SshProcess {
     }
 
     async fn write(&self, chunk: Vec<u8>) -> Result<WriteResponse, ExecServerError> {
+        ExecProcessImpl::write_with_id(self, chunk, None).await
+    }
+
+    async fn write_with_id(
+        &self,
+        chunk: Vec<u8>,
+        write_id: Option<String>,
+    ) -> Result<WriteResponse, ExecServerError> {
         // stdin is only writable when a tty or pipe is connected. SSH always
         // gives us a writable channel here, but reflect the closed-stream case.
         {
@@ -585,6 +608,7 @@ impl ExecProcessImpl for SshProcess {
             .cmd_tx
             .send(ChannelCommand::Write {
                 data: chunk,
+                write_id,
                 ack: ack_tx,
             })
             .await
@@ -623,6 +647,7 @@ impl ExecProcessImpl for SshProcess {
                 .cmd_tx
                 .send(ChannelCommand::Write {
                     data: vec![0x03],
+                    write_id: None,
                     ack: ack_tx,
                 })
                 .await;
@@ -670,6 +695,11 @@ trait ExecProcessImpl: Send + Sync {
         wait_ms: Option<u64>,
     ) -> Result<ReadResponse, ExecServerError>;
     async fn write(&self, chunk: Vec<u8>) -> Result<WriteResponse, ExecServerError>;
+    async fn write_with_id(
+        &self,
+        chunk: Vec<u8>,
+        write_id: Option<String>,
+    ) -> Result<WriteResponse, ExecServerError>;
     async fn signal(&self, signal: ProcessSignal) -> Result<(), ExecServerError>;
     async fn terminate(&self) -> Result<(), ExecServerError>;
 }
@@ -698,6 +728,14 @@ impl ExecProcess for SshProcess {
 
     fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
         Box::pin(ExecProcessImpl::write(self, chunk))
+    }
+
+    fn write_with_id(
+        &self,
+        chunk: Vec<u8>,
+        write_id: String,
+    ) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(ExecProcessImpl::write_with_id(self, chunk, Some(write_id)))
     }
 
     fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
@@ -758,7 +796,11 @@ async fn channel_pump(
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(ChannelCommand::Write { data, ack }) => {
+                    Some(ChannelCommand::Write {
+                        data,
+                        write_id: _,
+                        ack,
+                    }) => {
                         let result = channel
                             .channel()
                             .data(&data[..])

@@ -1737,6 +1737,116 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_missing_previous_response_reconnects_with_full_context() {
+    skip_if_no_network!();
+
+    let previous_response_not_found = json!({
+        "type": "error",
+        "status": 400,
+        "error": {
+            "type": "invalid_request_error",
+            "code": "previous_response_not_found",
+            "message": "Previous response with id 'resp-1' not found.",
+            "param": "previous_response_id"
+        }
+    });
+
+    let server = start_websocket_server(vec![
+        vec![
+            vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg_1", "first response"),
+                ev_completed("resp-1"),
+            ],
+            vec![previous_response_not_found],
+        ],
+        vec![vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg_2", "second response"),
+            ev_completed("resp-2"),
+        ]],
+    ])
+    .await;
+    let harness = websocket_harness(&server).await;
+    let mut client_session = harness.client.new_session();
+    let prompt_one = prompt_with_input(vec![message_item("first")]);
+    let prompt_two = prompt_with_input(vec![
+        message_item("first"),
+        assistant_message_item("1", "first response"),
+        message_item("second"),
+    ]);
+
+    stream_until_complete(&mut client_session, &harness, &prompt_one).await;
+
+    let responses_metadata = turn_metadata(&harness, /*turn_id*/ None);
+    let mut failed_stream = client_session
+        .stream(
+            &prompt_two,
+            &harness.model_info,
+            &harness.session_telemetry,
+            harness.effort.clone(),
+            harness.summary,
+            /*service_tier*/ None,
+            &responses_metadata,
+            &codex_rollout_trace::InferenceTraceContext::disabled(),
+        )
+        .await
+        .expect("incremental websocket request should start");
+    let mut saw_retryable_error = false;
+    while let Some(event) = failed_stream.next().await {
+        match event {
+            Err(error) => {
+                assert!(error.is_retryable(), "unexpected websocket error: {error}");
+                saw_retryable_error = true;
+                break;
+            }
+            Ok(ResponseEvent::Completed { .. }) => {
+                panic!("missing previous response unexpectedly completed")
+            }
+            Ok(_) => {}
+        }
+    }
+    assert!(
+        saw_retryable_error,
+        "expected missing previous response to request a retry"
+    );
+
+    // The production retry loop applies a backoff before trying again. Give
+    // the test server's close handshake the same opportunity to become
+    // visible so the client opens a fresh connection and drops incremental
+    // request state.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stream_until_complete(&mut client_session, &harness, &prompt_two).await;
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    let first_connection = connections.first().expect("missing first connection");
+    assert_eq!(first_connection.len(), 2);
+    let failed_incremental = first_connection
+        .get(1)
+        .expect("missing failed incremental request")
+        .body_json();
+    let replay = connections
+        .get(1)
+        .and_then(|connection| connection.first())
+        .expect("missing full-context replay")
+        .body_json();
+
+    assert_eq!(
+        failed_incremental["previous_response_id"].as_str(),
+        Some("resp-1")
+    );
+    assert_eq!(
+        failed_incremental["input"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(replay.get("previous_response_id"), None);
+    assert_eq!(replay["input"].as_array().map(Vec::len), Some(3));
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_uses_incremental_create_on_prefix() {
     skip_if_no_network!();
 

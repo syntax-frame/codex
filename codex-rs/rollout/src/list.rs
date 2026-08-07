@@ -1176,9 +1176,12 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             RolloutItem::InterAgentCommunicationMetadata { .. } => {}
             RolloutItem::RemoteExecutionProtocolMarker(_)
             | RolloutItem::RemoteExecutionLaunchIntent(_)
+            | RolloutItem::RemoteExecutionWriteRequest(_)
+            | RolloutItem::RemoteExecutionWriteIntent(_)
             | RolloutItem::RemoteExecutionSessionPrepared(_)
             | RolloutItem::RemoteExecutionSessionCommitted(_)
-            | RolloutItem::RemoteExecutionSessionAcknowledged(_) => {}
+            | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+            | RolloutItem::RemoteExecutionSessionReleased(_) => {}
             RolloutItem::TurnContext(_) => {
                 // Not included in `head`; skip.
             }
@@ -1254,9 +1257,12 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                 RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::RemoteExecutionProtocolMarker(_)
                 | RolloutItem::RemoteExecutionLaunchIntent(_)
+                | RolloutItem::RemoteExecutionWriteRequest(_)
+                | RolloutItem::RemoteExecutionWriteIntent(_)
                 | RolloutItem::RemoteExecutionSessionPrepared(_)
                 | RolloutItem::RemoteExecutionSessionCommitted(_)
                 | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+                | RolloutItem::RemoteExecutionSessionReleased(_)
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
@@ -1311,9 +1317,12 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
             RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::RemoteExecutionProtocolMarker(_)
             | RolloutItem::RemoteExecutionLaunchIntent(_)
+            | RolloutItem::RemoteExecutionWriteRequest(_)
+            | RolloutItem::RemoteExecutionWriteIntent(_)
             | RolloutItem::RemoteExecutionSessionPrepared(_)
             | RolloutItem::RemoteExecutionSessionCommitted(_)
             | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+            | RolloutItem::RemoteExecutionSessionReleased(_)
             | RolloutItem::Compacted(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)

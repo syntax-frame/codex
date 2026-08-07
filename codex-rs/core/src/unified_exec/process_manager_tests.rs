@@ -23,6 +23,143 @@ fn remote_launch_intent_is_durable_before_prepared_backend_start() {
     assert!(persist < launch);
     assert!(!method[persist..launch].contains("exec_server_params_for_request"));
 }
+
+#[test]
+fn remote_stdin_intent_precedes_tty_input_and_non_tty_interrupts() {
+    let source = include_str!("process_manager.rs");
+    let method = source
+        .split("pub(crate) async fn write_stdin")
+        .nth(1)
+        .expect("write_stdin method")
+        .split("async fn refresh_process_state")
+        .next()
+        .expect("write_stdin body");
+    let lock = method
+        .find("interaction_lock().lock_owned().await")
+        .expect("per-process interaction lock");
+    let persist = method
+        .find("persist_remote_execution_write_intent")
+        .expect("durable stdin intent");
+    let interrupt = method.find("process.interrupt().await").expect("interrupt");
+    let write = method
+        .find(".write(request.input.as_bytes(), durable_write_id.as_deref())")
+        .expect("stdin write");
+    assert!(lock < persist);
+    assert!(persist < interrupt);
+    assert!(persist < write);
+}
+
+#[tokio::test]
+async fn terminal_background_restore_replays_from_latest_committed_cursor() {
+    let (session, _turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let recovered = codex_exec_server::RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: session.thread_id.to_string(),
+            turn_id: "exec-turn".to_string(),
+            call_id: "exec-call".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: Some("digest".to_string()),
+        output: b"alreadynew".to_vec(),
+        status: codex_exec_server::RecoveredExecutionStatus::Exited(17),
+        terminal_verified_dead: true,
+        session_id: Some(41),
+        committed_output_cursor: 10,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "acknowledgement".to_string(),
+        ),
+    };
+    session
+        .services
+        .unified_exec_manager
+        .restore_terminal_background_process(
+            &recovered,
+            7,
+            &session,
+            "exec-call".to_string(),
+            PathUri::parse("file:///tmp").expect("cwd"),
+            "command".to_string(),
+            /*tty*/ false,
+        )
+        .await
+        .expect("restore terminal process");
+
+    let response = session
+        .services
+        .unified_exec_manager
+        .write_stdin(WriteStdinRequest {
+            process_id: 41,
+            input: "",
+            yield_time_ms: crate::unified_exec::MIN_YIELD_TIME_MS,
+            max_output_tokens: None,
+            truncation_policy: codex_protocol::protocol::TruncationPolicy::Bytes(1_024),
+            interaction_event: None,
+        })
+        .await
+        .expect("poll restored terminal process");
+
+    assert_eq!(response.raw_output, b"new");
+    assert_eq!(response.exit_code, Some(17));
+    assert_eq!(response.process_id, None);
+}
+
+#[tokio::test]
+async fn terminal_background_restore_accepts_an_exact_zero_byte_suffix() {
+    let (session, _turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let recovered = codex_exec_server::RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: session.thread_id.to_string(),
+            turn_id: "exec-turn-empty".to_string(),
+            call_id: "exec-call-empty".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: Some("digest-empty".to_string()),
+        output: b"already".to_vec(),
+        status: codex_exec_server::RecoveredExecutionStatus::Exited(0),
+        terminal_verified_dead: true,
+        session_id: Some(42),
+        committed_output_cursor: 7,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "acknowledgement-empty".to_string(),
+        ),
+    };
+    session
+        .services
+        .unified_exec_manager
+        .restore_terminal_background_process(
+            &recovered,
+            7,
+            &session,
+            "exec-call-empty".to_string(),
+            PathUri::parse("file:///tmp").expect("cwd"),
+            "command".to_string(),
+            /*tty*/ false,
+        )
+        .await
+        .expect("restore terminal process with no uncommitted suffix");
+
+    let response = session
+        .services
+        .unified_exec_manager
+        .write_stdin(WriteStdinRequest {
+            process_id: 42,
+            input: "",
+            yield_time_ms: crate::unified_exec::MIN_YIELD_TIME_MS,
+            max_output_tokens: None,
+            truncation_policy: codex_protocol::protocol::TruncationPolicy::Bytes(1_024),
+            interaction_event: None,
+        })
+        .await
+        .expect("poll restored zero-suffix process");
+
+    assert!(response.raw_output.is_empty());
+    assert_eq!(response.exit_code, Some(0));
+    assert_eq!(response.process_id, None);
+}
 use crate::unified_exec::clamp_yield_time;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use pretty_assertions::assert_eq;

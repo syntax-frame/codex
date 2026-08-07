@@ -108,6 +108,31 @@ pub(super) async fn acknowledge_consumed(
     }
 }
 
+pub(super) async fn release_acknowledged(
+    backend: &SshProcessBackend,
+    acknowledgement: &RecoveredExecutionAcknowledgement,
+) -> Result<(), ExecServerError> {
+    if acknowledgement.terminal_proof().is_none() {
+        return Err(ExecServerError::Protocol(
+            "ssh tmux acknowledgement release requires terminal proof".to_string(),
+        ));
+    }
+    let command = acknowledgement_release_command(backend.session_key(), acknowledgement);
+    let result = backend
+        .transport()
+        .exec_control(&with_remote_path(&command), None)
+        .await?;
+    if result.exit_code == 0 {
+        Ok(())
+    } else {
+        Err(ExecServerError::Protocol(format!(
+            "ssh tmux acknowledgement release failed with exit {}: {}",
+            result.exit_code,
+            String::from_utf8_lossy(&result.output).trim()
+        )))
+    }
+}
+
 pub(super) async fn start(
     backend: SshProcessBackend,
     params: ExecParams,
@@ -383,9 +408,13 @@ async fn monitor_pump(
                 }
                 command = cmd_rx.recv(), if commands_open => {
                     match command {
-                        Some(ChannelCommand::Write { data, ack }) => {
+                        Some(ChannelCommand::Write {
+                            data,
+                            write_id,
+                            ack,
+                        }) => {
                             let result = descriptor
-                                .write(backend.transport(), &data)
+                                .write(backend.transport(), &data, write_id.as_deref())
                                 .await
                                 .map_err(|error| error.to_string());
                             let _ = ack.send(result);
@@ -535,6 +564,7 @@ fn parse_monitor_exit_classification(
 }
 
 impl TmuxProcessDescriptor {
+    #[cfg(test)]
     fn new(agent_key: &str, controller_id: &str, params: &ExecParams) -> Self {
         Self::new_with_digest(
             agent_key,
@@ -1021,8 +1051,11 @@ impl TmuxProcessDescriptor {
         &self,
         transport: &crate::ssh_transport::SshTransport,
         data: &[u8],
+        write_id: Option<&str>,
     ) -> Result<(), ExecServerError> {
-        let command = if self.tty {
+        let command = if let Some(write_id) = write_id {
+            self.durable_write_command(data, write_id)
+        } else if self.tty {
             let buffer = format!("agentapp_{}", self.process_id);
             format!(
                 "{}; tmux load-buffer -b {} - && tmux paste-buffer -d -b {} -t {}",
@@ -1050,6 +1083,89 @@ impl TmuxProcessDescriptor {
                 String::from_utf8_lossy(&result.output).trim()
             )))
         }
+    }
+
+    fn durable_write_command(&self, data: &[u8], write_id: &str) -> String {
+        let root = self.remote_directory();
+        let write_key = format!(
+            "{:x}",
+            Sha256::digest(format!("agentapp-tmux-stdin-v2\0{write_id}").as_bytes())
+        );
+        let input_sha256 = format!("{:x}", Sha256::digest(data));
+        let input_len = data.len();
+        let delivery = if self.tty {
+            let buffer = format!("agentapp_{}_{}", self.process_id, write_key);
+            format!(
+                "tmux load-buffer -b {buffer} \"$data_candidate\" && tmux paste-buffer -d -b {buffer} -t {target}",
+                buffer = shell_quote(&buffer),
+                target = shell_quote(&self.target()),
+            )
+        } else {
+            "cat \"$data_candidate\" > \"$root/stdin\"".to_string()
+        };
+        format!(
+            concat!(
+                "set -eu\n",
+                "root=\"{root}\"\n",
+                "{ownership_guard}\n",
+                "write_key={write_key}\n",
+                "expected_input_sha256={input_sha256}\n",
+                "expected_input_len={input_len}\n",
+                "claim=\"$root/stdin-write-$write_key.claim\"\n",
+                "result=\"$root/stdin-write-$write_key.result\"\n",
+                "data_candidate=\"$root/.stdin-write-data.$write_key.$$\"\n",
+                "claim_candidate=\"$root/.stdin-write-claim.$write_key.$$\"\n",
+                "result_candidate=\"$root/.stdin-write-result.$write_key.$$\"\n",
+                "cleanup_write_candidates() {{ rm -f \"$data_candidate\" \"$claim_candidate\" \"$result_candidate\"; }}\n",
+                "interrupt_write() {{ signal_status=$1; trap - EXIT HUP INT TERM; cleanup_write_candidates; exit \"$signal_status\"; }}\n",
+                "trap 'cleanup_write_candidates' EXIT\n",
+                "trap 'interrupt_write 129' HUP\n",
+                "trap 'interrupt_write 130' INT\n",
+                "trap 'interrupt_write 143' TERM\n",
+                "( umask 077; set -C; cat > \"$data_candidate\" ) || {{ echo AGENTAPP_TMUX_STDIN_DATA_CONFLICT >&2; exit 78; }}\n",
+                "observed_input_len=$(wc -c < \"$data_candidate\" 2>/dev/null || printf '0'); observed_input_len=$(printf '%s' \"$observed_input_len\" | tr -d ' ')\n",
+                "[ \"$observed_input_len\" -eq \"$expected_input_len\" ] || {{ echo AGENTAPP_TMUX_STDIN_LENGTH_CONFLICT >&2; exit 78; }}\n",
+                "if command -v shasum >/dev/null 2>&1; then observed_input_sha256=$(shasum -a 256 \"$data_candidate\" | awk '{{print $1}}'); elif command -v sha256sum >/dev/null 2>&1; then observed_input_sha256=$(sha256sum \"$data_candidate\" | awk '{{print $1}}'); else echo AGENTAPP_TMUX_STDIN_SHA256_UNAVAILABLE >&2; exit 77; fi\n",
+                "[ \"$observed_input_sha256\" = \"$expected_input_sha256\" ] || {{ echo AGENTAPP_TMUX_STDIN_DIGEST_CONFLICT >&2; exit 78; }}\n",
+                "expected_claim=\"pending $expected_input_sha256 $expected_input_len\"\n",
+                "expected_result=\"accepted $expected_input_sha256 $expected_input_len\"\n",
+                "if [ -e \"$result\" ]; then\n",
+                "  [ -f \"$result\" ] && [ ! -L \"$result\" ] && [ \"$(cat \"$result\" 2>/dev/null || true)\" = \"$expected_result\" ] || {{ echo AGENTAPP_TMUX_STDIN_RESULT_CONFLICT >&2; exit 78; }}\n",
+                "  [ -f \"$claim\" ] && [ ! -L \"$claim\" ] && [ \"$(cat \"$claim\" 2>/dev/null || true)\" = \"$expected_claim\" ] || {{ echo AGENTAPP_TMUX_STDIN_CLAIM_CONFLICT >&2; exit 78; }}\n",
+                "  exit 0\n",
+                "fi\n",
+                "if [ -e \"$claim\" ]; then\n",
+                "  [ -f \"$claim\" ] && [ ! -L \"$claim\" ] && [ \"$(cat \"$claim\" 2>/dev/null || true)\" = \"$expected_claim\" ] || {{ echo AGENTAPP_TMUX_STDIN_CLAIM_CONFLICT >&2; exit 78; }}\n",
+                "  echo AGENTAPP_TMUX_STDIN_DELIVERY_UNKNOWN >&2\n",
+                "  exit 75\n",
+                "fi\n",
+                "[ ! -f \"$root/status\" ] || {{ echo AGENTAPP_TMUX_STDIN_CLOSED >&2; exit 3; }}\n",
+                "( umask 077; set -C; printf '%s\\n' \"$expected_claim\" > \"$claim_candidate\" ) || {{ echo AGENTAPP_TMUX_STDIN_CLAIM_CONFLICT >&2; exit 78; }}\n",
+                "if ! ln \"$claim_candidate\" \"$claim\" 2>/dev/null; then\n",
+                "  if [ -e \"$result\" ] && [ \"$(cat \"$result\" 2>/dev/null || true)\" = \"$expected_result\" ]; then exit 0; fi\n",
+                "  if [ -e \"$claim\" ] && [ \"$(cat \"$claim\" 2>/dev/null || true)\" = \"$expected_claim\" ]; then echo AGENTAPP_TMUX_STDIN_DELIVERY_UNKNOWN >&2; exit 75; fi\n",
+                "  echo AGENTAPP_TMUX_STDIN_CLAIM_CONFLICT >&2\n",
+                "  exit 78\n",
+                "fi\n",
+                "rm -f \"$claim_candidate\"\n",
+                // The durable claim is never removed here. If this process is
+                // lost before its result rename, retries fail closed instead
+                // of delivering the same bytes a second time.
+                "{delivery}\n",
+                "( umask 077; set -C; printf '%s\\n' \"$expected_result\" > \"$result_candidate\" ) || {{ echo AGENTAPP_TMUX_STDIN_RESULT_CONFLICT >&2; exit 78; }}\n",
+                "[ ! -e \"$result\" ] || {{ echo AGENTAPP_TMUX_STDIN_RESULT_CONFLICT >&2; exit 78; }}\n",
+                "mv \"$result_candidate\" \"$result\"\n",
+                "trap - EXIT HUP INT TERM\n",
+                "cleanup_write_candidates\n",
+                "exit 0\n"
+            ),
+            root = root,
+            ownership_guard = self.ownership_guard(),
+            write_key = shell_quote(&write_key),
+            input_sha256 = shell_quote(&input_sha256),
+            input_len = shell_quote(&input_len.to_string()),
+            delivery = delivery,
+        )
     }
 
     async fn interrupt(
@@ -1391,7 +1507,7 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
                 "  [ -r \"$root/output\" ] || {{ echo AGENTAPP_TMUX_RECONCILE_OUTPUT_UNREADABLE >&2; exit 77; }}\n",
                 "  snapshot_size=$(wc -c < \"$root/output\" 2>/dev/null || printf '0'); snapshot_size=$(printf '%s' \"$snapshot_size\" | tr -d ' ')\n",
                 "  [ \"$snapshot_size\" -ge \"$cursor\" ] || {{ echo AGENTAPP_TMUX_RECONCILE_OUTPUT_SHRANK >&2; exit 77; }}\n",
-                "  output=$(head -c \"$cursor\" \"$root/output\" | base64 | tr -d '\\n')\n",
+                "  if [ \"$cursor\" -eq 0 ]; then output=-; else output=$(head -c \"$cursor\" \"$root/output\" | base64 | tr -d '\\n'); fi\n",
                 "  printf 'AGENTAPP_RECOVERED %s %s %s %s %s %s %s %s %s %s %s %s %s\\n' {thread} {turn} {call} {attempt} \"$recovered\" \"$code\" \"$session_id\" \"$cursor\" \"$delivery_unknown\" \"$terminal_verified_dead\" \"$token\" \"$digest\" \"$output\"\n",
                 "fi\n"
             ),
@@ -1412,6 +1528,53 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
     command
 }
 
+fn acknowledgement_keys(acknowledgement: &RecoveredExecutionAcknowledgement) -> (String, String) {
+    let legacy_acknowledgement_key =
+        format!("{:x}", Sha256::digest(acknowledgement.as_str().as_bytes()));
+    let (range_start, range_end, output_sha256, state, exit_code) =
+        match acknowledgement.terminal_proof() {
+            Some(proof) => {
+                let (state, exit_code) = match proof.status {
+                    RecoveredExecutionStatus::Exited(exit_code) => {
+                        ("completed".to_string(), exit_code.to_string())
+                    }
+                    RecoveredExecutionStatus::Terminated => {
+                        ("terminated".to_string(), "143".to_string())
+                    }
+                    _ => ("-".to_string(), "-".to_string()),
+                };
+                (
+                    proof.range_start.to_string(),
+                    proof.range_end.to_string(),
+                    proof.output_sha256.clone(),
+                    state,
+                    exit_code,
+                )
+            }
+            None => (
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+            ),
+        };
+    let acknowledgement_key_material = format!(
+        "agentapp-tmux-ack-v2\0{}\0{}\0{}\0{}\0{}\0{}",
+        acknowledgement.as_str(),
+        range_start,
+        range_end,
+        output_sha256,
+        state,
+        exit_code
+    );
+    let acknowledgement_key = format!(
+        "{:x}",
+        Sha256::digest(acknowledgement_key_material.as_bytes())
+    );
+    (acknowledgement_key, legacy_acknowledgement_key)
+}
+
 fn acknowledgement_command(
     agent_key: &str,
     acknowledgement: &RecoveredExecutionAcknowledgement,
@@ -1422,8 +1585,6 @@ fn acknowledgement_command(
     // Core's exact durable Prepared/output/Commit chain, and atomically binds
     // it to the first full proof via `proof-key`. New tombstones are keyed by
     // the full domain-separated proof from their creation.
-    let legacy_acknowledgement_key =
-        format!("{:x}", Sha256::digest(acknowledgement.as_str().as_bytes()));
     let (
         expected_range_start,
         expected_range_end,
@@ -1457,22 +1618,11 @@ fn acknowledgement_command(
             "-".to_string(),
         ),
     };
-    let acknowledgement_key_material = format!(
-        "agentapp-tmux-ack-v2\0{}\0{}\0{}\0{}\0{}\0{}",
-        acknowledgement.as_str(),
-        expected_range_start,
-        expected_range_end,
-        expected_output_sha256,
-        expected_state,
-        expected_exit_code
-    );
-    let acknowledgement_key = format!(
-        "{:x}",
-        Sha256::digest(acknowledgement_key_material.as_bytes())
-    );
+    let (acknowledgement_key, legacy_acknowledgement_key) = acknowledgement_keys(acknowledgement);
     format!(
         concat!(
             "set -eu\n",
+            "setopt nonomatch 2>/dev/null || true\n",
             "base=\"$HOME/.agentapp/tmux/{agent_id}\"\n",
             "token={token}\n",
             "expected_range_start={expected_range_start}\n",
@@ -1504,7 +1654,7 @@ fn acknowledgement_command(
             "  for entry in \"$root\"/* \"$root\"/.[!.]* \"$root\"/..?*; do\n",
             "    [ -e \"$entry\" ] || continue\n",
             "    name=${{entry##*/}}\n",
-            "    case \"$name\" in command.sh|watchdog.sh|output|stdin|go|go.tmp|release|status|status.tmp|state|state.tmp|owner|identity|thread-id|turn-id|call-id|attempt-generation|session-id|tty|acknowledgement-token|digest|window|process-identity|process-identity.tmp|controller|controller.tmp|lease|lease.tmp|lease-generation|lease-generation.tmp|recovery-required|recovery-required.tmp|transition-claim|terminal-claim|.transition-candidate.*|transition-claim.quarantine.*) ;; proof-key|.proof-candidate.*) [ \"$root\" = \"$legacy_tombstone\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78; }} ;; *) echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78 ;; esac\n",
+            "    case \"$name\" in command.sh|watchdog.sh|output|stdin|go|go.tmp|release|status|status.tmp|state|state.tmp|owner|identity|thread-id|turn-id|call-id|attempt-generation|session-id|tty|acknowledgement-token|digest|window|process-identity|process-identity.tmp|controller|controller.tmp|lease|lease.tmp|lease-generation|lease-generation.tmp|recovery-required|recovery-required.tmp|transition-claim|terminal-claim|.transition-candidate.*|transition-claim.quarantine.*) ;; stdin-write-*.claim|stdin-write-*.result|.stdin-write-*) [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_STDIN_ENTRY >&2; exit 78; }} ;; proof-key|.proof-candidate.*) [ \"$root\" = \"$legacy_tombstone\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78; }} ;; *) echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78 ;; esac\n",
             "  done\n",
             "  if [ -d \"$root/terminal-claim\" ]; then\n",
             "    for terminal_entry in \"$root/terminal-claim\"/* \"$root/terminal-claim\"/.[!.]* \"$root/terminal-claim\"/..?*; do\n",
@@ -1525,6 +1675,7 @@ fn acknowledgement_command(
             "  rm -f \"$root\"/transition-claim.quarantine.*\n",
             "  rm -f \"$root/transition-claim\" \"$root\"/.transition-candidate.*\n",
             "  rm -f \"$root\"/.proof-candidate.*\n",
+            "  rm -f \"$root\"/stdin-write-*.claim \"$root\"/stdin-write-*.result \"$root\"/.stdin-write-*\n",
             "}}\n",
             "if [ -e \"$tombstone\" ]; then\n",
             "  [ -d \"$tombstone\" ] && [ ! -e \"$root\" ] || {{ echo AGENTAPP_TMUX_ACK_TOMBSTONE_CONFLICT >&2; exit 78; }}\n",
@@ -1627,6 +1778,20 @@ fn acknowledgement_command(
             "  mv \"$root/transition-claim\" \"$quarantine\"\n",
             "fi\n",
             "agentapp_ack_terminal_proof\n",
+            "if [ \"$watchdog_window_present\" -eq 1 ]; then tmux kill-window -t \"$session:$watchdog_window\" 2>/dev/null || true; fi\n",
+            "for stdin_claim in \"$root\"/stdin-write-*.claim; do\n",
+            "  [ -e \"$stdin_claim\" ] || continue\n",
+            "  stdin_name=${{stdin_claim##*/}}\n",
+            "  stdin_key=${{stdin_name#stdin-write-}}; stdin_key=${{stdin_key%.claim}}\n",
+            "  [ \"${{#stdin_key}}\" -eq 64 ] || {{ echo AGENTAPP_TMUX_ACK_STDIN_KEY_MALFORMED >&2; exit 78; }}\n",
+            "  case \"$stdin_key\" in *[!0-9a-f]*) echo AGENTAPP_TMUX_ACK_STDIN_KEY_MALFORMED >&2; exit 78 ;; esac\n",
+            "  tmux delete-buffer -b \"agentapp_${{process_id}}_$stdin_key\" 2>/dev/null || true\n",
+            "done\n",
+            "agentapp_ack_windows\n",
+            "[ \"$command_window_present\" -eq 0 ] && [ \"$watchdog_window_present\" -eq 0 ] || {{ echo AGENTAPP_TMUX_ACK_WINDOW_PRESENT >&2; exit 78; }}\n",
+            "agentapp_ack_preflight_root\n",
+            "[ \"$(cat \"$root/acknowledgement-token\" 2>/dev/null || true)\" = \"$token\" ] || {{ echo AGENTAPP_TMUX_ACK_CHANGED >&2; exit 78; }}\n",
+            "[ ! -e \"$tombstone\" ] || {{ echo AGENTAPP_TMUX_ACK_TOMBSTONE_CONFLICT >&2; exit 78; }}\n",
             "observed=$(cat \"$root/controller\" 2>/dev/null || true)\n",
             "observed_generation=${{observed%%:*}}\n",
             "observed_controller_id=${{observed#*:}}\n",
@@ -1642,23 +1807,25 @@ fn acknowledgement_command(
             "( umask 077; set -C; printf 'acknowledgement|k_{acknowledgement_key}|%s|%s|%s|%s|%s|%s\\n' \"$observed\" \"$operation_pid\" \"$operation_pgid\" \"$expected_window\" \"$pane_pid\" \"$pgid\" > \"$transition_candidate\" ) || {{ echo AGENTAPP_TMUX_TRANSITION_CANDIDATE_CONFLICT >&2; exit 79; }}\n",
             "ln \"$transition_candidate\" \"$root/transition-claim\" 2>/dev/null || {{ rm -f \"$transition_candidate\"; echo AGENTAPP_TMUX_ACK_BUSY >&2; exit 79; }}\n",
             "release_ack_claim() {{ if [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ]; then rm -f \"$root/transition-claim\"; fi; rm -f \"$transition_candidate\"; }}\n",
+            "interrupt_ack_claim() {{ signal_status=$1; trap - EXIT HUP INT TERM; release_ack_claim; exit \"$signal_status\"; }}\n",
             "trap 'release_ack_claim' EXIT\n",
-            "agentapp_ack_terminal_proof\n",
+            "trap 'interrupt_ack_claim 129' HUP\n",
+            "trap 'interrupt_ack_claim 130' INT\n",
+            "trap 'interrupt_ack_claim 143' TERM\n",
+            // All filesystem-, process-, output-, and tmux-bound proof is
+            // complete before the claim. Once claimed, keep the atomic commit
+            // window to local scalar checks plus one rename so loss of the SSH
+            // control channel cannot repeatedly strand the turn at this point.
             "[ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$observed\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
             "[ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"acknowledgement|k_{acknowledgement_key}|$observed|$operation_pid|$operation_pgid|$expected_window|$pane_pid|$pgid\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
-            "if [ \"$watchdog_window_present\" -eq 1 ]; then tmux kill-window -t \"$session:$watchdog_window\" 2>/dev/null || true; fi\n",
-            "agentapp_ack_windows\n",
-            "[ \"$command_window_present\" -eq 0 ] && [ \"$watchdog_window_present\" -eq 0 ] || {{ echo AGENTAPP_TMUX_ACK_WINDOW_PRESENT >&2; exit 78; }}\n",
-            "agentapp_ack_preflight_root\n",
             "[ \"$(cat \"$root/acknowledgement-token\" 2>/dev/null || true)\" = \"$token\" ] || {{ echo AGENTAPP_TMUX_ACK_CHANGED >&2; exit 78; }}\n",
             "[ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
-            "[ ! -e \"$tombstone\" ] || {{ echo AGENTAPP_TMUX_ACK_TOMBSTONE_CONFLICT >&2; exit 78; }}\n",
             "candidate_name=${{transition_candidate##*/}}\n",
             "mv \"$root\" \"$tombstone\"\n",
             "root=\"$tombstone\"\n",
             "transition_candidate=\"$root/$candidate_name\"\n",
             "agentapp_cleanup_ack_tombstone\n",
-            "trap - EXIT\n",
+            "trap - EXIT HUP INT TERM\n",
             "exit 0\n"
         ),
         agent_id = agent_id,
@@ -1674,16 +1841,70 @@ fn acknowledgement_command(
     )
 }
 
+fn acknowledgement_release_command(
+    agent_key: &str,
+    acknowledgement: &RecoveredExecutionAcknowledgement,
+) -> String {
+    let agent_id = stable_identifier(agent_key);
+    let (acknowledgement_key, legacy_acknowledgement_key) = acknowledgement_keys(acknowledgement);
+    format!(
+        concat!(
+            "set -eu\n",
+            "setopt nonomatch 2>/dev/null || true\n",
+            "base=\"$HOME/.agentapp/tmux/{agent_id}\"\n",
+            "token={token}\n",
+            "process_id=${{token%%-*}}\n",
+            "case \"$process_id\" in ''|*[!0-9a-f]*) echo AGENTAPP_TMUX_RELEASE_BAD_TOKEN >&2; exit 78 ;; esac\n",
+            "[ \"${{#process_id}}\" -eq 16 ] || {{ echo AGENTAPP_TMUX_RELEASE_BAD_TOKEN >&2; exit 78; }}\n",
+            "token_proof=${{token#*-}}\n",
+            "[ \"$token\" = \"$process_id-$token_proof\" ] && [ \"${{#token_proof}}\" -eq 64 ] || {{ echo AGENTAPP_TMUX_RELEASE_BAD_TOKEN >&2; exit 78; }}\n",
+            "case \"$token_proof\" in *[!0-9a-f]*) echo AGENTAPP_TMUX_RELEASE_BAD_TOKEN >&2; exit 78 ;; esac\n",
+            "root=\"$base/$process_id\"\n",
+            "tombstone=\"$base/.acknowledged-$process_id-{acknowledgement_key}\"\n",
+            "legacy_tombstone=\"$base/.acknowledged-$process_id-{legacy_acknowledgement_key}\"\n",
+            "[ ! -e \"$root\" ] || {{ echo AGENTAPP_TMUX_RELEASE_LIVE_ROOT_PRESENT >&2; exit 78; }}\n",
+            "if [ -e \"$tombstone\" ] && [ -e \"$legacy_tombstone\" ]; then echo AGENTAPP_TMUX_RELEASE_TOMBSTONE_CONFLICT >&2; exit 78; fi\n",
+            "if [ -e \"$tombstone\" ]; then\n",
+            "  [ -d \"$tombstone\" ] && [ ! -L \"$tombstone\" ] || {{ echo AGENTAPP_TMUX_RELEASE_TOMBSTONE_CONFLICT >&2; exit 78; }}\n",
+            "  for entry in \"$tombstone\"/* \"$tombstone\"/.[!.]* \"$tombstone\"/..?*; do [ ! -e \"$entry\" ] || {{ echo AGENTAPP_TMUX_RELEASE_UNEXPECTED_ENTRY >&2; exit 78; }}; done\n",
+            "  rmdir \"$tombstone\"\n",
+            "  exit 0\n",
+            "fi\n",
+            "if [ -e \"$legacy_tombstone\" ]; then\n",
+            "  [ -d \"$legacy_tombstone\" ] && [ ! -L \"$legacy_tombstone\" ] || {{ echo AGENTAPP_TMUX_RELEASE_TOMBSTONE_CONFLICT >&2; exit 78; }}\n",
+            "  [ -f \"$legacy_tombstone/proof-key\" ] && [ ! -L \"$legacy_tombstone/proof-key\" ] || {{ echo AGENTAPP_TMUX_RELEASE_PROOF_MISSING >&2; exit 78; }}\n",
+            "  [ \"$(cat \"$legacy_tombstone/proof-key\" 2>/dev/null || true)\" = {acknowledgement_key} ] || {{ echo AGENTAPP_TMUX_RELEASE_PROOF_CONFLICT >&2; exit 78; }}\n",
+            "  for entry in \"$legacy_tombstone\"/* \"$legacy_tombstone\"/.[!.]* \"$legacy_tombstone\"/..?*; do\n",
+            "    [ -e \"$entry\" ] || continue\n",
+            "    [ \"${{entry##*/}}\" = proof-key ] || {{ echo AGENTAPP_TMUX_RELEASE_UNEXPECTED_ENTRY >&2; exit 78; }}\n",
+            "  done\n",
+            "  rm -f \"$legacy_tombstone/proof-key\"\n",
+            "  rmdir \"$legacy_tombstone\"\n",
+            "fi\n",
+            "exit 0\n"
+        ),
+        agent_id = agent_id,
+        token = shell_quote(acknowledgement.as_str()),
+        acknowledgement_key = acknowledgement_key,
+        legacy_acknowledgement_key = legacy_acknowledgement_key,
+    )
+}
+
 fn parse_recovered_executions(output: &[u8]) -> Result<Vec<RecoveredExecution>, ExecServerError> {
     let recovered = String::from_utf8_lossy(output)
         .lines()
         .filter(|line| !line.is_empty())
-        .map(|line| {
+        .enumerate()
+        .map(|(line_index, line)| {
             let fields = line.splitn(14, ' ').collect::<Vec<_>>();
             if fields.len() != 14 || fields[0] != "AGENTAPP_RECOVERED" {
-                return Err(ExecServerError::Protocol(
-                    "ssh tmux reconciliation returned malformed data".to_string(),
-                ));
+                return Err(ExecServerError::Protocol(format!(
+                    "ssh tmux reconciliation returned malformed data at line {} \
+                     (field count {}, marker {})",
+                    line_index + 1,
+                    fields.len(),
+                    fields.first().copied() == Some("AGENTAPP_RECOVERED"),
+                )));
             }
             let decode_text = |value: &str| {
                 STANDARD

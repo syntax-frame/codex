@@ -287,9 +287,12 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::RemoteExecutionProtocolMarker(_)
         | RolloutItem::RemoteExecutionLaunchIntent(_)
+        | RolloutItem::RemoteExecutionWriteRequest(_)
+        | RolloutItem::RemoteExecutionWriteIntent(_)
         | RolloutItem::RemoteExecutionSessionPrepared(_)
         | RolloutItem::RemoteExecutionSessionCommitted(_)
         | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+        | RolloutItem::RemoteExecutionSessionReleased(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::WorldState(_) => None,
     }

@@ -1294,6 +1294,19 @@ impl Session {
 
     pub(crate) async fn write(&self, chunk: Vec<u8>) -> Result<WriteResponse, ExecServerError> {
         let write_id = self.state.next_write_id();
+        self.write_with_id(chunk, write_id).await
+    }
+
+    pub(crate) async fn write_with_id(
+        &self,
+        chunk: Vec<u8>,
+        write_id: String,
+    ) -> Result<WriteResponse, ExecServerError> {
+        if write_id.is_empty() {
+            return Err(ExecServerError::Protocol(
+                "stdin write id must not be empty".to_string(),
+            ));
+        }
         loop {
             match self
                 .client
@@ -2250,7 +2263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_write_retries_same_write_id_after_recovery() {
+    async fn session_write_retries_caller_stable_write_id_after_recovery() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -2279,7 +2292,7 @@ mod tests {
             assert_eq!(first_write_params.process_id.as_str(), "proc-write");
             assert_eq!(first_write_params.chunk.into_inner(), b"hello\n".to_vec());
             let write_id = first_write_params.write_id;
-            assert!(!write_id.is_empty());
+            assert_eq!(write_id, "durable-write-id");
             drop(first);
 
             let mut resumed = accept_websocket(&listener).await;
@@ -2350,10 +2363,13 @@ mod tests {
             .await
             .expect("session should register");
 
-        let response = timeout(Duration::from_secs(2), session.write(b"hello\n".to_vec()))
-            .await
-            .expect("write should not time out")
-            .expect("write should recover");
+        let response = timeout(
+            Duration::from_secs(2),
+            session.write_with_id(b"hello\n".to_vec(), "durable-write-id".to_string()),
+        )
+        .await
+        .expect("write should not time out")
+        .expect("write should recover");
         assert_eq!(
             response,
             WriteResponse {

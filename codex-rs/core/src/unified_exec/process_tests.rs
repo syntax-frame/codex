@@ -22,6 +22,7 @@ use tokio::sync::watch;
 struct MockExecProcess {
     process_id: ProcessId,
     write_response: WriteResponse,
+    writes: Arc<Mutex<Vec<Vec<u8>>>>,
     read_responses: Mutex<VecDeque<ReadResponse>>,
     terminate_error: Option<String>,
     terminate_count: Arc<AtomicUsize>,
@@ -85,8 +86,11 @@ impl ExecProcess for MockExecProcess {
         Box::pin(MockExecProcess::read(self))
     }
 
-    fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
-        Box::pin(async { Ok(self.write_response.clone()) })
+    fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(async move {
+            self.writes.lock().await.push(chunk);
+            Ok(self.write_response.clone())
+        })
     }
 
     fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
@@ -112,14 +116,30 @@ pub(crate) async fn remote_process_with_drop_policy(
     terminate_error: Option<String>,
     detach_on_drop: bool,
 ) -> (UnifiedExecProcess, Arc<AtomicUsize>) {
+    let (process, terminate_count, _writes) =
+        remote_process_with_write_log(write_status, terminate_error, detach_on_drop).await;
+    (process, terminate_count)
+}
+
+pub(crate) async fn remote_process_with_write_log(
+    write_status: WriteStatus,
+    terminate_error: Option<String>,
+    detach_on_drop: bool,
+) -> (
+    UnifiedExecProcess,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+) {
     let (wake_tx, _wake_rx) = watch::channel(0);
     let terminate_count = Arc::new(AtomicUsize::new(0));
+    let writes = Arc::new(Mutex::new(Vec::new()));
     let started = StartedExecProcess {
         process: Arc::new(MockExecProcess {
             process_id: "test-process".to_string().into(),
             write_response: WriteResponse {
                 status: write_status,
             },
+            writes: Arc::clone(&writes),
             read_responses: Mutex::new(VecDeque::new()),
             terminate_error,
             terminate_count: Arc::clone(&terminate_count),
@@ -129,12 +149,10 @@ pub(crate) async fn remote_process_with_drop_policy(
         }),
     };
 
-    (
-        UnifiedExecProcess::from_exec_server_started(started, detach_on_drop)
-            .await
-            .expect("remote process should start"),
-        terminate_count,
-    )
+    let process = UnifiedExecProcess::from_exec_server_started(started, detach_on_drop)
+        .await
+        .expect("remote process should start");
+    (process, terminate_count, writes)
 }
 
 #[tokio::test]
@@ -175,6 +193,7 @@ async fn concurrent_confirmed_termination_shares_the_same_failure() {
                     write_response: WriteResponse {
                         status: WriteStatus::Accepted,
                     },
+                    writes: Arc::new(Mutex::new(Vec::new())),
                     read_responses: Mutex::new(VecDeque::new()),
                     terminate_error: Some("terminate unavailable".to_string()),
                     terminate_count: Arc::clone(&terminate_count),
@@ -219,6 +238,7 @@ async fn fire_and_forget_and_confirmed_termination_share_completion() {
                 write_response: WriteResponse {
                     status: WriteStatus::Accepted,
                 },
+                writes: Arc::new(Mutex::new(Vec::new())),
                 read_responses: Mutex::new(VecDeque::new()),
                 terminate_error: Some("terminate unavailable".to_string()),
                 terminate_count: Arc::clone(&terminate_count),
@@ -247,7 +267,7 @@ async fn remote_write_unknown_process_marks_process_exited() {
     let process = remote_process(WriteStatus::UnknownProcess, /*terminate_error*/ None).await;
 
     let err = process
-        .write(b"hello")
+        .write(b"hello", None)
         .await
         .expect_err("expected write failure");
 
@@ -260,7 +280,7 @@ async fn remote_write_closed_stdin_marks_process_exited() {
     let process = remote_process(WriteStatus::StdinClosed, /*terminate_error*/ None).await;
 
     let err = process
-        .write(b"hello")
+        .write(b"hello", None)
         .await
         .expect_err("expected write failure");
 

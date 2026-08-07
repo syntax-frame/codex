@@ -241,6 +241,11 @@ fn rollout_item_type(item: &RolloutItem) -> String {
         RolloutItem::RemoteExecutionSessionAcknowledged(_) => {
             "remote_execution_session_acknowledged".to_string()
         }
+        RolloutItem::RemoteExecutionSessionReleased(_) => {
+            "remote_execution_session_released".to_string()
+        }
+        RolloutItem::RemoteExecutionWriteRequest(_) => "remote_execution_write_request".to_string(),
+        RolloutItem::RemoteExecutionWriteIntent(_) => "remote_execution_write_intent".to_string(),
         RolloutItem::Compacted(_) => "compacted".to_string(),
         RolloutItem::TurnContext(_) => "turn_context".to_string(),
         RolloutItem::WorldState(_) => "world_state".to_string(),

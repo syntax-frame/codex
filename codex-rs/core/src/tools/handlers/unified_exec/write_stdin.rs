@@ -71,6 +71,23 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        let truncation_policy = turn.model_info.truncation_policy.into();
+        if !args.chars.is_empty() {
+            session
+                .persist_remote_execution_write_request(
+                    args.session_id,
+                    turn.sub_id.as_str(),
+                    &call_id,
+                    &args.chars,
+                    args.yield_time_ms,
+                    args.max_output_tokens,
+                    truncation_policy,
+                )
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
+                })?;
+        }
         let response = session
             .services
             .unified_exec_manager
@@ -79,7 +96,7 @@ impl WriteStdinHandler {
                 input: &args.chars,
                 yield_time_ms: args.yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
-                truncation_policy: turn.model_info.truncation_policy.into(),
+                truncation_policy,
                 interaction_event: Some(WriteStdinInteractionEvent {
                     session: &session,
                     turn: Some(&turn),

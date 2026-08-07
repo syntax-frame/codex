@@ -403,9 +403,12 @@ impl ThreadHistoryBuilder {
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::RemoteExecutionProtocolMarker(_)
             | RolloutItem::RemoteExecutionLaunchIntent(_)
+            | RolloutItem::RemoteExecutionWriteRequest(_)
+            | RolloutItem::RemoteExecutionWriteIntent(_)
             | RolloutItem::RemoteExecutionSessionPrepared(_)
             | RolloutItem::RemoteExecutionSessionCommitted(_)
             | RolloutItem::RemoteExecutionSessionAcknowledged(_)
+            | RolloutItem::RemoteExecutionSessionReleased(_)
             | RolloutItem::TurnContext(_)
             | RolloutItem::WorldState(_)
             | RolloutItem::SessionMeta(_) => {}
