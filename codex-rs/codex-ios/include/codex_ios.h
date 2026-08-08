@@ -36,6 +36,16 @@ char *codex_list_models_json(const char *access_token,
                              const char *account_id);
 
 /*
+ * Resolve the current account's concrete OAuth model and reasoning defaults
+ * without starting a turn. Returns typed JSON with `status` equal to
+ * `available` or `unavailable`; failures use the normal `ERROR: ` string.
+ * The caller owns the result and must release it with codex_free_string().
+ */
+char *codex_resolve_oauth_defaults_json(const char *access_token,
+                                        const char *id_token,
+                                        const char *account_id);
+
+/*
  * Free a string previously returned by this library.
  * Passing NULL is a no-op.
  */

@@ -263,6 +263,34 @@ pub extern "C" fn codex_list_models_json(
     }
 }
 
+/// Resolve the current account's concrete OAuth model and reasoning defaults
+/// without starting a turn. Returns a typed JSON payload or `ERROR: ...`.
+///
+/// # Safety
+/// All pointers must be valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub extern "C" fn codex_resolve_oauth_defaults_json(
+    access_token: *const c_char,
+    id_token: *const c_char,
+    account_id: *const c_char,
+) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let token = c_str_to_string(access_token, "access_token")?;
+        let id_token = c_str_to_string(id_token, "id_token")?;
+        let account = c_str_to_string(account_id, "account_id")?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
+        runtime.block_on(turn::resolve_oauth_defaults_json(token, id_token, account))
+    });
+    match result {
+        Ok(Ok(json)) => into_c_string(json),
+        Ok(Err(message)) => error_string(message),
+        Err(_) => error_string("panic while resolving OAuth defaults"),
+    }
+}
+
 /// Free a string previously returned by [`codex_run_prompt`].
 ///
 /// # Safety

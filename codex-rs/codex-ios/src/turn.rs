@@ -48,6 +48,7 @@ use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
+use codex_models_manager::ModelsManagerConfig;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -73,6 +74,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use serde::Serialize;
 use tokio::time::timeout;
 
 const CONTEXT_LOCK_FILE: &str = ".agentapp-context.lock";
@@ -900,6 +902,86 @@ pub(crate) async fn list_oauth_models_json(
         .list_models(RefreshStrategy::Online, default_http_client_factory())
         .await;
     serde_json::to_string(&models).map_err(|e| format!("failed to serialize model catalog: {e}"))
+}
+
+/// No-turn resolution payload for a ChatGPT account's dynamic OAuth defaults.
+/// The selected model is always one produced by the same ModelsManager picker
+/// pipeline used at turn start; unavailable is explicit rather than a guessed
+/// first catalog row.
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum OAuthDefaultsResolution {
+    Available {
+        account_id: String,
+        fetched_at_unix_ms: u128,
+        model_slug: String,
+        display_name: String,
+        default_reasoning_effort: String,
+    },
+}
+
+/// Resolve the concrete OAuth defaults without creating a turn. This follows
+/// the normal root-turn ModelsManager flow: online refresh, picker filtering
+/// and priority ordering, then `get_default_model` and model-info metadata.
+pub(crate) async fn resolve_oauth_defaults_json(
+    access_token: String,
+    id_token: String,
+    account_id: String,
+) -> Result<String, String> {
+    let auth = build_auth(access_token, id_token, account_id.clone()).await?;
+    let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    let thread_manager = thread_manager_with_models_provider(auth, provider);
+    let models_manager = thread_manager.get_models_manager();
+    let http_client_factory = default_http_client_factory();
+    let picker_models = models_manager
+        .list_models(RefreshStrategy::Online, http_client_factory)
+        .await;
+    let fetched_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
+        .as_millis();
+    // `list_models` has already applied authenticated visibility and Core's
+    // priority/recommendation ordering. An explicit account default wins; if
+    // none exists, the first picker item is Core's strongest eligible model.
+    let preset = picker_models
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| picker_models.first())
+        .ok_or_else(|| "OAuth model picker produced no usable model".to_string())?;
+    let model_slug = preset.model.clone();
+    let model_info = models_manager
+        .get_model_info(&model_slug, &ModelsManagerConfig::default())
+        .await;
+    let default_reasoning_effort = model_info
+        .supported_reasoning_levels
+        .iter()
+        .find(|effort| effort.effort.to_string() == "medium")
+        .map(|effort| effort.effort.clone())
+        .or_else(|| {
+            model_info.default_reasoning_level.filter(|default| {
+                model_info
+                    .supported_reasoning_levels
+                    .iter()
+                    .any(|effort| effort.effort == *default)
+            })
+        })
+        .or_else(|| {
+            let supported = &model_info.supported_reasoning_levels;
+            supported
+                .get(supported.len() / 2)
+                .map(|effort| effort.effort.clone())
+        })
+        .ok_or_else(|| {
+            format!("OAuth default model `{model_slug}` has no usable reasoning effort")
+        })?;
+    serde_json::to_string(&OAuthDefaultsResolution::Available {
+        account_id,
+        fetched_at_unix_ms,
+        model_slug,
+        display_name: preset.display_name.clone(),
+        default_reasoning_effort: default_reasoning_effort.to_string(),
+    })
+    .map_err(|error| format!("failed to serialize OAuth defaults: {error}"))
 }
 
 fn toml_basic_string(value: &str) -> String {
