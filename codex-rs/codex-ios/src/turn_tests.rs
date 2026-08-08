@@ -104,13 +104,19 @@ fn oauth_default_policy_prefers_flag_then_ranked_picker_and_concrete_effort() {
         oauth_preset("default", true),
         oauth_preset("other-default", true),
     ];
-    assert_eq!(resolve_oauth_preset(&ranked).unwrap().model, "default");
+    assert_eq!(
+        resolve_oauth_preset(&ranked, true).unwrap().model,
+        "default"
+    );
     let no_default = vec![oauth_preset("strongest", false), oauth_preset("weaker", false)];
-    assert_eq!(resolve_oauth_preset(&no_default).unwrap().model, "strongest");
+    assert_eq!(
+        resolve_oauth_preset(&no_default, true).unwrap().model,
+        "strongest"
+    );
     let mut hidden = oauth_preset("hidden", true);
     hidden.show_in_picker = false;
     assert_eq!(
-        resolve_oauth_preset(&[hidden, oauth_preset("visible", false)])
+        resolve_oauth_preset(&[hidden, oauth_preset("visible", false)], true)
             .unwrap()
             .model,
         "visible"
@@ -122,6 +128,37 @@ fn oauth_default_policy_prefers_flag_then_ranked_picker_and_concrete_effort() {
         )
         .unwrap(),
         ReasoningEffort::Medium
+    );
+}
+
+#[test]
+fn oauth_default_policy_uses_production_auth_filter_for_ffi_resolution() {
+    let mut chatgpt_default = oauth_preset("chatgpt-default", true);
+    chatgpt_default.supported_in_api = false;
+    let api_picker_model = oauth_preset("api-picker-model", false);
+
+    // The no-turn FFI resolves ChatGPT/OAuth accounts. It must retain a
+    // picker-visible account default even when it is not available to an
+    // API-key caller.
+    assert_eq!(
+        resolve_oauth_preset(
+            &[chatgpt_default.clone(), api_picker_model.clone()],
+            /* chatgpt_mode */ true,
+        )
+        .unwrap()
+        .model,
+        "chatgpt-default"
+    );
+
+    // The same production availability helper preserves API-key filtering.
+    assert_eq!(
+        resolve_oauth_preset(
+            &[chatgpt_default, api_picker_model],
+            /* chatgpt_mode */ false,
+        )
+        .unwrap()
+        .model,
+        "api-picker-model"
     );
 }
 
@@ -143,7 +180,7 @@ fn oauth_default_policy_falls_back_to_supported_default_then_middle_and_errors_e
         .unwrap(),
         ReasoningEffort::High
     );
-    assert!(resolve_oauth_preset(&[]).is_err());
+    assert!(resolve_oauth_preset(&[], true).is_err());
     assert!(resolve_oauth_effort(&[], None).is_err());
 }
 

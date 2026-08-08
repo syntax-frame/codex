@@ -927,16 +927,25 @@ enum OAuthDefaultsResolution {
     },
 }
 
-fn resolve_oauth_preset(picker: &[ModelPreset]) -> Result<&ModelPreset, String> {
-    picker
+/// Select a picker-visible preset using the same authentication availability
+/// policy as normal model selection. ChatGPT/OAuth accounts may use a model
+/// that is not API-key eligible; API-key callers remain limited to
+/// `supported_in_api` presets.
+fn resolve_oauth_preset(
+    picker: &[ModelPreset],
+    chatgpt_mode: bool,
+) -> Result<ModelPreset, String> {
+    let authenticated_models = ModelPreset::filter_by_auth(picker.to_vec(), chatgpt_mode);
+    authenticated_models
         .iter()
-        .filter(|model| model.show_in_picker && model.supported_in_api)
+        .filter(|model| model.show_in_picker)
         .find(|model| model.is_default)
         .or_else(|| {
-            picker
+            authenticated_models
                 .iter()
-                .find(|model| model.show_in_picker && model.supported_in_api)
+                .find(|model| model.show_in_picker)
         })
+        .cloned()
         .ok_or_else(|| "OAuth model picker produced no usable model".to_string())
 }
 
@@ -978,7 +987,7 @@ pub(crate) async fn resolve_oauth_defaults_json(
     // `list_models` has already applied authenticated visibility and Core's
     // priority/recommendation ordering. An explicit account default wins; if
     // none exists, the first picker item is Core's strongest eligible model.
-    let preset = match resolve_oauth_preset(&picker_models) {
+    let preset = match resolve_oauth_preset(&picker_models, /* chatgpt_mode */ true) {
         Ok(preset) => preset,
         Err(reason) => {
             return serde_json::to_string(&OAuthDefaultsResolution::Unavailable {
