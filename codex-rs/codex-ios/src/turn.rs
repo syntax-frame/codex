@@ -920,13 +920,23 @@ enum OAuthDefaultsResolution {
         display_name: String,
         default_reasoning_effort: String,
     },
+    Unavailable {
+        account_id: String,
+        fetched_at_unix_ms: u128,
+        reason: String,
+    },
 }
 
 fn resolve_oauth_preset(picker: &[ModelPreset]) -> Result<&ModelPreset, String> {
     picker
         .iter()
+        .filter(|model| model.show_in_picker && model.supported_in_api)
         .find(|model| model.is_default)
-        .or_else(|| picker.first())
+        .or_else(|| {
+            picker
+                .iter()
+                .find(|model| model.show_in_picker && model.supported_in_api)
+        })
         .ok_or_else(|| "OAuth model picker produced no usable model".to_string())
 }
 
@@ -968,16 +978,35 @@ pub(crate) async fn resolve_oauth_defaults_json(
     // `list_models` has already applied authenticated visibility and Core's
     // priority/recommendation ordering. An explicit account default wins; if
     // none exists, the first picker item is Core's strongest eligible model.
-    let preset = resolve_oauth_preset(&picker_models)?;
+    let preset = match resolve_oauth_preset(&picker_models) {
+        Ok(preset) => preset,
+        Err(reason) => {
+            return serde_json::to_string(&OAuthDefaultsResolution::Unavailable {
+                account_id,
+                fetched_at_unix_ms,
+                reason,
+            })
+            .map_err(|error| format!("failed to serialize OAuth defaults: {error}"));
+        }
+    };
     let model_slug = preset.model.clone();
     let model_info = models_manager
         .get_model_info(&model_slug, &ModelsManagerConfig::default())
         .await;
-    let default_reasoning_effort = resolve_oauth_effort(
+    let default_reasoning_effort = match resolve_oauth_effort(
         &model_info.supported_reasoning_levels,
         model_info.default_reasoning_level,
-    )
-    .map_err(|error| format!("OAuth default model `{model_slug}` {error}"))?;
+    ) {
+        Ok(effort) => effort,
+        Err(reason) => {
+            return serde_json::to_string(&OAuthDefaultsResolution::Unavailable {
+                account_id,
+                fetched_at_unix_ms,
+                reason: format!("OAuth default model `{model_slug}` {reason}"),
+            })
+            .map_err(|error| format!("failed to serialize OAuth defaults: {error}"));
+        }
+    };
     serde_json::to_string(&OAuthDefaultsResolution::Available {
         account_id,
         fetched_at_unix_ms,

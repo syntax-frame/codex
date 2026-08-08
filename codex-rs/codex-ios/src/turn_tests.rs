@@ -107,6 +107,14 @@ fn oauth_default_policy_prefers_flag_then_ranked_picker_and_concrete_effort() {
     assert_eq!(resolve_oauth_preset(&ranked).unwrap().model, "default");
     let no_default = vec![oauth_preset("strongest", false), oauth_preset("weaker", false)];
     assert_eq!(resolve_oauth_preset(&no_default).unwrap().model, "strongest");
+    let mut hidden = oauth_preset("hidden", true);
+    hidden.show_in_picker = false;
+    assert_eq!(
+        resolve_oauth_preset(&[hidden, oauth_preset("visible", false)])
+            .unwrap()
+            .model,
+        "visible"
+    );
     assert_eq!(
         resolve_oauth_effort(
             &[effort(ReasoningEffort::Low), effort(ReasoningEffort::Medium)],
