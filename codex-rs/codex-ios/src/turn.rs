@@ -65,7 +65,9 @@ use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -920,6 +922,29 @@ enum OAuthDefaultsResolution {
     },
 }
 
+fn resolve_oauth_preset(picker: &[ModelPreset]) -> Result<&ModelPreset, String> {
+    picker
+        .iter()
+        .find(|model| model.is_default)
+        .or_else(|| picker.first())
+        .ok_or_else(|| "OAuth model picker produced no usable model".to_string())
+}
+
+fn resolve_oauth_effort(
+    supported: &[ReasoningEffortPreset],
+    declared_default: Option<ReasoningEffort>,
+) -> Result<ReasoningEffort, String> {
+    supported
+        .iter()
+        .find(|effort| effort.effort.to_string() == "medium")
+        .map(|effort| effort.effort.clone())
+        .or_else(|| declared_default.filter(|default| {
+            supported.iter().any(|effort| effort.effort == *default)
+        }))
+        .or_else(|| supported.get(supported.len() / 2).map(|effort| effort.effort.clone()))
+        .ok_or_else(|| "OAuth default model has no usable reasoning effort".to_string())
+}
+
 /// Resolve the concrete OAuth defaults without creating a turn. This follows
 /// the normal root-turn ModelsManager flow: online refresh, picker filtering
 /// and priority ordering, then `get_default_model` and model-info metadata.
@@ -943,37 +968,16 @@ pub(crate) async fn resolve_oauth_defaults_json(
     // `list_models` has already applied authenticated visibility and Core's
     // priority/recommendation ordering. An explicit account default wins; if
     // none exists, the first picker item is Core's strongest eligible model.
-    let preset = picker_models
-        .iter()
-        .find(|model| model.is_default)
-        .or_else(|| picker_models.first())
-        .ok_or_else(|| "OAuth model picker produced no usable model".to_string())?;
+    let preset = resolve_oauth_preset(&picker_models)?;
     let model_slug = preset.model.clone();
     let model_info = models_manager
         .get_model_info(&model_slug, &ModelsManagerConfig::default())
         .await;
-    let default_reasoning_effort = model_info
-        .supported_reasoning_levels
-        .iter()
-        .find(|effort| effort.effort.to_string() == "medium")
-        .map(|effort| effort.effort.clone())
-        .or_else(|| {
-            model_info.default_reasoning_level.filter(|default| {
-                model_info
-                    .supported_reasoning_levels
-                    .iter()
-                    .any(|effort| effort.effort == *default)
-            })
-        })
-        .or_else(|| {
-            let supported = &model_info.supported_reasoning_levels;
-            supported
-                .get(supported.len() / 2)
-                .map(|effort| effort.effort.clone())
-        })
-        .ok_or_else(|| {
-            format!("OAuth default model `{model_slug}` has no usable reasoning effort")
-        })?;
+    let default_reasoning_effort = resolve_oauth_effort(
+        &model_info.supported_reasoning_levels,
+        model_info.default_reasoning_level,
+    )
+    .map_err(|error| format!("OAuth default model `{model_slug}` {error}"))?;
     serde_json::to_string(&OAuthDefaultsResolution::Available {
         account_id,
         fetched_at_unix_ms,

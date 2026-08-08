@@ -24,6 +24,8 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::ItemStartedEvent;
 
 use super::AGENTAPP_BROWSER_TOOL_NAMES;
@@ -66,6 +68,76 @@ use super::startup_interrupt_requested;
 use super::tool_discovery_event_json;
 use super::validate_relative_rollout_path;
 use super::write_thread_pointer;
+use super::resolve_oauth_effort;
+use super::resolve_oauth_preset;
+
+fn oauth_preset(model: &str, is_default: bool) -> ModelPreset {
+    ModelPreset {
+        id: model.to_string(),
+        model: model.to_string(),
+        display_name: model.to_string(),
+        description: String::new(),
+        default_reasoning_effort: ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![],
+        supports_personality: false,
+        additional_speed_tiers: vec![],
+        service_tiers: vec![],
+        default_service_tier: None,
+        is_default,
+        upgrade: None,
+        show_in_picker: true,
+        multi_agent_version: None,
+        availability_nux: None,
+        supported_in_api: true,
+        input_modalities: vec![],
+    }
+}
+
+fn effort(effort: ReasoningEffort) -> ReasoningEffortPreset {
+    ReasoningEffortPreset { effort, description: String::new() }
+}
+
+#[test]
+fn oauth_default_policy_prefers_flag_then_ranked_picker_and_concrete_effort() {
+    let ranked = vec![
+        oauth_preset("strongest", false),
+        oauth_preset("default", true),
+        oauth_preset("other-default", true),
+    ];
+    assert_eq!(resolve_oauth_preset(&ranked).unwrap().model, "default");
+    let no_default = vec![oauth_preset("strongest", false), oauth_preset("weaker", false)];
+    assert_eq!(resolve_oauth_preset(&no_default).unwrap().model, "strongest");
+    assert_eq!(
+        resolve_oauth_effort(
+            &[effort(ReasoningEffort::Low), effort(ReasoningEffort::Medium)],
+            Some(ReasoningEffort::Low),
+        )
+        .unwrap(),
+        ReasoningEffort::Medium
+    );
+}
+
+#[test]
+fn oauth_default_policy_falls_back_to_supported_default_then_middle_and_errors_empty() {
+    assert_eq!(
+        resolve_oauth_effort(
+            &[effort(ReasoningEffort::Low), effort(ReasoningEffort::High)],
+            Some(ReasoningEffort::High),
+        )
+        .unwrap(),
+        ReasoningEffort::High
+    );
+    assert_eq!(
+        resolve_oauth_effort(
+            &[effort(ReasoningEffort::Low), effort(ReasoningEffort::High)],
+            Some(ReasoningEffort::Medium),
+        )
+        .unwrap(),
+        ReasoningEffort::High
+    );
+    assert!(resolve_oauth_preset(&[]).is_err());
+    assert!(resolve_oauth_effort(&[], None).is_err());
+}
 
 #[tokio::test]
 async fn context_file_lock_excludes_other_os_lock_holders_and_releases_on_drop() {
