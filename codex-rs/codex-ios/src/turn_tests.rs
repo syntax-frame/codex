@@ -8,6 +8,7 @@ use std::os::raw::c_char;
 use std::os::raw::c_int;
 use std::os::raw::c_void;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -56,6 +57,7 @@ use super::emit_item_started_events;
 use super::emit_turn_result;
 use super::finish_turn_after_cleanup;
 use super::finish_turn_with_cleanup;
+use super::interrupted_model_turn_cleanup_error;
 use super::model_context_resume_error_class;
 use super::parse_agentapp_dynamic_tools_json;
 use super::parse_reasoning_effort;
@@ -394,6 +396,89 @@ impl Drop for RejectingResponsesServer {
     }
 }
 
+struct PersistenceSabotagingResponsesServer {
+    base_url: String,
+    sabotage_result: mpsc::Receiver<Result<(), String>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl PersistenceSabotagingResponsesServer {
+    fn start(context_home: PathBuf) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind success server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking success server");
+        let address = listener.local_addr().expect("success server address");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (sabotage_tx, sabotage_result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let body = concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-durability\"}}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-durability\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":null,\"output_tokens\":0,\"output_tokens_details\":null,\"total_tokens\":0}}}\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            while !worker_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                        let mut request = [0_u8; 8192];
+                        let _ = stream.read(&mut request);
+                        let result = sabotage_rollout_path(context_home.as_path());
+                        let _ = sabotage_tx.send(result);
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/v1"),
+            sabotage_result,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn sabotage_result(&self) -> Result<(), String> {
+        self.sabotage_result
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("missing sabotage result: {error}"))?
+    }
+}
+
+impl Drop for PersistenceSabotagingResponsesServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("success server worker");
+        }
+    }
+}
+
+fn sabotage_rollout_path(context_home: &Path) -> Result<(), String> {
+    let pointer_bytes = std::fs::read(context_home.join(CONTEXT_POINTER_FILE))
+        .map_err(|error| format!("read context pointer: {error}"))?;
+    let pointer: PersistedThreadPointer = serde_json::from_slice(&pointer_bytes)
+        .map_err(|error| format!("decode context pointer: {error}"))?;
+    let rollout_path = context_home.join(pointer.rollout_path);
+    let preserved_path = rollout_path.with_extension("jsonl.preserved");
+    std::fs::rename(&rollout_path, &preserved_path)
+        .map_err(|error| format!("preserve rollout: {error}"))?;
+    std::fs::create_dir(&rollout_path)
+        .map_err(|error| format!("replace rollout with directory: {error}"))
+}
+
 #[test]
 fn failed_protected_first_turn_leaves_a_resumable_rollout() {
     let home = tempfile::tempdir().expect("context home");
@@ -439,6 +524,32 @@ fn failed_protected_first_turn_leaves_a_resumable_rollout() {
         std::fs::read(pointer_path).expect("stable pointer"),
         pointer_bytes
     );
+}
+
+#[test]
+fn bridge_never_emits_done_when_rollout_flush_and_shutdown_fail() {
+    let home = tempfile::tempdir().expect("context home");
+    let server = PersistenceSabotagingResponsesServer::start(home.path().to_path_buf());
+
+    let events = run_apikey_turn_against(home.path(), &server.base_url);
+    server
+        .sabotage_result()
+        .expect("replace the live rollout path");
+
+    assert!(
+        !events.iter().any(|(kind, _)| *kind == KIND_DONE),
+        "terminal success must wait for durable persistence cleanup"
+    );
+    let errors = events
+        .iter()
+        .filter(|(kind, _)| *kind == KIND_ERROR)
+        .map(|(_, message)| message.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("failed to flush persistent model context"));
+    assert!(errors[0].contains("failed to shutdown persistent model context"));
+    assert!(!errors[0].contains(home.path().to_string_lossy().as_ref()));
+    assert!(!errors[0].contains("rollout.jsonl"));
 }
 
 #[test]
@@ -583,6 +694,11 @@ fn persistent_model_context_storage_errors_hide_internal_details() {
         assert!(!public_message.contains(private_detail));
         assert!(!public_message.contains("/private/context"));
     }
+
+    let public_message = interrupted_model_turn_cleanup_error(&private_detail);
+    assert_eq!(public_message, "failed to terminate interrupted model turn");
+    assert!(!public_message.contains(private_detail));
+    assert!(!public_message.contains("/private/context"));
 }
 
 #[test]

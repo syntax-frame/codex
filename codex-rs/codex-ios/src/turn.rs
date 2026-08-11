@@ -398,6 +398,15 @@ fn persistent_model_context_storage_error(
     format!("failed to {operation} persistent model context")
 }
 
+fn interrupted_model_turn_cleanup_error(error: &impl std::fmt::Display) -> String {
+    tracing::warn!(
+        operation = "shutdown_interrupted_turn",
+        error_type = std::any::type_name_of_val(error),
+        "interrupted model-turn cleanup failed"
+    );
+    "failed to terminate interrupted model turn".to_string()
+}
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedThreadPointer {
@@ -2017,7 +2026,7 @@ pub(crate) async fn run_turn_async(
             TurnExitDisposition::UserInterrupt => thread
                 .shutdown_and_wait()
                 .await
-                .map_err(|error| format!("failed to terminate interrupted model turn: {error}")),
+                .map_err(|error| interrupted_model_turn_cleanup_error(&error)),
         },
         Err(error) => Err(error),
     };

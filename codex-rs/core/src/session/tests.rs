@@ -9141,7 +9141,7 @@ async fn shutdown_and_wait_propagates_thread_persistence_shutdown_failure() {
 }
 
 #[tokio::test]
-async fn swallowed_rollout_write_failure_stays_sticky_until_host_detach() {
+async fn compacted_rollout_write_failure_stays_sticky_until_host_detach() {
     let (mut session, _turn_context) = make_session_and_context().await;
     let config = session.get_config().await;
     let store = Arc::new(codex_thread_store::LocalThreadStore::new(
@@ -9183,9 +9183,19 @@ async fn swallowed_rollout_write_failure_stays_sticky_until_host_detach() {
     session.services.live_thread = Some(live_thread);
 
     session
-        .persist_rollout_items(&[RolloutItem::ResponseItem(user_message(
-            "private persisted content",
-        ))])
+        .replace_compacted_history(
+            vec![user_message("private replacement history")],
+            /*reference_context_item*/ None,
+            /*world_state_baseline*/ None,
+            CompactedItem {
+                message: "private compacted summary".to_string(),
+                replacement_history: None,
+                window_number: Some(2),
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            },
+        )
         .await;
     let error = session
         .ensure_rollout_persistence_succeeded()
@@ -9193,7 +9203,38 @@ async fn swallowed_rollout_write_failure_stays_sticky_until_host_detach() {
         .expect_err("earlier write failure must block host detach");
     let message = error.to_string();
     assert!(message.contains("[durable_write]"));
-    assert!(!message.contains("private persisted content"));
+    assert!(!message.contains("private replacement history"));
+    assert!(!message.contains("private compacted summary"));
+}
+
+#[tokio::test]
+async fn shutdown_rechecks_rollout_failure_recorded_during_session_end() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let (tx_sub, rx_sub) = async_channel::bounded(1);
+    let (_tx_event, rx_event) = async_channel::unbounded();
+    let session_for_loop = Arc::clone(&session);
+    let session_loop_handle = tokio::spawn(async move {
+        let shutdown: Submission = rx_sub.recv().await.expect("shutdown submission");
+        assert_eq!(shutdown.op, Op::Shutdown);
+        session_for_loop
+            .record_rollout_persistence_failure(RolloutPersistenceFailure::DurableWrite)
+            .await;
+        Ok::<(), Arc<str>>(())
+    });
+    let io = SessionIo {
+        tx_sub,
+        rx_event,
+        agent_status: watch::channel(AgentStatus::PendingInit).1,
+        session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+    };
+
+    let error = crate::codex_thread::shutdown_and_verify_rollout_persistence(session.as_ref(), &io)
+        .await
+        .expect_err("late SessionEnd persistence failure must fail shutdown");
+    let message = error.to_string();
+    assert!(message.contains("[durable_write]"));
+    assert!(!message.contains("SessionEnd"));
 }
 
 #[tokio::test]

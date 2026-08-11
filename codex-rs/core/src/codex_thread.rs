@@ -212,7 +212,7 @@ impl CodexThread {
     }
 
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
-        self.io.shutdown_and_wait().await
+        shutdown_and_verify_rollout_persistence(self.session.as_ref(), &self.io).await
     }
 
     /// Flushes durable recovery state and releases restart-safe remote
@@ -710,4 +710,15 @@ impl CodexThread {
         }
         Ok(elicitations.count)
     }
+}
+
+pub(crate) async fn shutdown_and_verify_rollout_persistence(
+    session: &Session,
+    io: &SessionIo,
+) -> CodexResult<()> {
+    io.shutdown_and_wait().await?;
+    // SessionEnd hooks run inside the session loop and may enqueue their final
+    // lifecycle records after host-detach's flush barrier. Recheck the sticky
+    // projection/write failure only after that loop has fully terminated.
+    session.ensure_rollout_persistence_succeeded().await
 }
