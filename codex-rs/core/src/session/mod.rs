@@ -493,30 +493,26 @@ fn missing_background_session_commits(
 
 fn completed_nonempty_write_after_commit(
     history: &[RolloutItem],
-    session_id: i32,
+    committed: &RemoteExecutionSessionCommitted,
     commit_index: usize,
 ) -> CodexResult<Option<String>> {
-    let completed_calls = history
+    for (call_index, item) in history
         .iter()
-        .filter_map(|item| match item {
-            RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. }) => {
-                Some(call_id.as_str())
-            }
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-
-    for item in history.iter().skip(commit_index.saturating_add(1)) {
-        let RolloutItem::ResponseItem(ResponseItem::FunctionCall {
-            call_id,
-            name,
-            arguments,
-            ..
-        }) = item
+        .enumerate()
+        .skip(commit_index.saturating_add(1))
+    {
+        let RolloutItem::ResponseItem(
+            response @ ResponseItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            },
+        ) = item
         else {
             continue;
         };
-        if name != "write_stdin" || !completed_calls.contains(call_id.as_str()) {
+        if name != "write_stdin" {
             continue;
         }
         let Ok(arguments) = serde_json::from_str::<serde_json::Value>(arguments) else {
@@ -526,12 +522,106 @@ fn completed_nonempty_write_after_commit(
             .get("session_id")
             .and_then(serde_json::Value::as_i64)
             .and_then(|value| i32::try_from(value).ok())
-            == Some(session_id);
+            == Some(committed.session_id);
         let nonempty = arguments
             .get("chars")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|chars| !chars.is_empty());
         if matching_session && nonempty {
+            let Some(turn_id) = response.turn_id() else {
+                return Ok(Some(call_id.clone()));
+            };
+            let matching_outputs = history
+                .iter()
+                .enumerate()
+                .filter_map(|(output_index, item)| match item {
+                    RolloutItem::ResponseItem(
+                        output @ ResponseItem::FunctionCallOutput {
+                            call_id: output_call_id,
+                            ..
+                        },
+                    ) if output_call_id == call_id => Some((output_index, output)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let (output_index, output) = match matching_outputs.as_slice() {
+                [] => continue,
+                [(output_index, output)] => (*output_index, *output),
+                _ => return Ok(Some(call_id.clone())),
+            };
+            let matching_call_count = history
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item,
+                        RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+                            call_id: matching_call_id,
+                            ..
+                        }) if matching_call_id == call_id
+                    )
+                })
+                .count();
+            if matching_call_count != 1 {
+                return Ok(Some(call_id.clone()));
+            }
+            let matching_markers = history
+                .iter()
+                .enumerate()
+                .filter_map(|(marker_index, item)| match item {
+                    RolloutItem::RemoteExecutionProtocolMarker(marker)
+                        if marker.turn_id == turn_id =>
+                    {
+                        Some((marker_index, marker))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let has_dispatch_evidence = history.iter().any(|item| {
+                // A reused or conflicting identity is not evidence of absence:
+                // any durable record for this call keeps recovery fail-closed.
+                matches!(
+                    item,
+                    RolloutItem::RemoteExecutionWriteRequest(request)
+                        if request.receipt_call_id == *call_id
+                ) || matches!(
+                    item,
+                    RolloutItem::RemoteExecutionWriteIntent(intent)
+                        if intent.receipt_call_id == *call_id
+                ) || matches!(
+                    item,
+                    RolloutItem::RemoteExecutionSessionPrepared(prepared)
+                        if prepared.receipt_call_id == *call_id
+                            && matches!(
+                                prepared.receipt_kind,
+                                RemoteExecutionReceiptKind::NonemptyWrite
+                                    | RemoteExecutionReceiptKind::DeliveryUnknownWrite
+                            )
+                ) || matches!(
+                    item,
+                    RolloutItem::RemoteExecutionSessionCommitted(receipt)
+                        if receipt.receipt_call_id == *call_id
+                            && matches!(
+                                receipt.receipt_kind,
+                                RemoteExecutionReceiptKind::NonemptyWrite
+                                    | RemoteExecutionReceiptKind::DeliveryUnknownWrite
+                            )
+                )
+            });
+            let proven_unsent = matches!(
+                matching_markers.as_slice(),
+                [(marker_index, marker)]
+                    if *marker_index < call_index
+                        && marker.thread_id == committed.thread_id
+                        && marker.protocol_version == 2
+                        && marker.identity_schema == "thread-turn-call-generation"
+                        && marker.descriptor_before_go
+                        && marker.stdin_intent_before_write
+            ) && call_index < output_index
+                && output.turn_id() == Some(turn_id)
+                && !has_dispatch_evidence;
+            if proven_unsent {
+                continue;
+            }
             return Ok(Some(call_id.clone()));
         }
     }
@@ -875,7 +965,7 @@ fn remote_write_request_order_is_valid(
     call_index: usize,
     request_index: Option<usize>,
 ) -> bool {
-    committed_index < marker_index
+    committed_index < call_index
         && marker_index < call_index
         && request_index.is_none_or(|request_index| call_index < request_index)
 }
@@ -2565,11 +2655,9 @@ impl Session {
         }
         for (commit_index, committed) in latest.into_values().filter(|(_, commit)| !commit.terminal)
         {
-            if let Some(call_id) = completed_nonempty_write_after_commit(
-                &history.items,
-                committed.session_id,
-                commit_index,
-            )? {
+            if let Some(call_id) =
+                completed_nonempty_write_after_commit(&history.items, &committed, commit_index)?
+            {
                 return Err(CodexErr::Fatal(format!(
                     "background session {} has completed nonempty write_stdin call {call_id} \
                      without a durable stdout cursor receipt; resume is fail-closed",

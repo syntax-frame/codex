@@ -99,18 +99,22 @@ fn completed_legacy_nonempty_write_after_latest_cursor_fails_closed() {
     let history = vec![
         prepared,
         output,
-        RolloutItem::RemoteExecutionSessionCommitted(committed),
+        RolloutItem::RemoteExecutionSessionCommitted(committed.clone()),
         write_stdin_call("stdin-turn", "stdin-legacy", 41, "continue\n"),
         background_output_for_turn("stdin-turn", "stdin-legacy"),
     ];
 
     assert_eq!(
-        completed_nonempty_write_after_commit(&history, 41, 2)
+        completed_nonempty_write_after_commit(&history, &committed, 2)
             .expect("legacy write classification"),
         Some("stdin-legacy".to_string())
     );
+    let other_session = RemoteExecutionSessionCommitted {
+        session_id: 42,
+        ..committed
+    };
     assert_eq!(
-        completed_nonempty_write_after_commit(&history, 42, 2)
+        completed_nonempty_write_after_commit(&history, &other_session, 2)
             .expect("other session classification"),
         None
     );
@@ -144,12 +148,185 @@ fn committed_nonempty_write_cursor_does_not_trigger_legacy_guard() {
         .expect("nonempty write receipt")
         .pop()
         .expect("nonempty write commit");
-    history.push(RolloutItem::RemoteExecutionSessionCommitted(latest));
+    history.push(RolloutItem::RemoteExecutionSessionCommitted(latest.clone()));
 
     assert_eq!(
-        completed_nonempty_write_after_commit(&history, 41, history.len() - 1)
+        completed_nonempty_write_after_commit(&history, &latest, history.len() - 1,)
             .expect("committed write classification"),
         None
+    );
+}
+
+#[test]
+fn completed_v2_predispatch_write_failure_is_proven_unsent_after_round_trip() {
+    let prepared = background_prepared(41, "exec-41", 7);
+    let initial_output = background_output("exec-41");
+    let committed = missing_background_session_commits(&[prepared.clone(), initial_output.clone()])
+        .expect("initial receipt")
+        .pop()
+        .expect("initial commit");
+    let marker = RolloutItem::RemoteExecutionProtocolMarker(RemoteExecutionProtocolMarker {
+        thread_id: "thread".to_string(),
+        turn_id: "same-turn".to_string(),
+        protocol_version: 2,
+        identity_schema: "thread-turn-call-generation".to_string(),
+        descriptor_before_go: true,
+        stdin_intent_before_write: true,
+    });
+    let failed_output = RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "interrupt".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("write_stdin failed before dispatch".to_string()),
+            success: Some(false),
+        },
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some("same-turn".to_string()),
+        }),
+    });
+    let history = [
+        marker,
+        prepared,
+        initial_output,
+        RolloutItem::RemoteExecutionSessionCommitted(committed.clone()),
+        write_stdin_call("same-turn", "interrupt", 41, "\u{3}"),
+        failed_output,
+    ]
+    .iter()
+    .map(persisted_rollout_item)
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        completed_nonempty_write_after_commit(&history, &committed, 3)
+            .expect("v2 pre-dispatch classification"),
+        None
+    );
+
+    let mut duplicate_marker_history = history.clone();
+    duplicate_marker_history.insert(1, duplicate_marker_history[0].clone());
+    assert_eq!(
+        completed_nonempty_write_after_commit(&duplicate_marker_history, &committed, 4,)
+            .expect("duplicate marker classification"),
+        Some("interrupt".to_string())
+    );
+
+    let input_sha256 = remote_receipt_bytes_digest(b"\x03");
+    let mut late_marker_history = history.clone();
+    let late_marker = late_marker_history.remove(0);
+    late_marker_history.insert(4, late_marker);
+    assert_eq!(
+        completed_nonempty_write_after_commit(&late_marker_history, &committed, 2,)
+            .expect("late marker classification"),
+        Some("interrupt".to_string())
+    );
+
+    let write_request = RemoteExecutionWriteRequest {
+        thread_id: committed.thread_id.clone(),
+        exec_turn_id: committed.exec_turn_id.clone(),
+        exec_call_id: committed.exec_call_id.clone(),
+        receipt_turn_id: "same-turn".to_string(),
+        receipt_call_id: "interrupt".to_string(),
+        attempt_generation: committed.attempt_generation,
+        session_id: committed.session_id,
+        command_digest: committed.command_digest.clone(),
+        committed_output_cursor: committed.range_end,
+        input_sha256: input_sha256.clone(),
+        input_len: 1,
+        yield_time_ms: crate::unified_exec::MIN_YIELD_TIME_MS,
+        max_output_tokens: None,
+        truncation_policy: TruncationPolicy::Bytes(2_048),
+    };
+    let mut requested_history = history.clone();
+    requested_history.insert(
+        5,
+        persisted_rollout_item(&RolloutItem::RemoteExecutionWriteRequest(write_request)),
+    );
+    assert_eq!(
+        completed_nonempty_write_after_commit(&requested_history, &committed, 3,)
+            .expect("write request classification"),
+        Some("interrupt".to_string())
+    );
+
+    let mut write_prepared = match background_prepared(41, "interrupt", committed.range_end) {
+        RolloutItem::RemoteExecutionSessionPrepared(prepared) => prepared,
+        _ => unreachable!(),
+    };
+    write_prepared.thread_id = committed.thread_id.clone();
+    write_prepared.exec_turn_id = committed.exec_turn_id.clone();
+    write_prepared.exec_call_id = committed.exec_call_id.clone();
+    write_prepared.receipt_turn_id = "same-turn".to_string();
+    write_prepared.receipt_kind = RemoteExecutionReceiptKind::NonemptyWrite;
+    write_prepared.attempt_generation = committed.attempt_generation;
+    write_prepared.command_digest = committed.command_digest.clone();
+    write_prepared.range_start = committed.range_end;
+    let mut prepared_history = history.clone();
+    prepared_history.insert(
+        5,
+        persisted_rollout_item(&RolloutItem::RemoteExecutionSessionPrepared(
+            write_prepared.clone(),
+        )),
+    );
+    assert_eq!(
+        completed_nonempty_write_after_commit(&prepared_history, &committed, 3,)
+            .expect("nonempty-write preparation classification"),
+        Some("interrupt".to_string())
+    );
+
+    let write_commit = RemoteExecutionSessionCommitted {
+        thread_id: write_prepared.thread_id.clone(),
+        exec_turn_id: write_prepared.exec_turn_id.clone(),
+        exec_call_id: write_prepared.exec_call_id.clone(),
+        receipt_turn_id: write_prepared.receipt_turn_id.clone(),
+        receipt_call_id: write_prepared.receipt_call_id.clone(),
+        receipt_kind: write_prepared.receipt_kind.clone(),
+        attempt_generation: write_prepared.attempt_generation,
+        session_id: write_prepared.session_id,
+        command_digest: write_prepared.command_digest.clone(),
+        range_start: write_prepared.range_start,
+        range_end: write_prepared.range_end,
+        receipt_output_digest: write_prepared.receipt_output_digest.clone(),
+        prepared_receipt_digest: prepared_remote_receipt_digest(&write_prepared)
+            .expect("matching preparation digest"),
+        terminal_acknowledgement_token: write_prepared.terminal_acknowledgement_token.clone(),
+        terminal_output_digest: write_prepared.terminal_output_digest.clone(),
+        terminal_status: write_prepared.terminal_status.clone(),
+        terminal: write_prepared.terminal_candidate,
+    };
+    let mut committed_history = history.clone();
+    committed_history.insert(
+        5,
+        persisted_rollout_item(&RolloutItem::RemoteExecutionSessionCommitted(write_commit)),
+    );
+    assert_eq!(
+        completed_nonempty_write_after_commit(&committed_history, &committed, 3,)
+            .expect("nonempty-write commit classification"),
+        Some("interrupt".to_string())
+    );
+
+    let mut ambiguous_history = history;
+    ambiguous_history.insert(
+        5,
+        persisted_rollout_item(&RolloutItem::RemoteExecutionWriteIntent(
+            RemoteExecutionWriteIntent {
+                thread_id: "thread".to_string(),
+                exec_turn_id: committed.exec_turn_id.clone(),
+                exec_call_id: committed.exec_call_id.clone(),
+                receipt_turn_id: "same-turn".to_string(),
+                receipt_call_id: "interrupt".to_string(),
+                attempt_generation: committed.attempt_generation,
+                session_id: 41,
+                command_digest: committed.command_digest.clone(),
+                committed_output_cursor: committed.range_end,
+                write_id: "a".repeat(64),
+                input_sha256,
+                input_len: 1,
+            },
+        )),
+    );
+    assert_eq!(
+        completed_nonempty_write_after_commit(&ambiguous_history, &committed, 3,)
+            .expect("v2 delivery-unknown classification"),
+        Some("interrupt".to_string())
     );
 }
 
@@ -927,14 +1104,12 @@ fn pending_nonempty_write_replay_preserves_persisted_polling_parameters() {
 }
 
 #[test]
-fn remote_write_request_requires_commit_marker_call_request_order() {
+fn remote_write_request_accepts_both_valid_commit_marker_topologies() {
     assert!(remote_write_request_order_is_valid(0, 1, 2, Some(3)));
     assert!(remote_write_request_order_is_valid(0, 1, 2, None));
-    assert!(
-        !remote_write_request_order_is_valid(1, 0, 2, Some(3)),
-        "a marker from before the latest committed cursor cannot authorize stdin"
-    );
+    assert!(remote_write_request_order_is_valid(1, 0, 2, Some(3)));
     assert!(!remote_write_request_order_is_valid(0, 2, 1, Some(3)));
+    assert!(!remote_write_request_order_is_valid(2, 0, 1, Some(3)));
     assert!(!remote_write_request_order_is_valid(0, 1, 3, Some(2)));
 }
 

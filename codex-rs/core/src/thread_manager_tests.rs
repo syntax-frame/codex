@@ -590,7 +590,7 @@ fn scanner_rejects_stdin_intent_bound_to_an_earlier_session_cursor() {
 }
 
 #[test]
-fn scanner_rejects_stdin_request_when_commit_follows_turn_marker() {
+fn scanner_accepts_same_turn_commit_between_marker_and_stdin_call() {
     let input = "continue\n";
     let history = vec![
         scanner_marker("thread", "write-turn", 2),
@@ -610,10 +610,22 @@ fn scanner_rejects_stdin_request_when_commit_follows_turn_marker() {
             17,
             input,
         ),
+        scanner_write_intent(
+            "thread",
+            "write-turn",
+            "write-call",
+            42,
+            "command-digest",
+            17,
+            input,
+        ),
     ];
 
-    ThreadManager::scan_active_remote_calls("thread".to_string(), &history)
-        .expect_err("a marker from before the committed cursor must not authorize stdin");
+    let request =
+        ThreadManager::scan_active_remote_calls("thread".to_string(), &history).expect("scan");
+    assert_eq!(request.pending_writes.len(), 1);
+    assert!(request.pending_writes[0].pre_send_intent_required);
+    assert!(request.pending_writes[0].pre_send_intent_persisted);
 }
 
 #[test]

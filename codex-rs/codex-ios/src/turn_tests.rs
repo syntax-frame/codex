@@ -59,10 +59,12 @@ use super::finish_turn_after_cleanup;
 use super::finish_turn_with_cleanup;
 use super::interrupted_model_turn_cleanup_error;
 use super::model_context_resume_error_class;
+use super::model_context_resume_error_reason;
 use super::parse_agentapp_dynamic_tools_json;
 use super::parse_reasoning_effort;
 use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
+use super::persistent_model_context_resume_error;
 use super::persistent_model_context_storage_error;
 use super::prompt_image_uploads;
 use super::read_thread_pointer;
@@ -679,6 +681,23 @@ fn model_context_resume_errors_are_content_free_stable_classes() {
         model_context_resume_error_class(&CodexErr::Fatal("private structural detail".to_string())),
         "invalid_or_unavailable"
     );
+    let receipt_gap = CodexErr::Fatal(
+        "background session private has completed nonempty write_stdin call private \
+         without a durable stdout cursor receipt"
+            .to_string(),
+    );
+    assert_eq!(
+        model_context_resume_error_reason(&receipt_gap),
+        "remote_write_receipt_gap"
+    );
+    let public_message = persistent_model_context_resume_error("thread_resume", &receipt_gap);
+    assert_eq!(
+        public_message,
+        "failed to resume persistent model context \
+         [invalid_or_unavailable;stage=thread_resume;reason=remote_write_receipt_gap]"
+    );
+    assert!(!public_message.contains("background session private"));
+    assert!(!public_message.contains("write_stdin call private"));
 }
 
 #[test]
@@ -1105,7 +1124,8 @@ fn failed_model_context_resume_preserves_pointer_and_rollout() {
     );
     assert_eq!(
         events[1].1,
-        "failed to resume persistent model context [malformed_json]"
+        "failed to resume persistent model context \
+         [malformed_json;stage=execution_reconciliation;reason=rollout_read]"
     );
     assert!(
         !events[1].1.contains(relative_rollout),
@@ -1151,7 +1171,8 @@ fn truncated_model_context_resume_preserves_typed_failure() {
     );
     assert_eq!(
         events[1].1,
-        "failed to resume persistent model context [truncated_record]"
+        "failed to resume persistent model context \
+         [truncated_record;stage=execution_reconciliation;reason=rollout_read]"
     );
     assert_eq!(
         std::fs::read(pointer_path).expect("preserved pointer"),

@@ -377,13 +377,42 @@ fn model_context_resume_error_class(error: &codex_protocol::error::CodexErr) -> 
     }
 }
 
+fn model_context_resume_error_reason(error: &codex_protocol::error::CodexErr) -> &'static str {
+    match error {
+        codex_protocol::error::CodexErr::Fatal(detail)
+            if detail.contains("completed nonempty write_stdin call")
+                && detail.contains("without a durable stdout cursor receipt") =>
+        {
+            "remote_write_receipt_gap"
+        }
+        codex_protocol::error::CodexErr::Fatal(_) => "structural_invariant",
+        codex_protocol::error::CodexErr::Io(error)
+            if codex_rollout::rollout_read_error(error).is_some() =>
+        {
+            "rollout_read"
+        }
+        codex_protocol::error::CodexErr::Io(_) => "io_failure",
+        codex_protocol::error::CodexErr::Json(_) => "serialization_failure",
+        _ => "runtime_failure",
+    }
+}
+
 fn persistent_model_context_resume_error(
     stage: &'static str,
     error: &codex_protocol::error::CodexErr,
 ) -> String {
     let error_class = model_context_resume_error_class(error);
-    tracing::warn!(stage, error_class, "persistent model-context resume failed");
-    format!("failed to resume persistent model context [{error_class}]")
+    let reason = model_context_resume_error_reason(error);
+    tracing::warn!(
+        stage,
+        error_class,
+        reason,
+        "persistent model-context resume failed"
+    );
+    format!(
+        "failed to resume persistent model context \
+         [{error_class};stage={stage};reason={reason}]"
+    )
 }
 
 fn persistent_model_context_storage_error(

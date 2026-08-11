@@ -961,8 +961,14 @@ impl ThreadManager {
                             request.receipt_call_id
                         )));
                     }
-                    let call_matches = calls.get(&request.receipt_call_id).is_some_and(
-                        |(_, turn_id, interaction, protocol_evidence, pre_send_intent_required)| {
+                    let matching_call_index = calls.get(&request.receipt_call_id).and_then(
+                        |(
+                            call_index,
+                            turn_id,
+                            interaction,
+                            protocol_evidence,
+                            pre_send_intent_required,
+                        )| {
                             let Some((
                                 session_id,
                                 input_is_empty,
@@ -972,9 +978,9 @@ impl ThreadManager {
                                 max_output_tokens,
                             )) = interaction
                             else {
-                                return false;
+                                return None;
                             };
-                            turn_id == &request.receipt_turn_id
+                            (turn_id == &request.receipt_turn_id
                                 && *session_id == request.session_id
                                 && !*input_is_empty
                                 && input_sha256 == &request.input_sha256
@@ -982,7 +988,8 @@ impl ThreadManager {
                                 && *yield_time_ms == request.yield_time_ms
                                 && *max_output_tokens == request.max_output_tokens
                                 && *protocol_evidence == RemoteExecutionProtocolEvidence::V2Proven
-                                && *pre_send_intent_required
+                                && *pre_send_intent_required)
+                                .then_some(*call_index)
                         },
                     );
                     let marker_index = marker_state
@@ -999,15 +1006,18 @@ impl ThreadManager {
                                 && committed.session_id == request.session_id
                         })
                         .is_some_and(|(commit_index, committed)| {
-                            marker_index.is_some_and(|marker_index| *commit_index < marker_index)
-                                && !committed.terminal
+                            marker_index.zip(matching_call_index).is_some_and(
+                                |(marker_index, call_index)| {
+                                    *commit_index < call_index && marker_index < call_index
+                                },
+                            ) && !committed.terminal
                                 && committed.exec_turn_id == request.exec_turn_id
                                 && committed.exec_call_id == request.exec_call_id
                                 && committed.attempt_generation == request.attempt_generation
                                 && committed.command_digest == request.command_digest
                                 && committed.range_end == request.committed_output_cursor
                         });
-                    if !call_matches
+                    if matching_call_index.is_none()
                         || !committed_matches
                         || outputs.contains(&request.receipt_call_id)
                     {
@@ -1047,19 +1057,20 @@ impl ThreadManager {
                             intent.receipt_call_id
                         )));
                     }
-                    let call_matches = calls.get(&intent.receipt_call_id).is_some_and(
-                        |(_, turn_id, interaction, protocol_evidence, _)| {
+                    let matching_call_index = calls.get(&intent.receipt_call_id).and_then(
+                        |(call_index, turn_id, interaction, protocol_evidence, _)| {
                             let Some((session_id, input_is_empty, input_sha256, input_len, _, _)) =
                                 interaction
                             else {
-                                return false;
+                                return None;
                             };
-                            turn_id == &intent.receipt_turn_id
+                            (turn_id == &intent.receipt_turn_id
                                 && *session_id == intent.session_id
                                 && !*input_is_empty
                                 && input_sha256 == &intent.input_sha256
                                 && *input_len == intent.input_len
-                                && *protocol_evidence == RemoteExecutionProtocolEvidence::V2Proven
+                                && *protocol_evidence == RemoteExecutionProtocolEvidence::V2Proven)
+                                .then_some(*call_index)
                         },
                     );
                     let marker_index = marker_state
@@ -1076,8 +1087,11 @@ impl ThreadManager {
                                 && committed.session_id == intent.session_id
                         })
                         .is_some_and(|(commit_index, committed)| {
-                            marker_index.is_some_and(|marker_index| *commit_index < marker_index)
-                                && !committed.terminal
+                            marker_index.zip(matching_call_index).is_some_and(
+                                |(marker_index, call_index)| {
+                                    *commit_index < call_index && marker_index < call_index
+                                },
+                            ) && !committed.terminal
                                 && committed.exec_turn_id == intent.exec_turn_id
                                 && committed.exec_call_id == intent.exec_call_id
                                 && committed.attempt_generation == intent.attempt_generation
@@ -1106,7 +1120,7 @@ impl ThreadManager {
                                 && request.input_len == intent.input_len
                         })
                         .unwrap_or(!request_required);
-                    if !call_matches
+                    if matching_call_index.is_none()
                         || !committed_matches
                         || !request_matches
                         || outputs.contains(&intent.receipt_call_id)
