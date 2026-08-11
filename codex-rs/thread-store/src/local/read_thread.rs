@@ -275,6 +275,10 @@ async fn read_thread_from_rollout_path(
     path: std::path::PathBuf,
 ) -> ThreadStoreResult<StoredThread> {
     let Some(item) = read_thread_item_from_rollout(path.clone()).await else {
+        // The lightweight summary reader intentionally suppresses malformed
+        // records. Run the typed full-history loader before falling back to
+        // session metadata so resume callers retain the structural cause.
+        load_history_items(path.as_path()).await?;
         return stored_thread_from_session_meta(store, path).await;
     };
     let archived = rollout_path_is_archived(store.config.codex_home.as_path(), path.as_path());
@@ -313,9 +317,7 @@ pub(super) async fn load_history_items(
 ) -> ThreadStoreResult<Vec<codex_protocol::protocol::RolloutItem>> {
     let (items, _, _) = RolloutRecorder::load_rollout_items(path)
         .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to load thread history: {err}"),
-        })?;
+        .map_err(|source| ThreadStoreError::RolloutRead { source })?;
     Ok(items)
 }
 
@@ -442,9 +444,7 @@ async fn read_required_session_meta_line(
 ) -> ThreadStoreResult<SessionMetaLine> {
     read_session_meta_line(path)
         .await
-        .map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to read session metadata {}: {err}", path.display()),
-        })
+        .map_err(|source| ThreadStoreError::RolloutRead { source })
 }
 
 fn stored_thread_from_meta_line(

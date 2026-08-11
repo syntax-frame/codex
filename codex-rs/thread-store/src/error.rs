@@ -46,6 +46,15 @@ pub enum ThreadStoreError {
         operation: &'static str,
     },
 
+    /// A rollout loader rejected persisted history. Preserve the typed I/O source so clients can
+    /// classify structural failures without exposing rollout contents or filesystem paths.
+    #[error("thread rollout could not be read")]
+    RolloutRead {
+        /// Typed loader failure wrapped by the rollout crate.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Catch-all for implementation failures that do not fit a more specific category.
     #[error("thread-store internal error: {message}")]
     Internal {

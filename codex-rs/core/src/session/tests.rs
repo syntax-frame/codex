@@ -7079,6 +7079,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        rollout_persistence_failure: Mutex::new(None),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
@@ -9140,6 +9141,62 @@ async fn shutdown_and_wait_propagates_thread_persistence_shutdown_failure() {
 }
 
 #[tokio::test]
+async fn swallowed_rollout_write_failure_stays_sticky_until_host_detach() {
+    let (mut session, _turn_context) = make_session_and_context().await;
+    let config = session.get_config().await;
+    let store = Arc::new(codex_thread_store::LocalThreadStore::new(
+        codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
+        /*state_db*/ None,
+    ));
+    let thread_store: Arc<dyn codex_thread_store::ThreadStore> = store.clone();
+    let live_thread = LiveThread::create(
+        Arc::clone(&thread_store),
+        CreateThreadParams {
+            session_id: session.session_id(),
+            thread_id: session.thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: Default::default(),
+            subagent_history_start_ordinal: None,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(config.cwd.to_path_buf()),
+                model_provider: config.model_provider_id.clone(),
+                memory_mode: ThreadMemoryMode::Disabled,
+            },
+        },
+    )
+    .await
+    .expect("create thread persistence");
+    codex_thread_store::ThreadStore::shutdown_thread(store.as_ref(), session.thread_id)
+        .await
+        .expect("close recorder before append");
+    session.services.thread_store = thread_store;
+    session.services.live_thread = Some(live_thread);
+
+    session
+        .persist_rollout_items(&[RolloutItem::ResponseItem(user_message(
+            "private persisted content",
+        ))])
+        .await;
+    let error = session
+        .ensure_rollout_persistence_succeeded()
+        .await
+        .expect_err("earlier write failure must block host detach");
+    let message = error.to_string();
+    assert!(message.contains("[durable_write]"));
+    assert!(!message.contains("private persisted content"));
+}
+
+#[tokio::test]
 async fn shutdown_and_wait_shuts_down_cached_guardian_subagent() {
     let (parent_session, parent_turn_context) = make_session_and_context().await;
     let parent_session = Arc::new(parent_session);
@@ -9546,6 +9603,7 @@ where
         tx_event,
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        rollout_persistence_failure: Mutex::new(None),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),

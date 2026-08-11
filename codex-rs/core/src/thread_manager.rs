@@ -2846,6 +2846,7 @@ fn thread_store_rollout_read_error(err: ThreadStoreError) -> CodexErr {
     match err {
         ThreadStoreError::ThreadNotFound { thread_id } => CodexErr::ThreadNotFound(thread_id),
         ThreadStoreError::InvalidRequest { message } => CodexErr::InvalidRequest(message),
+        ThreadStoreError::RolloutRead { source } => CodexErr::Io(source),
         err => CodexErr::Fatal(format!("failed to read thread by rollout path: {err}")),
     }
 }

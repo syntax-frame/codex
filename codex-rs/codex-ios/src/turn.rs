@@ -377,13 +377,22 @@ fn model_context_resume_error_class(error: &codex_protocol::error::CodexErr) -> 
     }
 }
 
+fn persistent_model_context_resume_error(
+    stage: &'static str,
+    error: &codex_protocol::error::CodexErr,
+) -> String {
+    let error_class = model_context_resume_error_class(error);
+    tracing::warn!(stage, error_class, "persistent model-context resume failed");
+    format!("failed to resume persistent model context [{error_class}]")
+}
+
 fn persistent_model_context_storage_error(
     operation: &'static str,
     error: &impl std::fmt::Display,
 ) -> String {
     tracing::warn!(
         operation,
-        error = %error,
+        error_type = std::any::type_name_of_val(error),
         "persistent model-context storage operation failed"
     );
     format!("failed to {operation} persistent model context")
@@ -631,6 +640,21 @@ fn finish_turn_with_cleanup(
         );
         TurnFailure::ProtectedAlreadyReported
     })
+}
+
+fn finish_turn_after_cleanup(
+    callback: EventCallback,
+    ctx: *mut c_void,
+    completed_turn: bool,
+    protected_error_emitted: bool,
+    turn_result: Result<(), String>,
+    cleanup_result: Result<(), String>,
+) -> Result<(), TurnFailure> {
+    let result = finish_turn_with_cleanup(protected_error_emitted, turn_result, cleanup_result);
+    if completed_turn && result.is_ok() {
+        emit(callback, ctx, KIND_DONE, "");
+    }
+    result
 }
 
 fn emit_turn_result(
@@ -931,10 +955,7 @@ enum OAuthDefaultsResolution {
 /// policy as normal model selection. ChatGPT/OAuth accounts may use a model
 /// that is not API-key eligible; API-key callers remain limited to
 /// `supported_in_api` presets.
-fn resolve_oauth_preset(
-    picker: &[ModelPreset],
-    chatgpt_mode: bool,
-) -> Result<ModelPreset, String> {
+fn resolve_oauth_preset(picker: &[ModelPreset], chatgpt_mode: bool) -> Result<ModelPreset, String> {
     let authenticated_models = ModelPreset::filter_by_auth(picker.to_vec(), chatgpt_mode);
     authenticated_models
         .iter()
@@ -957,10 +978,15 @@ fn resolve_oauth_effort(
         .iter()
         .find(|effort| effort.effort.to_string() == "medium")
         .map(|effort| effort.effort.clone())
-        .or_else(|| declared_default.filter(|default| {
-            supported.iter().any(|effort| effort.effort == *default)
-        }))
-        .or_else(|| supported.get(supported.len() / 2).map(|effort| effort.effort.clone()))
+        .or_else(|| {
+            declared_default
+                .filter(|default| supported.iter().any(|effort| effort.effort == *default))
+        })
+        .or_else(|| {
+            supported
+                .get(supported.len() / 2)
+                .map(|effort| effort.effort.clone())
+        })
         .ok_or_else(|| "OAuth default model has no usable reasoning effort".to_string())
 }
 
@@ -1433,10 +1459,7 @@ pub(crate) async fn run_turn_async(
             .execution_reconciliation_request_from_rollout(rollout_path.clone())
             .await
             .map_err(|error| {
-                format!(
-                    "failed to resume persistent model context [{}]",
-                    model_context_resume_error_class(&error)
-                )
+                persistent_model_context_resume_error("execution_reconciliation", &error)
             })?;
         let pending_writes = reconciliation_request.pending_writes.clone();
         let recovered_executions = thread_manager
@@ -1457,12 +1480,7 @@ pub(crate) async fn run_turn_async(
                 pending_writes,
             )
             .await
-            .map_err(|error| {
-                format!(
-                    "failed to resume persistent model context [{}]",
-                    model_context_resume_error_class(&error)
-                )
-            })?;
+            .map_err(|error| persistent_model_context_resume_error("thread_resume", &error))?;
         resumed = true;
         emit_debug_stage(callback, ctx, "thread_resumed");
         thread
@@ -1476,6 +1494,7 @@ pub(crate) async fn run_turn_async(
     let thread = new_thread.thread;
     let session_model = new_thread.session_configured.model.clone();
     let mut protected_error_emitted = false;
+    let mut completed_turn = false;
     let turn_result: Result<(), String> = async {
 
     // `history_json` is retained for legacy bridge callers that still need to
@@ -1968,7 +1987,7 @@ pub(crate) async fn run_turn_async(
                         emit(callback, ctx, KIND_HISTORY, &json);
                     }
                 }
-                emit(callback, ctx, KIND_DONE, "");
+                completed_turn = true;
                 return Ok(());
             }
             _ => {}
@@ -1979,12 +1998,14 @@ pub(crate) async fn run_turn_async(
     let cleanup_result = match claim_turn_exit_disposition(turn_handle) {
         Ok(exit_disposition) => match exit_disposition {
             TurnExitDisposition::HostDetach => {
-                let detach_result = thread.prepare_for_host_detach().await.map_err(|error| {
-                    format!("failed to flush model context before host detach: {error}")
-                });
-                let shutdown_result = thread.shutdown_and_wait().await.map_err(|error| {
-                    format!("failed to finish model-context host detach: {error}")
-                });
+                let detach_result = thread
+                    .prepare_for_host_detach()
+                    .await
+                    .map_err(|error| persistent_model_context_storage_error("flush", &error));
+                let shutdown_result = thread
+                    .shutdown_and_wait()
+                    .await
+                    .map_err(|error| persistent_model_context_storage_error("shutdown", &error));
                 match (detach_result, shutdown_result) {
                     (Ok(()), Ok(())) => Ok(()),
                     (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -2000,7 +2021,14 @@ pub(crate) async fn run_turn_async(
         },
         Err(error) => Err(error),
     };
-    finish_turn_with_cleanup(protected_error_emitted, turn_result, cleanup_result)
+    finish_turn_after_cleanup(
+        callback,
+        ctx,
+        completed_turn,
+        protected_error_emitted,
+        turn_result,
+        cleanup_result,
+    )
 }
 
 fn disable_upstream_multi_agent(config: &mut Config) {

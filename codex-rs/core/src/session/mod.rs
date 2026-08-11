@@ -1189,6 +1189,7 @@ pub(crate) use self::input_queue::TurnInputQueue;
 pub use self::mcp_runtime::McpRuntimeSnapshot;
 use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
+use self::session::RolloutPersistenceFailure;
 use self::session::Session;
 use self::session::SessionConfiguration;
 pub(crate) use self::session::SessionSettingsUpdate;
@@ -6859,16 +6860,45 @@ impl Session {
             Ok(items) => items,
             Err(error) => {
                 error!(
+                    failure_class = RolloutPersistenceFailure::ArgumentPrivacyProjection.code(),
                     error_type = std::any::type_name_of_val(&error),
                     "refusing to persist rollout items that could not be privacy-projected"
                 );
+                self.record_rollout_persistence_failure(
+                    RolloutPersistenceFailure::ArgumentPrivacyProjection,
+                )
+                .await;
                 return;
             }
         };
         if let Some(live_thread) = self.live_thread()
             && let Err(e) = live_thread.append_items(&projected_items).await
         {
-            error!("failed to record rollout items: {e:#}");
+            error!(
+                failure_class = RolloutPersistenceFailure::DurableWrite.code(),
+                error_type = std::any::type_name_of_val(&e),
+                "failed to record rollout items"
+            );
+            self.record_rollout_persistence_failure(RolloutPersistenceFailure::DurableWrite)
+                .await;
+        }
+    }
+
+    async fn record_rollout_persistence_failure(&self, failure: RolloutPersistenceFailure) {
+        let mut recorded = self.rollout_persistence_failure.lock().await;
+        if recorded.is_none() {
+            *recorded = Some(failure);
+        }
+    }
+
+    pub(crate) async fn ensure_rollout_persistence_succeeded(&self) -> CodexResult<()> {
+        let failure = *self.rollout_persistence_failure.lock().await;
+        match failure {
+            Some(failure) => Err(CodexErr::Fatal(format!(
+                "persistent model context write failed [{}]",
+                failure.code()
+            ))),
+            None => Ok(()),
         }
     }
 

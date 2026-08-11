@@ -219,12 +219,14 @@ impl CodexThread {
     /// executions without signalling them. The ordinary session-loop teardown
     /// will still terminate local and non-recoverable processes.
     pub async fn prepare_for_host_detach(&self) -> CodexResult<()> {
+        self.session.ensure_rollout_persistence_succeeded().await?;
         if let Some(live_thread) = self.session.live_thread() {
             live_thread
                 .flush()
                 .await
                 .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
         }
+        self.session.ensure_rollout_persistence_succeeded().await?;
         self.session
             .services
             .unified_exec_manager

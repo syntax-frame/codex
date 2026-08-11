@@ -31,6 +31,9 @@ pub(crate) struct Session {
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
+    /// First rollout persistence failure observed by a best-effort event path. Sticky for the
+    /// session lifetime so a later successful flush cannot falsely acknowledge missing history.
+    pub(super) rollout_persistence_failure: Mutex<Option<RolloutPersistenceFailure>>,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
     pub(super) managed_network_proxy_refresh_lock: Semaphore,
@@ -49,6 +52,21 @@ pub(crate) struct Session {
     /// apply it without taking a lock or risking a re-entrant deadlock.
     pub(super) dynamic_tool_argument_policy: DynamicToolArgumentPolicy,
     pub(super) next_internal_sub_id: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RolloutPersistenceFailure {
+    ArgumentPrivacyProjection,
+    DurableWrite,
+}
+
+impl RolloutPersistenceFailure {
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            Self::ArgumentPrivacyProjection => "argument_privacy_projection",
+            Self::DurableWrite => "durable_write",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1159,6 +1177,7 @@ impl Session {
                 tx_event: tx_event.clone(),
                 agent_status,
                 state: Mutex::new(state),
+                rollout_persistence_failure: Mutex::new(None),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),
                 multi_agent_version,

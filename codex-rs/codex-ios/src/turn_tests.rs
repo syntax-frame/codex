@@ -23,8 +23,8 @@ use codex_features::Feature;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
-use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::ItemStartedEvent;
 
@@ -54,6 +54,7 @@ use super::disable_upstream_multi_agent;
 use super::emit;
 use super::emit_item_started_events;
 use super::emit_turn_result;
+use super::finish_turn_after_cleanup;
 use super::finish_turn_with_cleanup;
 use super::model_context_resume_error_class;
 use super::parse_agentapp_dynamic_tools_json;
@@ -64,12 +65,12 @@ use super::persistent_model_context_storage_error;
 use super::prompt_image_uploads;
 use super::read_thread_pointer;
 use super::register_starting_turn;
+use super::resolve_oauth_effort;
+use super::resolve_oauth_preset;
 use super::startup_interrupt_requested;
 use super::tool_discovery_event_json;
 use super::validate_relative_rollout_path;
 use super::write_thread_pointer;
-use super::resolve_oauth_effort;
-use super::resolve_oauth_preset;
 
 fn oauth_preset(model: &str, is_default: bool) -> ModelPreset {
     ModelPreset {
@@ -94,7 +95,10 @@ fn oauth_preset(model: &str, is_default: bool) -> ModelPreset {
 }
 
 fn effort(effort: ReasoningEffort) -> ReasoningEffortPreset {
-    ReasoningEffortPreset { effort, description: String::new() }
+    ReasoningEffortPreset {
+        effort,
+        description: String::new(),
+    }
 }
 
 #[test]
@@ -108,7 +112,10 @@ fn oauth_default_policy_prefers_flag_then_ranked_picker_and_concrete_effort() {
         resolve_oauth_preset(&ranked, true).unwrap().model,
         "default"
     );
-    let no_default = vec![oauth_preset("strongest", false), oauth_preset("weaker", false)];
+    let no_default = vec![
+        oauth_preset("strongest", false),
+        oauth_preset("weaker", false),
+    ];
     assert_eq!(
         resolve_oauth_preset(&no_default, true).unwrap().model,
         "strongest"
@@ -123,7 +130,10 @@ fn oauth_default_policy_prefers_flag_then_ranked_picker_and_concrete_effort() {
     );
     assert_eq!(
         resolve_oauth_effort(
-            &[effort(ReasoningEffort::Low), effort(ReasoningEffort::Medium)],
+            &[
+                effort(ReasoningEffort::Low),
+                effort(ReasoningEffort::Medium)
+            ],
             Some(ReasoningEffort::Low),
         )
         .unwrap(),
@@ -614,6 +624,48 @@ fn protected_turn_post_error_failures_never_cross_ffi() {
 }
 
 #[test]
+fn done_is_emitted_only_after_successful_persistence_cleanup() {
+    let mut events = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+
+    let success = finish_turn_after_cleanup(
+        capture_event,
+        ctx,
+        /*completed_turn*/ true,
+        /*protected_error_emitted*/ false,
+        Ok(()),
+        Ok(()),
+    );
+    emit_turn_result(capture_event, ctx, Ok(success));
+    assert_eq!(events, vec![(KIND_DONE, String::new())]);
+
+    events.clear();
+    let private_detail = "/private/context/rollout.jsonl: secret record";
+    let cleanup_error = persistent_model_context_storage_error("shutdown", &private_detail);
+    let failure = finish_turn_after_cleanup(
+        capture_event,
+        ctx,
+        /*completed_turn*/ true,
+        /*protected_error_emitted*/ false,
+        Ok(()),
+        Err(cleanup_error),
+    );
+    emit_turn_result(capture_event, ctx, Ok(failure));
+    assert_eq!(
+        events,
+        vec![(
+            KIND_ERROR,
+            "failed to shutdown persistent model context".to_string(),
+        )]
+    );
+    assert!(
+        events
+            .iter()
+            .all(|(_, message)| !message.contains(private_detail))
+    );
+}
+
+#[test]
 fn password_authentication_preserves_secret_without_temp_file() {
     let secret = " password with spaces ".to_string();
     let (authentication, guard) =
@@ -935,10 +987,9 @@ fn failed_model_context_resume_preserves_pointer_and_rollout() {
         events.iter().map(|event| event.0).collect::<Vec<_>>(),
         vec![KIND_TURN_READY, KIND_ERROR]
     );
-    assert!(
-        events[1]
-            .1
-            .contains("failed to resume persistent model context")
+    assert_eq!(
+        events[1].1,
+        "failed to resume persistent model context [malformed_json]"
     );
     assert!(
         !events[1].1.contains(relative_rollout),
@@ -947,6 +998,44 @@ fn failed_model_context_resume_preserves_pointer_and_rollout() {
     assert!(
         !events[0].1.contains("not a valid rollout"),
         "public resume errors must not expose record content"
+    );
+    assert_eq!(
+        std::fs::read(pointer_path).expect("preserved pointer"),
+        pointer_bytes
+    );
+    assert_eq!(
+        std::fs::read(rollout_path).expect("preserved rollout"),
+        rollout_bytes
+    );
+}
+
+#[test]
+fn truncated_model_context_resume_preserves_typed_failure() {
+    let home = tempfile::tempdir().expect("context home");
+    let relative_rollout = "sessions/thread.jsonl";
+    let rollout_path = home.path().join(relative_rollout);
+    std::fs::create_dir_all(rollout_path.parent().expect("rollout parent"))
+        .expect("rollout parent");
+    let rollout_bytes = br#"{"timestamp":"truncated""#;
+    std::fs::write(&rollout_path, rollout_bytes).expect("truncated rollout");
+    let pointer = PersistedThreadPointer {
+        version: 1,
+        thread_id: codex_protocol::ThreadId::new().to_string(),
+        rollout_path: relative_rollout.to_string(),
+    };
+    let pointer_bytes = serde_json::to_vec(&pointer).expect("pointer JSON");
+    let pointer_path = home.path().join(CONTEXT_POINTER_FILE);
+    std::fs::write(&pointer_path, &pointer_bytes).expect("pointer");
+
+    let events = run_apikey_turn(home.path());
+
+    assert_eq!(
+        events.iter().map(|event| event.0).collect::<Vec<_>>(),
+        vec![KIND_TURN_READY, KIND_ERROR]
+    );
+    assert_eq!(
+        events[1].1,
+        "failed to resume persistent model context [truncated_record]"
     );
     assert_eq!(
         std::fs::read(pointer_path).expect("preserved pointer"),

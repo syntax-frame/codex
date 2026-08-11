@@ -48,6 +48,20 @@ use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+#[test]
+fn rollout_read_error_mapping_preserves_typed_loader_source() {
+    let error = thread_store_rollout_read_error(ThreadStoreError::RolloutRead {
+        source: std::io::Error::other(codex_rollout::RolloutReadError::MalformedJson { record: 7 }),
+    });
+    let CodexErr::Io(source) = error else {
+        panic!("rollout read failure must remain typed I/O");
+    };
+    assert!(matches!(
+        codex_rollout::rollout_read_error(&source),
+        Some(codex_rollout::RolloutReadError::MalformedJson { record: 7 })
+    ));
+}
+
 fn scanner_call(name: &str, call_id: &str, turn_id: &str, arguments: &str) -> RolloutItem {
     let mut item = ResponseItem::FunctionCall {
         id: None,
