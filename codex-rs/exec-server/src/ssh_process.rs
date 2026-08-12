@@ -57,6 +57,7 @@ mod tmux;
 const RETAINED_OUTPUT_BYTES_PER_PROCESS: usize = 1024 * 1024;
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const SSH_START_ATTEMPTS: usize = 2;
+const SSH_SIGNAL_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_TERMINATE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_PATH_EXPORT: &str = "export PATH=\"$HOME/bin:$HOME/.local/bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}\"";
 
@@ -308,8 +309,6 @@ impl SshProcessBackend {
         Ok(StartedExecProcess {
             process: Arc::new(SshProcess {
                 process_id,
-                tty: params.tty,
-                tmux: false,
                 events,
                 wake_tx,
                 output_notify,
@@ -497,7 +496,10 @@ enum ChannelCommand {
         write_id: Option<String>,
         ack: oneshot::Sender<Result<(), String>>,
     },
-    Signal(Sig),
+    Signal {
+        signal: Sig,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
     Terminate {
         ack: oneshot::Sender<Result<(), String>>,
     },
@@ -505,8 +507,6 @@ enum ChannelCommand {
 
 struct SshProcess {
     process_id: ProcessId,
-    tty: bool,
-    tmux: bool,
     events: ExecProcessEventLog,
     wake_tx: watch::Sender<u64>,
     output_notify: Arc<Notify>,
@@ -634,25 +634,26 @@ impl ExecProcessImpl for SshProcess {
         let sig = match signal {
             ProcessSignal::Interrupt => Sig::INT,
         };
-        // Best effort: try the SSH signal request; if the channel is gone, fall
-        // back to injecting Ctrl-C into stdin (only meaningful with a PTY, but
-        // harmless otherwise). Either way report success.
-        if self.cmd_tx.send(ChannelCommand::Signal(sig)).await.is_err() {
-            tracing::debug!("ssh signal: channel pump gone, dropping signal");
-            return Ok(());
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ChannelCommand::Signal {
+                signal: sig,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| {
+                ExecServerError::Protocol("ssh signal: channel pump unavailable".to_string())
+            })?;
+        match tokio::time::timeout(SSH_SIGNAL_ACK_TIMEOUT, ack_rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(ExecServerError::Protocol(format!("ssh signal: {error}"))),
+            Ok(Err(_)) => Err(ExecServerError::Protocol(
+                "ssh signal acknowledgement channel closed".to_string(),
+            )),
+            Err(_) => Err(ExecServerError::Protocol(
+                "ssh signal acknowledgement timed out".to_string(),
+            )),
         }
-        if self.tty && !self.tmux {
-            let (ack_tx, _ack_rx) = oneshot::channel();
-            let _ = self
-                .cmd_tx
-                .send(ChannelCommand::Write {
-                    data: vec![0x03],
-                    write_id: None,
-                    ack: ack_tx,
-                })
-                .await;
-        }
-        Ok(())
     }
 
     async fn terminate(&self) -> Result<(), ExecServerError> {
@@ -808,8 +809,18 @@ async fn channel_pump(
                             .map_err(|e| e.to_string());
                         let _ = ack.send(result);
                     }
-                    Some(ChannelCommand::Signal(sig)) => {
-                        let _ = channel.channel().signal(sig).await;
+                    Some(ChannelCommand::Signal { signal, ack }) => {
+                        if let Err(error) = channel.channel().signal(signal).await {
+                            let _ = ack.send(Err(error.to_string()));
+                            continue;
+                        }
+                        // RFC 4254 signal requests never ask sshd for a reply.
+                        // Local enqueue and a later natural exit are both
+                        // insufficient delivery proof. Make the best-effort
+                        // request, but never report it as acknowledged.
+                        let _ = ack.send(Err(
+                            "remote SSH signal delivery is unacknowledgeable".to_string(),
+                        ));
                     }
                     Some(ChannelCommand::Terminate { ack }) => {
                         if termination_ack.is_some() {

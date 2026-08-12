@@ -3339,6 +3339,9 @@ pub enum RemoteExecutionReceiptKind {
 pub enum RemoteExecutionTerminalStatus {
     Exited(i32),
     Terminated,
+    /// The exact remote process and command window are gone, but the host did
+    /// not durably record a trustworthy command exit or signal outcome.
+    RecoveryLost,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

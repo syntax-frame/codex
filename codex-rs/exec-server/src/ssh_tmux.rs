@@ -237,8 +237,6 @@ pub(super) async fn start_prepared(
     Ok(StartedExecProcess {
         process: Arc::new(SshProcess {
             process_id,
-            tty: params.tty,
-            tmux: true,
             events,
             wake_tx,
             output_notify,
@@ -310,8 +308,6 @@ pub(super) async fn adopt_execution(
     Ok(StartedExecProcess {
         process: Arc::new(SshProcess {
             process_id: crate::ProcessId::new(process_id),
-            tty: request.tty,
-            tmux: true,
             events,
             wake_tx,
             output_notify,
@@ -419,14 +415,20 @@ async fn monitor_pump(
                                 .map_err(|error| error.to_string());
                             let _ = ack.send(result);
                         }
-                        Some(ChannelCommand::Signal(_)) => {
-                            if let Err(error) = descriptor.interrupt(backend.transport()).await {
+                        Some(ChannelCommand::Signal { ack, .. }) => {
+                            let result = descriptor
+                                .interrupt(backend.transport())
+                                .await;
+                            if let Err(error) = &result {
                                 tracing::debug!(
                                     session_key = %backend.session_key(),
                                     error = %error,
                                     "failed to interrupt tmux process"
                                 );
                             }
+                            let _ = ack.send(
+                                result.map_err(|error| error.to_string())
+                            );
                         }
                         Some(ChannelCommand::Terminate { ack }) => {
                             let result =
@@ -663,6 +665,13 @@ impl TmuxProcessDescriptor {
                 "expected_session={session}\n",
                 "expected_window={window}\n",
                 "candidate_controller={candidate}\n",
+                "agentapp_adopt_probe_process_group() {{\n",
+                "  probe_state=unknown\n",
+                "  [ -x /bin/kill ] || return\n",
+                "  if /bin/kill -0 -- \"-$1\" 2>/dev/null; then probe_state=alive; return; fi\n",
+                "  if kill_error=$(LC_ALL=C /bin/kill -0 -- \"-$1\" 2>&1); then probe_state=alive; return; fi\n",
+                "  case \"$kill_error\" in *\"No such process\"*) probe_state=dead ;; esac\n",
+                "}}\n",
                 "agentapp_adopt_authority() {{\n",
                 "  [ -d \"$root\" ] || {{ echo AGENTAPP_TMUX_ADOPT_MISSING >&2; exit 77; }}\n",
                 "  [ \"$(cat \"$root/owner\" 2>/dev/null || true)\" = {owner} ] || {{ echo AGENTAPP_TMUX_ADOPT_AUTHORITY_MISMATCH >&2; exit 77; }}\n",
@@ -714,7 +723,8 @@ impl TmuxProcessDescriptor {
                 "  [ \"$claim_window\" = \"$expected_window\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }}\n",
                 "  live_operation_pgid=$(ps -o pgid= -p \"$claim_operation_pid\" 2>/dev/null | tr -d ' ')\n",
                 "  [ \"$live_operation_pgid\" != \"$claim_operation_pgid\" ] || {{ echo AGENTAPP_TMUX_ADOPT_BUSY >&2; exit 79; }}\n",
-                "  ! kill -0 \"-$claim_operation_pgid\" 2>/dev/null || {{ echo AGENTAPP_TMUX_ADOPT_BUSY >&2; exit 79; }}\n",
+                "  agentapp_adopt_probe_process_group \"$claim_operation_pgid\"\n",
+                "  case \"$probe_state\" in dead) ;; alive) echo AGENTAPP_TMUX_ADOPT_BUSY >&2; exit 79 ;; *) echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
                 "  agentapp_adopt_authority\n",
                 "  agentapp_adopt_live_pane\n",
                 "  [ \"$claim_operation_pgid\" != \"$pgid\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }}\n",
@@ -817,7 +827,7 @@ impl TmuxProcessDescriptor {
             )
         };
         format!(
-            "#!/bin/sh\nroot=\"{root}\"\ntarget={target}\npgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')\ncase \"$pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac\nprintf '%s:%s\\n' \"$$\" \"$pgid\" > \"$root/process-identity.tmp\"\nmv \"$root/process-identity.tmp\" \"$root/process-identity\"\nrm -f \"$root/status.tmp\"\n{invocation}\ncode=$?\nif mkdir \"$root/terminal-claim\" 2>/dev/null; then\n  printf 'completed\\n' > \"$root/terminal-claim/kind\"\n  printf '%s\\n' \"$code\" > \"$root/status.tmp\"\n  mv \"$root/status.tmp\" \"$root/status\"\n  printf 'completed\\n' > \"$root/state.tmp\"\n  mv \"$root/state.tmp\" \"$root/state\"\nelse\n  while [ ! -f \"$root/status\" ]; do sleep 1; done\n  code=$(cat \"$root/status\" 2>/dev/null || printf '125')\nfi\ni=0\nwhile [ \"$i\" -lt {COMPLETED_WINDOW_RETENTION_SECONDS} ] && [ ! -f \"$root/release\" ]; do\n  sleep 1\n  i=$((i + 1))\ndone\nexit \"$code\"\n",
+            "#!/bin/sh\nroot=\"{root}\"\ntarget={target}\npgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')\ncase \"$pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac\nprintf '%s:%s\\n' \"$$\" \"$pgid\" > \"$root/process-identity.tmp\"\nmv \"$root/process-identity.tmp\" \"$root/process-identity\"\nrm -f \"$root/status.tmp\"\n{invocation}\ncode=$?\nif mkdir \"$root/terminal-claim\" 2>/dev/null; then\n  printf 'completed\\n' > \"$root/terminal-claim/kind.tmp\"\n  mv \"$root/terminal-claim/kind.tmp\" \"$root/terminal-claim/kind\"\n  printf '%s\\n' \"$code\" > \"$root/status.tmp\"\n  mv \"$root/status.tmp\" \"$root/status\"\n  printf 'completed\\n' > \"$root/state.tmp\"\n  mv \"$root/state.tmp\" \"$root/state\"\nelse\n  while [ ! -f \"$root/status\" ]; do sleep 1; done\n  code=$(cat \"$root/status\" 2>/dev/null || printf '125')\nfi\ni=0\nwhile [ \"$i\" -lt {COMPLETED_WINDOW_RETENTION_SECONDS} ] && [ ! -f \"$root/release\" ]; do\n  sleep 1\n  i=$((i + 1))\ndone\nexit \"$code\"\n",
             target = shell_quote(&self.target()),
         )
     }
@@ -1172,12 +1182,52 @@ impl TmuxProcessDescriptor {
         &self,
         transport: &crate::ssh_transport::SshTransport,
     ) -> Result<(), ExecServerError> {
+        let root = self.remote_directory();
         self.run_control(
             transport,
             &format!(
-                "{}; tmux send-keys -t {} C-c",
-                self.ownership_guard(),
-                shell_quote(&self.target())
+                concat!(
+                    "set -eu; root=\"{root}\"; {ownership}; ",
+                    "stored_identity=$(cat \"$root/process-identity\" 2>/dev/null || true); ",
+                    "pane_pid=${{stored_identity%%:*}}; pgid=${{stored_identity#*:}}; ",
+                    "case \"$stored_identity\" in *:*:*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                    "case \"$pane_pid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                    "case \"$pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                    "[ \"$pane_pid:$pgid\" = \"$stored_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80; }}; ",
+                    "current_identity=$(tmux display-message -p -t {target} '#{{pane_id}}:#{{pane_pid}}' 2>/dev/null || true); ",
+                    "pane_id=${{current_identity%%:*}}; current_pane=${{current_identity#*:}}; ",
+                    "case \"$pane_id\" in %*) ;; *) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                    "case \"$current_pane\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                    "current_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' '); ",
+                    "[ \"$current_pane:$current_pgid\" = \"$stored_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH >&2; exit 80; }}; ",
+                    "current_controller=$(cat \"$root/controller\" 2>/dev/null || true); ",
+                    "case \"$current_controller\" in *:*) ;; *) echo AGENTAPP_TMUX_INTERRUPT_CONTROLLER_UNKNOWN >&2; exit 80 ;; esac; ",
+                    "operation_pid=$$; operation_pgid=$(command -p ps -o pgid= -p \"$operation_pid\" 2>/dev/null | tr -d ' '); ",
+                    "case \"$operation_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                    "[ \"$operation_pgid\" != \"$pgid\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80; }}; ",
+                    "interrupt_nonce=i_${{operation_pid}}_${{operation_pgid}}; ",
+                    "transition_candidate=\"$root/.transition-candidate.$interrupt_nonce.$operation_pid\"; ",
+                    "expected_claim=\"interrupt|$interrupt_nonce|$current_controller|$operation_pid|$operation_pgid|$(cat \"$root/window\" 2>/dev/null || true)|$pane_pid|$pgid\"; ",
+                    "( umask 077; set -C; printf '%s\\n' \"$expected_claim\" > \"$transition_candidate\" ) || {{ echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}; ",
+                    "ln \"$transition_candidate\" \"$root/transition-claim\" 2>/dev/null || {{ rm -f \"$transition_candidate\"; echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}; ",
+                    "release_interrupt_claim() {{ if [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ]; then rm -f \"$root/transition-claim\"; fi; rm -f \"$transition_candidate\"; }}; ",
+                    "trap 'release_interrupt_claim' EXIT HUP INT TERM; ",
+                    "require_interrupt_claim() {{ [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] && [ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"$expected_claim\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}; }}; ",
+                    "require_interrupt_claim; ",
+                    "[ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$current_controller\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}; ",
+                    "[ ! -f \"$root/status\" ] && [ \"$(cat \"$root/state\" 2>/dev/null || true)\" = running ] || {{ echo AGENTAPP_TMUX_TRANSITION_STATE_CHANGED >&2; exit 79; }}; ",
+                    "{ownership}; ",
+                    "rechecked_identity=$(tmux display-message -p -t \"$pane_id\" '#{{pane_id}}:#{{pane_pid}}' 2>/dev/null || true); ",
+                    "[ \"$rechecked_identity\" = \"$current_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH >&2; exit 80; }}; ",
+                    "rechecked_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' '); ",
+                    "[ \"$current_pane:$rechecked_pgid\" = \"$stored_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH >&2; exit 80; }}; ",
+                    "require_interrupt_claim; ",
+                    "tmux send-keys -t \"$pane_id\" C-c; ",
+                    "release_interrupt_claim; trap - EXIT HUP INT TERM",
+                ),
+                root = root,
+                ownership = self.ownership_guard(),
+                target = shell_quote(&self.target()),
             ),
             "interrupt",
         )
@@ -1190,7 +1240,7 @@ impl TmuxProcessDescriptor {
     ) -> Result<(), ExecServerError> {
         let root = self.remote_directory();
         let command = format!(
-            "root=\"{root}\"; {}; claimed=0; if mkdir \"$root/terminal-claim\" 2>/dev/null; then claimed=1; printf 'terminated\\n' > \"$root/terminal-claim/kind\"; fi; {}; if [ \"$claimed\" -eq 1 ]; then printf '143\\n' > \"$root/status.tmp\"; mv \"$root/status.tmp\" \"$root/status\"; printf 'terminated\\n' > \"$root/state.tmp\"; mv \"$root/state.tmp\" \"$root/state\"; else i=0; while [ ! -f \"$root/status\" ] && [ \"$i\" -lt 30 ]; do sleep 1; i=$((i + 1)); done; [ -f \"$root/status\" ] || {{ echo AGENTAPP_TMUX_TERMINAL_STATE_UNKNOWN >&2; exit 82; }}; fi",
+            "root=\"{root}\"; {}; claimed=0; if mkdir \"$root/terminal-claim\" 2>/dev/null; then claimed=1; printf 'terminated\\n' > \"$root/terminal-claim/kind.tmp\"; mv \"$root/terminal-claim/kind.tmp\" \"$root/terminal-claim/kind\"; fi; {}; if [ \"$claimed\" -eq 1 ]; then printf '143\\n' > \"$root/status.tmp\"; mv \"$root/status.tmp\" \"$root/status\"; printf 'terminated\\n' > \"$root/state.tmp\"; mv \"$root/state.tmp\" \"$root/state\"; else i=0; while [ ! -f \"$root/status\" ] && [ \"$i\" -lt 30 ]; do sleep 1; i=$((i + 1)); done; [ -f \"$root/status\" ] || {{ echo AGENTAPP_TMUX_TERMINAL_STATE_UNKNOWN >&2; exit 82; }}; fi",
             self.ownership_guard(),
             self.confirmed_process_group_termination()
         );
@@ -1212,7 +1262,7 @@ impl TmuxProcessDescriptor {
 
     fn confirmed_process_group_termination(&self) -> String {
         format!(
-            "process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true); pane_pid=${{process_identity%%:*}}; pgid=${{process_identity#*:}}; case \"$pane_pid:$pgid\" in :|:*|*:|*[!0-9:]*) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac; window_exists=0; if tmux list-windows -t {} -F '#{{window_name}}' 2>/dev/null | grep -Fqx {}; then window_exists=1; fi; if [ \"$window_exists\" -eq 1 ]; then current_pane=$(tmux display-message -p -t {} '#{{pane_pid}}' 2>/dev/null || true); current_pgid=$(ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' '); if [ -z \"$current_pane\" ] || [ \"$pane_pid\" != \"$current_pane\" ] || [ \"$current_pgid\" != \"$pgid\" ]; then echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; fi; if kill -0 \"-$pgid\" 2>/dev/null; then kill -TERM \"-$pgid\" 2>/dev/null || true; i=0; while kill -0 \"-$pgid\" 2>/dev/null && [ \"$i\" -lt 10 ]; do sleep 1; i=$((i + 1)); done; fi; if kill -0 \"-$pgid\" 2>/dev/null; then kill -KILL \"-$pgid\" 2>/dev/null || true; i=0; while kill -0 \"-$pgid\" 2>/dev/null && [ \"$i\" -lt 5 ]; do sleep 1; i=$((i + 1)); done; fi; elif kill -0 \"-$pgid\" 2>/dev/null; then echo AGENTAPP_TMUX_PROCESS_IDENTITY_UNKNOWN >&2; exit 80; fi; if kill -0 \"-$pgid\" 2>/dev/null; then echo AGENTAPP_TMUX_PROCESS_GROUP_ALIVE >&2; exit 81; fi; tmux kill-window -t {} 2>/dev/null || true; if tmux list-windows -t {} -F '#{{window_name}}' 2>/dev/null | grep -Fqx {}; then echo AGENTAPP_TMUX_TERMINATION_UNCONFIRMED >&2; exit 78; fi; tmux kill-window -t {} 2>/dev/null || true",
+            "process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true); pane_pid=${{process_identity%%:*}}; pgid=${{process_identity#*:}}; case \"$pane_pid:$pgid\" in :|:*|*:|*[!0-9:]*) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac; agentapp_termination_probe_group() {{ agentapp_termination_group_state=unknown; [ -x /bin/kill ] || return; if /bin/kill -0 -- \"-$pgid\" 2>/dev/null; then agentapp_termination_group_state=alive; return; fi; if agentapp_kill_error=$(LC_ALL=C /bin/kill -0 -- \"-$pgid\" 2>&1); then agentapp_termination_group_state=alive; return; fi; case \"$agentapp_kill_error\" in *\"No such process\"*) agentapp_termination_group_state=dead ;; esac; }}; window_exists=0; if tmux list-windows -t {} -F '#{{window_name}}' 2>/dev/null | grep -Fqx {}; then window_exists=1; fi; if [ \"$window_exists\" -eq 1 ]; then current_pane=$(tmux display-message -p -t {} '#{{pane_pid}}' 2>/dev/null || true); current_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' '); if [ -z \"$current_pane\" ] || [ \"$pane_pid\" != \"$current_pane\" ] || [ \"$current_pgid\" != \"$pgid\" ]; then echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; fi; if kill -0 \"-$pgid\" 2>/dev/null; then kill -TERM \"-$pgid\" 2>/dev/null || true; i=0; while kill -0 \"-$pgid\" 2>/dev/null && [ \"$i\" -lt 10 ]; do sleep 1; i=$((i + 1)); done; fi; if kill -0 \"-$pgid\" 2>/dev/null; then kill -KILL \"-$pgid\" 2>/dev/null || true; i=0; while kill -0 \"-$pgid\" 2>/dev/null && [ \"$i\" -lt 5 ]; do sleep 1; i=$((i + 1)); done; fi; elif kill -0 \"-$pgid\" 2>/dev/null; then echo AGENTAPP_TMUX_PROCESS_IDENTITY_UNKNOWN >&2; exit 80; fi; agentapp_termination_probe_group; case \"$agentapp_termination_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_PROCESS_GROUP_ALIVE >&2; exit 81 ;; *) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac; tmux kill-window -t {} 2>/dev/null || true; if tmux list-windows -t {} -F '#{{window_name}}' 2>/dev/null | grep -Fqx {}; then echo AGENTAPP_TMUX_TERMINATION_UNCONFIRMED >&2; exit 78; fi; tmux kill-window -t {} 2>/dev/null || true",
             shell_quote(&self.session_name),
             shell_quote(&self.window_name),
             shell_quote(&self.target()),
@@ -1270,6 +1320,13 @@ fn prepared_rollback_fragment(agent_id: &str, process_id: &str) -> String {
     let recovery_key = stable_identifier(&format!("{agent_id}:{process_id}:prepared-recovery"));
     format!(
         concat!(
+            "  prepared_terminal_kind=$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\n",
+            "  prepared_terminal_status=$(cat \"$root/status\" 2>/dev/null || true)\n",
+            "  if {{ [ \"$state\" = prepared ] || [ \"$state\" = running ]; }} && [ ! -e \"$root/go\" ] && [ \"$prepared_terminal_kind:$prepared_terminal_status\" = launch-interrupted:125 ]; then\n",
+            "    printf 'launch-interrupted\\n' > \"$root/state.tmp\"\n",
+            "    mv \"$root/state.tmp\" \"$root/state\"\n",
+            "    state=launch-interrupted\n",
+            "  fi\n",
             "  if {{ [ \"$state\" = prepared ] || [ \"$state\" = running ]; }} && [ ! -e \"$root/go\" ]; then\n",
             "    expected_session=agentapp_{agent_id}\n",
             "    expected_window=p_{process_id}\n",
@@ -1307,75 +1364,98 @@ fn prepared_rollback_fragment(agent_id: &str, process_id: &str) -> String {
             "        case \"$owned_pane\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
             "        case \"$owned_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
             "        [ \"$current_pane\" = \"$owned_pane\" ] && [ \"$current_pgid\" = \"$owned_pgid\" ] || {{ echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }}\n",
-            "        if kill -0 \"-$owned_pgid\" 2>/dev/null; then\n",
+            "        agentapp_probe_process_group \"$owned_pgid\"\n",
+            "        case \"$agentapp_process_group_state\" in alive) ;; dead) ;; *) echo AGENTAPP_TMUX_RECONCILE_PROCESS_QUERY_UNCERTAIN >&2; exit 80 ;; esac\n",
+            "        if [ \"$agentapp_process_group_state\" = alive ]; then\n",
             "          kill -TERM \"-$owned_pgid\" 2>/dev/null || true\n",
             "          i=0\n",
-            "          while kill -0 \"-$owned_pgid\" 2>/dev/null && [ \"$i\" -lt 10 ]; do sleep 1; i=$((i + 1)); done\n",
+            "          while [ \"$i\" -lt 10 ]; do agentapp_probe_process_group \"$owned_pgid\"; [ \"$agentapp_process_group_state\" = alive ] || break; sleep 1; i=$((i + 1)); done\n",
             "        fi\n",
-            "        if kill -0 \"-$owned_pgid\" 2>/dev/null; then\n",
+            "        agentapp_probe_process_group \"$owned_pgid\"\n",
+            "        case \"$agentapp_process_group_state\" in alive) ;; dead) ;; *) echo AGENTAPP_TMUX_RECONCILE_PROCESS_QUERY_UNCERTAIN >&2; exit 80 ;; esac\n",
+            "        if [ \"$agentapp_process_group_state\" = alive ]; then\n",
             "          kill -KILL \"-$owned_pgid\" 2>/dev/null || true\n",
             "          i=0\n",
-            "          while kill -0 \"-$owned_pgid\" 2>/dev/null && [ \"$i\" -lt 5 ]; do sleep 1; i=$((i + 1)); done\n",
+            "          while [ \"$i\" -lt 5 ]; do agentapp_probe_process_group \"$owned_pgid\"; [ \"$agentapp_process_group_state\" = alive ] || break; sleep 1; i=$((i + 1)); done\n",
             "        fi\n",
-            "        kill -0 \"-$owned_pgid\" 2>/dev/null && {{ echo AGENTAPP_TMUX_RECONCILE_PROCESS_GROUP_ALIVE >&2; exit 81; }}\n",
+            "        agentapp_probe_process_group \"$owned_pgid\"\n",
+            "        case \"$agentapp_process_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_RECONCILE_PROCESS_GROUP_ALIVE >&2; exit 81 ;; *) echo AGENTAPP_TMUX_RECONCILE_PROCESS_QUERY_UNCERTAIN >&2; exit 80 ;; esac\n",
             "        tmux kill-window -t \"$expected_session:$expected_window\" 2>/dev/null || true\n",
             "        agentapp_window_exists \"$expected_window\"\n",
             "        [ \"$exact_window_exists\" -eq 0 ] || {{ echo AGENTAPP_TMUX_RECONCILE_TERMINATION_UNCONFIRMED >&2; exit 78; }}\n",
             "      elif [ \"$owned_pgid\" != - ]; then\n",
             "        case \"$owned_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
-            "        kill -0 \"-$owned_pgid\" 2>/dev/null && {{ echo AGENTAPP_TMUX_RECONCILE_PROCESS_WITHOUT_WINDOW >&2; exit 80; }}\n",
+            "        agentapp_probe_process_group \"$owned_pgid\"\n",
+            "        case \"$agentapp_process_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_RECONCILE_PROCESS_WITHOUT_WINDOW >&2; exit 80 ;; *) echo AGENTAPP_TMUX_RECONCILE_PROCESS_QUERY_UNCERTAIN >&2; exit 80 ;; esac\n",
             "      fi\n",
             "    }}\n",
+            "    reuse_existing_claim=0\n",
             "    if [ -e \"$root/transition-claim\" ]; then\n",
-            "      claim_line=$(cat \"$root/transition-claim\" 2>/dev/null || true)\n",
-            "      old_ifs=$IFS\n",
-            "      IFS='|'\n",
-            "      read claim_kind claim_nonce claim_controller claim_operation_pid claim_operation_pgid claim_window claim_pane claim_pgid <<AGENTAPP_TRANSITION_EOF\n",
-            "$claim_line\n",
-            "AGENTAPP_TRANSITION_EOF\n",
+            "      existing_claim=$(cat \"$root/transition-claim\" 2>/dev/null || true)\n",
+            "      old_ifs=$IFS; IFS='|'\n",
+            "      read claim_kind claim_nonce claim_controller claim_operation_pid claim_operation_pgid claim_window claim_pane claim_pgid <<AGENTAPP_PREPARED_CLAIM_EOF\n",
+            "$existing_claim\n",
+            "AGENTAPP_PREPARED_CLAIM_EOF\n",
             "      IFS=$old_ifs\n",
-            "      case \"$claim_kind\" in bootstrap|recovery) ;; adoption) echo AGENTAPP_TMUX_TRANSITION_ADOPTION_STATE_CONFLICT >&2; exit 79 ;; *) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
+            "      case \"$claim_kind\" in bootstrap|recovery) ;; *) echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79 ;; esac\n",
             "      case \"$claim_nonce\" in ''|*[!0-9a-zA-Z_.-]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
-            "      case \"$claim_operation_pid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
-            "      case \"$claim_operation_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
-            "      [ \"$claim_window\" = \"$expected_window\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }}\n",
-            "      live_operation_pgid=$(ps -o pgid= -p \"$claim_operation_pid\" 2>/dev/null | tr -d ' ')\n",
+            "      case \"$claim_operation_pid:$claim_operation_pgid\" in *[!0-9:]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
+            "      claim_generation=${{claim_controller%%:*}}; claim_controller_id=${{claim_controller#*:}}\n",
+            "      case \"$claim_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
+            "      [ -n \"$claim_controller_id\" ] && [ \"$claim_controller_id\" != \"$claim_controller\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }}\n",
+            "      claim_candidate=\"$root/.transition-candidate.$claim_nonce.$claim_operation_pid\"\n",
+            "      [ -f \"$claim_candidate\" ] && [ ! -L \"$claim_candidate\" ] && [ \"$claim_candidate\" -ef \"$root/transition-claim\" ] && [ \"$(cat \"$claim_candidate\" 2>/dev/null || true)\" = \"$existing_claim\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
+            "      live_operation_pgid=$(command -p ps -o pgid= -p \"$claim_operation_pid\" 2>/dev/null | tr -d ' ')\n",
             "      [ \"$live_operation_pgid\" != \"$claim_operation_pgid\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}\n",
-            "      ! kill -0 \"-$claim_operation_pgid\" 2>/dev/null || {{ echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}\n",
-            "      agentapp_terminate_pre_go_window \"$claim_pane\" \"$claim_pgid\"\n",
-            "      [ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"$claim_line\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
-            "      quarantine=\"$root/transition-claim.quarantine.$claim_nonce\"\n",
-            "      [ ! -e \"$quarantine\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_QUARANTINE_CONFLICT >&2; exit 79; }}\n",
-            "      mv \"$root/transition-claim\" \"$quarantine\"\n",
+            "      agentapp_probe_process_group \"$claim_operation_pgid\"\n",
+            "      case \"$agentapp_process_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79 ;; *) echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "      [ \"$claim_window\" = \"$expected_window\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }}\n",
+            "      reuse_existing_claim=1\n",
             "    fi\n",
             "    observed=$(cat \"$root/controller\" 2>/dev/null || true)\n",
             "    observed_generation=${{observed%%:*}}\n",
             "    case \"$observed_generation\" in ''|*[!0-9]*) observed_generation=0 ;; esac\n",
-            "    next_generation=$((observed_generation + 1))\n",
-            "    next=\"$next_generation:r_{recovery_key}\"\n",
-            "    agentapp_window_exists \"$expected_window\"\n",
-            "    claim_pane=-\n",
-            "    claim_pgid=-\n",
-            "    if [ \"$exact_window_exists\" -eq 1 ]; then\n",
-            "      claim_pane=$(tmux display-message -p -t \"$expected_session:$expected_window.0\" '#{{pane_pid}}' 2>/dev/null || true)\n",
-            "      claim_pgid=$(ps -o pgid= -p \"$claim_pane\" 2>/dev/null | tr -d ' ')\n",
-            "      case \"$claim_pane\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
-            "      case \"$claim_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "    if [ \"$reuse_existing_claim\" -eq 1 ]; then\n",
+            "      next_generation=$claim_generation\n",
+            "      next=$claim_controller\n",
+            "      if [ \"$next\" != \"$observed\" ]; then [ \"$next_generation\" -eq $((observed_generation + 1)) ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}; fi\n",
+            "      transition_candidate=$claim_candidate\n",
+            "      expected_recovery_claim=$existing_claim\n",
+            "    else\n",
+            "      next_generation=$((observed_generation + 1))\n",
+            "      next=\"$next_generation:r_{recovery_key}\"\n",
+            "      agentapp_window_exists \"$expected_window\"\n",
+            "      claim_pane=-\n",
+            "      claim_pgid=-\n",
+            "      if [ \"$exact_window_exists\" -eq 1 ]; then\n",
+            "        claim_pane=$(tmux display-message -p -t \"$expected_session:$expected_window.0\" '#{{pane_pid}}' 2>/dev/null || true)\n",
+            "        claim_pgid=$(ps -o pgid= -p \"$claim_pane\" 2>/dev/null | tr -d ' ')\n",
+            "        case \"$claim_pane\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "        case \"$claim_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "      fi\n",
+            "      operation_pid=$$\n",
+            "      operation_pgid=$(ps -o pgid= -p \"$operation_pid\" 2>/dev/null | tr -d ' ')\n",
+            "      case \"$operation_pid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "      case \"$operation_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "      transition_candidate=\"$root/.transition-candidate.r_{recovery_key}.$$\"\n",
+            "      expected_recovery_claim=\"recovery|r_{recovery_key}|$next|$operation_pid|$operation_pgid|$expected_window|$claim_pane|$claim_pgid\"\n",
+            "      printf '%s\\n' \"$expected_recovery_claim\" > \"$transition_candidate\"\n",
+            "      ln \"$transition_candidate\" \"$root/transition-claim\" 2>/dev/null || {{ rm -f \"$transition_candidate\"; echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}\n",
             "    fi\n",
-            "    operation_pid=$$\n",
-            "    operation_pgid=$(ps -o pgid= -p \"$operation_pid\" 2>/dev/null | tr -d ' ')\n",
-            "    case \"$operation_pid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
-            "    case \"$operation_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
-            "    transition_candidate=\"$root/.transition-candidate.r_{recovery_key}.$$\"\n",
-            "    printf 'recovery|r_{recovery_key}|%s|%s|%s|%s|%s|%s\\n' \"$next\" \"$operation_pid\" \"$operation_pgid\" \"$expected_window\" \"$claim_pane\" \"$claim_pgid\" > \"$transition_candidate\"\n",
-            "    ln \"$transition_candidate\" \"$root/transition-claim\" 2>/dev/null || {{ rm -f \"$transition_candidate\"; echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}\n",
-            "    release_transition_claim() {{ if [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ]; then rm -f \"$root/transition-claim\"; fi; rm -f \"$transition_candidate\"; }}\n",
-            "    trap 'release_transition_claim' EXIT\n",
+            "    cleanup_new_transition_claim() {{ if [ \"$reuse_existing_claim\" -eq 0 ]; then if [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ]; then rm -f \"$root/transition-claim\"; fi; rm -f \"$transition_candidate\"; fi; }}\n",
+            "    release_transition_claim() {{ if [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] && [ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"$expected_recovery_claim\" ]; then rm -f \"$root/transition-claim\"; fi; rm -f \"$transition_candidate\"; }}\n",
+            "    require_recovery_claim() {{ [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] && [ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"$expected_recovery_claim\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}; }}\n",
+            "    trap 'cleanup_new_transition_claim' EXIT\n",
             "    [ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$observed\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
-            "    printf '%s\\n' \"$next_generation\" > \"$root/lease-generation.tmp\"\n",
-            "    mv \"$root/lease-generation.tmp\" \"$root/lease-generation\"\n",
-            "    printf '%s\\n' \"$next\" > \"$root/controller.tmp\"\n",
-            "    mv \"$root/controller.tmp\" \"$root/controller\"\n",
+            "    require_recovery_claim\n",
+            "    if [ \"$(cat \"$root/controller\" 2>/dev/null || true)\" != \"$next\" ]; then\n",
+            "      printf '%s\\n' \"$next_generation\" > \"$root/lease-generation.tmp\"\n",
+            "      mv \"$root/lease-generation.tmp\" \"$root/lease-generation\"\n",
+            "      require_recovery_claim\n",
+            "      printf '%s\\n' \"$next\" > \"$root/controller.tmp\"\n",
+            "      mv \"$root/controller.tmp\" \"$root/controller\"\n",
+            "      require_recovery_claim\n",
+            "    fi\n",
             "    state=$(cat \"$root/state\" 2>/dev/null || true)\n",
             "    {{ [ \"$state\" = prepared ] || [ \"$state\" = running ]; }} && [ ! -e \"$root/go\" ] && [ ! -e \"$root/status\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_STATE_CHANGED >&2; exit 79; }}\n",
             "    agentapp_terminate_pre_go_window \"$claim_pane\" \"$claim_pgid\"\n",
@@ -1388,8 +1468,12 @@ fn prepared_rollback_fragment(agent_id: &str, process_id: &str) -> String {
             "    {{ [ \"$state\" = prepared ] || [ \"$state\" = running ]; }} && [ ! -e \"$root/go\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_STATE_CHANGED >&2; exit 79; }}\n",
             "    agentapp_window_exists \"$expected_window\"\n",
             "    [ \"$exact_window_exists\" -eq 0 ] || {{ echo AGENTAPP_TMUX_RECONCILE_TERMINATION_UNCONFIRMED >&2; exit 78; }}\n",
-            "    mkdir \"$root/terminal-claim\" 2>/dev/null || {{ echo AGENTAPP_TMUX_TERMINAL_STATE_UNKNOWN >&2; exit 82; }}\n",
-            "    printf 'launch-interrupted\\n' > \"$root/terminal-claim/kind\"\n",
+            "    prepared_terminal_kind=$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\n",
+            "    if [ ! -e \"$root/terminal-claim\" ]; then mkdir \"$root/terminal-claim\" 2>/dev/null || true; fi\n",
+            "    [ -d \"$root/terminal-claim\" ] && [ ! -L \"$root/terminal-claim\" ] || {{ echo AGENTAPP_TMUX_TERMINAL_STATE_UNKNOWN >&2; exit 82; }}\n",
+            "    [ -z \"$prepared_terminal_kind\" ] || [ \"$prepared_terminal_kind\" = launch-interrupted ] || {{ echo AGENTAPP_TMUX_TERMINAL_STATE_UNKNOWN >&2; exit 82; }}\n",
+            "    printf 'launch-interrupted\\n' > \"$root/terminal-claim/kind.tmp\"\n",
+            "    mv \"$root/terminal-claim/kind.tmp\" \"$root/terminal-claim/kind\"\n",
             "    [ -e \"$root/output\" ] || : > \"$root/output\"\n",
             "    printf '125\\n' > \"$root/status.tmp\"\n",
             "    mv \"$root/status.tmp\" \"$root/status\"\n",
@@ -1407,9 +1491,187 @@ fn prepared_rollback_fragment(agent_id: &str, process_id: &str) -> String {
     )
 }
 
+// A remote command can disappear before command.sh writes terminal descriptor
+// fields. Reconciliation may retire that exact stale-running state only after
+// proving that the descriptor is locally authoritative, its recorded process
+// group is gone, and its exact command window is absent. This deliberately
+// records recovery loss rather than inventing a natural exit or claiming that
+// a previously requested signal was delivered. Any live process, live
+// transition, malformed identity, or failed tmux query remains ambiguous and
+// fails closed.
+fn stale_running_recovery_loss_fragment(agent_id: &str, process_id: &str) -> String {
+    let recovery_key = stable_identifier(&format!("{agent_id}:{process_id}:stale-running"));
+    format!(
+        concat!(
+            "  stale_terminal_kind=$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\n",
+            "  if [ \"$state\" = running ] && [ -e \"$root/go\" ]; then\n",
+            "    expected_session=agentapp_{agent_id}\n",
+            "    expected_window=p_{process_id}\n",
+            "    watchdog_window=w_{process_id}\n",
+            "    stored_window=$(cat \"$root/window\" 2>/dev/null || true)\n",
+            "    [ \"$stored_window\" = \"$expected_window\" ] || {{ echo AGENTAPP_TMUX_RECONCILE_WINDOW_IDENTITY_MISMATCH >&2; exit 80; }}\n",
+            "    process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true)\n",
+            "    pane_pid=${{process_identity%%:*}}\n",
+            "    pgid=${{process_identity#*:}}\n",
+            "    case \"$process_identity\" in *:*:*) echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "    case \"$pane_pid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "    case \"$pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "    [ \"$pane_pid:$pgid\" = \"$process_identity\" ] || {{ echo AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN >&2; exit 80; }}\n",
+            "    agentapp_stale_window_exists() {{\n",
+            "      stale_window_to_check=$1\n",
+            "      stale_window_exists=0\n",
+            "      if stale_window_listing=$(LC_ALL=C tmux list-windows -t \"$expected_session:\" -F '#{{window_name}}' 2>&1); then\n",
+            "        if printf '%s\\n' \"$stale_window_listing\" | grep -Fqx \"$stale_window_to_check\"; then stale_window_exists=1; fi\n",
+            "      else\n",
+            "        case \"$stale_window_listing\" in *\"can't find session:\"*|*\"no server running on \"*|*\"failed to connect to server: No such file or directory\"*|*\"failed to connect to server: Connection refused\"*) ;; *) echo AGENTAPP_TMUX_RECONCILE_WINDOW_QUERY_FAILED >&2; exit 77 ;; esac\n",
+            "      fi\n",
+            "    }}\n",
+            "    agentapp_stale_window_exists \"$expected_window\"\n",
+            "    if [ \"$stale_window_exists\" -eq 0 ]; then\n",
+            "      agentapp_probe_process_group \"$pgid\"\n",
+            "      case \"$agentapp_process_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_RECONCILE_PROCESS_WITHOUT_WINDOW >&2; exit 80 ;; *) echo AGENTAPP_TMUX_RECONCILE_PROCESS_QUERY_UNCERTAIN >&2; exit 80 ;; esac\n",
+            "      operation_pid=$$\n",
+            "      operation_pgid=$(command -p ps -o pgid= -p \"$operation_pid\" 2>/dev/null | tr -d ' ')\n",
+            "      case \"$operation_pid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "      case \"$operation_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "      [ \"$operation_pgid\" != \"$pgid\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80; }}\n",
+            "      observed=$(cat \"$root/controller\" 2>/dev/null || true)\n",
+            "      observed_generation=${{observed%%:*}}\n",
+            "      case \"$observed_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_CONTROLLER_GENERATION_UNKNOWN >&2; exit 80 ;; esac\n",
+            "      reuse_existing_claim=0\n",
+            "      if [ -e \"$root/transition-claim\" ]; then\n",
+            "        expected_stale_claim=$(cat \"$root/transition-claim\" 2>/dev/null || true)\n",
+            "        old_ifs=$IFS; IFS='|'\n",
+            "        read claim_kind claim_nonce claim_controller claim_operation_pid claim_operation_pgid claim_window claim_pane claim_pgid <<AGENTAPP_STALE_CLAIM_EOF\n",
+            "$expected_stale_claim\n",
+            "AGENTAPP_STALE_CLAIM_EOF\n",
+            "        IFS=$old_ifs\n",
+            "        case \"$claim_kind\" in recovery|bootstrap|interrupt) ;; *) echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79 ;; esac\n",
+            "        case \"$claim_nonce\" in ''|*[!0-9a-zA-Z_.-]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
+            "        case \"$claim_operation_pid:$claim_operation_pgid\" in *[!0-9:]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
+            "        claim_generation=${{claim_controller%%:*}}; claim_controller_id=${{claim_controller#*:}}\n",
+            "        case \"$claim_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
+            "        [ -n \"$claim_controller_id\" ] && [ \"$claim_controller_id\" != \"$claim_controller\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }}\n",
+            "        [ \"$claim_window\" = \"$expected_window\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }}\n",
+            "        case \"$claim_kind\" in bootstrap) [ \"$claim_pane:$claim_pgid\" = -:- ] || [ \"$claim_pane:$claim_pgid\" = \"$pane_pid:$pgid\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }} ;; *) [ \"$claim_pane:$claim_pgid\" = \"$pane_pid:$pgid\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }} ;; esac\n",
+            "        [ \"$claim_operation_pgid\" != \"$pgid\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }}\n",
+            "        transition_candidate=\"$root/.transition-candidate.$claim_nonce.$claim_operation_pid\"\n",
+            "        [ -f \"$transition_candidate\" ] && [ ! -L \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] && [ \"$(cat \"$transition_candidate\" 2>/dev/null || true)\" = \"$expected_stale_claim\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
+            "        live_operation_pgid=$(command -p ps -o pgid= -p \"$claim_operation_pid\" 2>/dev/null | tr -d ' ')\n",
+            "        [ \"$live_operation_pgid\" != \"$claim_operation_pgid\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}\n",
+            "        agentapp_probe_process_group \"$claim_operation_pgid\"\n",
+            "        case \"$agentapp_process_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79 ;; *) echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "        next_generation=$claim_generation\n",
+            "        next=$claim_controller\n",
+            "        case \"$claim_kind\" in recovery) if [ \"$next\" != \"$observed\" ]; then [ \"$next_generation\" -eq $((observed_generation + 1)) ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}; fi ;; *) [ \"$next\" = \"$observed\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }} ;; esac\n",
+            "        reuse_existing_claim=1\n",
+            "      else\n",
+            "        next_generation=$((observed_generation + 1))\n",
+            "        next=\"$next_generation:s_{recovery_key}\"\n",
+            "        transition_candidate=\"$root/.transition-candidate.s_{recovery_key}.$$\"\n",
+            "        expected_stale_claim=\"recovery|s_{recovery_key}|$next|$operation_pid|$operation_pgid|$expected_window|$pane_pid|$pgid\"\n",
+            "        printf '%s\\n' \"$expected_stale_claim\" > \"$transition_candidate\"\n",
+            "        ln \"$transition_candidate\" \"$root/transition-claim\" 2>/dev/null || {{ rm -f \"$transition_candidate\"; echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}\n",
+            "      fi\n",
+            "      cleanup_new_stale_claim() {{ if [ \"$reuse_existing_claim\" -eq 0 ]; then if [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ]; then rm -f \"$root/transition-claim\"; fi; rm -f \"$transition_candidate\"; fi; }}\n",
+            "      release_stale_transition_claim() {{ if [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] && [ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"$expected_stale_claim\" ]; then rm -f \"$root/transition-claim\"; fi; rm -f \"$transition_candidate\"; }}\n",
+            "      agentapp_require_stale_claim_inode() {{\n",
+            "        [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
+            "        [ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"$expected_stale_claim\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
+            "      }}\n",
+            "      agentapp_require_stale_claim() {{\n",
+            "        agentapp_require_stale_claim_inode\n",
+            "        [ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$next\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
+            "      }}\n",
+            "      trap 'cleanup_new_stale_claim' EXIT\n",
+            "      [ \"$(cat \"$root/state\" 2>/dev/null || true)\" = running ] && [ -e \"$root/go\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_STATE_CHANGED >&2; exit 79; }}\n",
+            "      [ \"$(cat \"$root/process-identity\" 2>/dev/null || true)\" = \"$process_identity\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_OWNERSHIP_MISMATCH >&2; exit 80; }}\n",
+            "      [ \"$(cat \"$root/window\" 2>/dev/null || true)\" = \"$expected_window\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_OWNERSHIP_MISMATCH >&2; exit 80; }}\n",
+            "      [ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$observed\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
+            "      agentapp_require_stale_claim_inode\n",
+            "      if [ \"$(cat \"$root/controller\" 2>/dev/null || true)\" != \"$next\" ]; then\n",
+            "        printf '%s\\n' \"$next_generation\" > \"$root/lease-generation.tmp\"\n",
+            "        mv \"$root/lease-generation.tmp\" \"$root/lease-generation\"\n",
+            "        printf '%s\\n' \"$next\" > \"$root/controller.tmp\"\n",
+            "        mv \"$root/controller.tmp\" \"$root/controller\"\n",
+            "      fi\n",
+            "      agentapp_require_stale_claim\n",
+            "      agentapp_stale_window_exists \"$expected_window\"\n",
+            "      [ \"$stale_window_exists\" -eq 0 ] || {{ echo AGENTAPP_TMUX_TRANSITION_STATE_CHANGED >&2; exit 79; }}\n",
+            "      agentapp_probe_process_group \"$pgid\"\n",
+            "      case \"$agentapp_process_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_RECONCILE_PROCESS_WITHOUT_WINDOW >&2; exit 80 ;; *) echo AGENTAPP_TMUX_RECONCILE_PROCESS_QUERY_UNCERTAIN >&2; exit 80 ;; esac\n",
+            "      agentapp_require_stale_claim\n",
+            "      agentapp_stale_window_exists \"$watchdog_window\"\n",
+            "      if [ \"$stale_window_exists\" -eq 1 ]; then tmux kill-window -t \"$expected_session:$watchdog_window\" 2>/dev/null || true; fi\n",
+            "      agentapp_stale_window_exists \"$watchdog_window\"\n",
+            "      [ \"$stale_window_exists\" -eq 0 ] || {{ echo AGENTAPP_TMUX_RECONCILE_WATCHDOG_PRESENT >&2; exit 78; }}\n",
+            "      agentapp_require_stale_claim\n",
+            "      stale_terminal_kind=$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\n",
+            "      stale_terminal_status=$(cat \"$root/status\" 2>/dev/null || true)\n",
+            "      terminal_state=\n",
+            "      terminal_status=\n",
+            "      case \"$stale_terminal_kind:$stale_terminal_status\" in\n",
+            "        completed:*[!0-9]*|completed:) terminal_state=recovery-lost; terminal_status=125 ;;\n",
+            "        completed:*) terminal_state=completed; terminal_status=$stale_terminal_status ;;\n",
+            "        terminated:143) terminal_state=terminated; terminal_status=143 ;;\n",
+            "        recovery-lost:|recovery-lost:125) terminal_state=recovery-lost; terminal_status=125 ;;\n",
+            "        launch-interrupted:125) terminal_state=launch-interrupted; terminal_status=125 ;;\n",
+            "        :|terminated:) terminal_state=recovery-lost; terminal_status=125 ;;\n",
+            "        *) echo AGENTAPP_TMUX_TERMINAL_STATE_UNKNOWN >&2; exit 82 ;;\n",
+            "      esac\n",
+            "      if [ \"$terminal_state\" = recovery-lost ]; then\n",
+            "        if [ ! -e \"$root/terminal-claim\" ]; then mkdir \"$root/terminal-claim\" 2>/dev/null || true; fi\n",
+            "        [ -d \"$root/terminal-claim\" ] && [ ! -L \"$root/terminal-claim\" ] || {{ echo AGENTAPP_TMUX_TERMINAL_STATE_UNKNOWN >&2; exit 82; }}\n",
+            "        for terminal_entry in \"$root/terminal-claim\"/* \"$root/terminal-claim\"/.[!.]* \"$root/terminal-claim\"/..?*; do [ ! -e \"$terminal_entry\" ] || {{ [ \"${{terminal_entry##*/}}\" = kind ] || [ \"${{terminal_entry##*/}}\" = kind.tmp ]; }} || {{ echo AGENTAPP_TMUX_TERMINAL_STATE_UNKNOWN >&2; exit 82; }}; done\n",
+            "        agentapp_require_stale_claim\n",
+            "        printf 'recovery-lost\\n' > \"$root/terminal-claim/kind.tmp\"\n",
+            "        mv \"$root/terminal-claim/kind.tmp\" \"$root/terminal-claim/kind\"\n",
+            "      fi\n",
+            "      agentapp_require_stale_claim\n",
+            "      [ -e \"$root/output\" ] || : > \"$root/output\"\n",
+            "      if [ -e \"$root/status\" ]; then\n",
+            "        [ \"$(cat \"$root/status\" 2>/dev/null || true)\" = \"$terminal_status\" ] || {{ echo AGENTAPP_TMUX_TERMINAL_STATE_UNKNOWN >&2; exit 82; }}\n",
+            "      else\n",
+            "        printf '%s\\n' \"$terminal_status\" > \"$root/status.tmp\"\n",
+            "        mv \"$root/status.tmp\" \"$root/status\"\n",
+            "      fi\n",
+            "      agentapp_require_stale_claim\n",
+            "      rm -f \"$root/recovery-required\"\n",
+            "      printf '%s\\n' \"$terminal_state\" > \"$root/state.tmp\"\n",
+            "      mv \"$root/state.tmp\" \"$root/state\"\n",
+            "      release_stale_transition_claim\n",
+            "      trap - EXIT\n",
+            "      state=$terminal_state\n",
+            "    fi\n",
+            "  fi\n"
+        ),
+        agent_id = agent_id,
+        process_id = process_id,
+        recovery_key = recovery_key,
+    )
+}
+
 fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest) -> String {
     let agent_id = stable_identifier(agent_key);
-    let mut command = format!("set -eu\nbase=\"$HOME/.agentapp/tmux/{agent_id}\"\n");
+    let mut command = format!(
+        concat!(
+            "set -eu\n",
+            "base=\"$HOME/.agentapp/tmux/{agent_id}\"\n",
+            // A failed signal-zero probe is not itself death proof: EPERM and
+            // ESRCH both use a nonzero status. Accept only the kernel utility's
+            // locale-stabilized ESRCH diagnostic, and retain an explicit
+            // unknown outcome for every other failure.
+            "agentapp_probe_process_group() {{\n",
+            "  agentapp_probe_pgid=$1\n",
+            "  agentapp_process_group_state=unknown\n",
+            "  [ -x /bin/kill ] || return\n",
+            "  if /bin/kill -0 -- \"-$agentapp_probe_pgid\" 2>/dev/null; then agentapp_process_group_state=alive; return; fi\n",
+            "  if agentapp_kill_error=$(LC_ALL=C /bin/kill -0 -- \"-$agentapp_probe_pgid\" 2>&1); then agentapp_process_group_state=alive; return; fi\n",
+            "  case \"$agentapp_kill_error\" in *\"No such process\"*) agentapp_process_group_state=dead ;; esac\n",
+            "}}\n",
+        ),
+        agent_id = agent_id,
+    );
     for execution in &request.incomplete_executions {
         let expected_command_digest = execution.expected_command_digest.as_deref().unwrap_or("-");
         let expected_session_id = execution
@@ -1436,6 +1698,8 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
         let expected_turn = STANDARD.encode(identity.turn_id.as_bytes());
         let expected_call = STANDARD.encode(identity.call_id.as_bytes());
         let prepared_rollback = prepared_rollback_fragment(&agent_id, &process_id);
+        let stale_running_recovery_loss =
+            stale_running_recovery_loss_fragment(&agent_id, &process_id);
         command.push_str(&format!(
             concat!(
                 "root=\"{root}\"\n",
@@ -1470,20 +1734,21 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
                 "  [ \"$(cat \"$root/tty\" 2>/dev/null || true)\" = {expected_tty} ] || {{ echo AGENTAPP_TMUX_RECONCILE_STREAM_MODE_CONFLICT >&2; exit 77; }}\n",
                 "  state=$(cat \"$root/state\" 2>/dev/null || true)\n",
                 "{prepared_rollback}",
+                "{stale_running_recovery_loss}",
                 "  cursor=$(wc -c < \"$root/output\" 2>/dev/null || printf '0'); cursor=$(printf '%s' \"$cursor\" | tr -d ' ')\n",
                 "  state=$(cat \"$root/state\" 2>/dev/null || true)\n",
                 "  delivery_unknown=0\n",
                 "  terminal_verified_dead=0\n",
                 "  code=$(cat \"$root/status\" 2>/dev/null || printf '-')\n",
-                "  case \"$state\" in completed) recovered=completed ;; terminated) recovered=terminated ;; launch-interrupted) recovered=launch-interrupted ;; running) if [ -e \"$root/go\" ]; then recovered=running; else recovered=unknown; fi ;; prepared) if [ -e \"$root/go\" ]; then recovered=running; else recovered=prepared; fi ;; *) recovered=unknown ;; esac\n",
-                "  if [ \"$recovered\" = completed ] || [ \"$recovered\" = terminated ] || [ \"$recovered\" = launch-interrupted ]; then\n",
+                "  case \"$state\" in completed) recovered=completed ;; terminated) recovered=terminated ;; recovery-lost) recovered=recovery-lost ;; launch-interrupted) recovered=launch-interrupted ;; running) if [ -e \"$root/go\" ]; then recovered=running; else recovered=unknown; fi ;; prepared) if [ -e \"$root/go\" ]; then recovered=running; else recovered=prepared; fi ;; *) recovered=unknown ;; esac\n",
+                "  if [ \"$recovered\" = completed ] || [ \"$recovered\" = terminated ] || [ \"$recovered\" = recovery-lost ] || [ \"$recovered\" = launch-interrupted ]; then\n",
                 "    process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true)\n",
                 "    pane_pid=${{process_identity%%:*}}; pgid=${{process_identity#*:}}\n",
                 "    window=$(cat \"$root/window\" 2>/dev/null || true); expected_window=p_{process_id}\n",
                 "    claim_kind=$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\n",
                 "    identity_valid=1\n",
                 "    [ \"$window\" = \"$expected_window\" ] || identity_valid=0\n",
-                "    case \"$recovered:$claim_kind\" in completed:completed|terminated:terminated|launch-interrupted:launch-interrupted) ;; *) identity_valid=0 ;; esac\n",
+                "    case \"$recovered:$claim_kind\" in completed:completed|terminated:terminated|recovery-lost:recovery-lost|launch-interrupted:launch-interrupted) ;; *) identity_valid=0 ;; esac\n",
                 "    if [ \"$recovered\" = completed ]; then case \"$code\" in ''|*[!0-9-]*) identity_valid=0 ;; esac; fi\n",
                 "    if [ \"$recovered\" = launch-interrupted ] && [ ! -e \"$root/go\" ]; then\n",
                 "      if [ -z \"$process_identity\" ]; then pane_pid=-; pgid=-; else case \"$process_identity\" in *:*:*) identity_valid=0 ;; esac; case \"$pane_pid\" in ''|*[!0-9]*) identity_valid=0 ;; esac; case \"$pgid\" in ''|*[!0-9]*) identity_valid=0 ;; esac; [ \"$pane_pid:$pgid\" = \"$process_identity\" ] || identity_valid=0; fi\n",
@@ -1494,7 +1759,12 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
                 "      [ \"$pane_pid:$pgid\" = \"$process_identity\" ] || identity_valid=0\n",
                 "    fi\n",
                 "    process_dead=0\n",
-                "    if [ \"$pgid\" = - ] || ! kill -0 \"-$pgid\" 2>/dev/null; then process_dead=1; fi\n",
+                "    if [ \"$pgid\" = - ]; then\n",
+                "      process_dead=1\n",
+                "    else\n",
+                "      agentapp_probe_process_group \"$pgid\"\n",
+                "      case \"$agentapp_process_group_state\" in dead) process_dead=1 ;; alive) ;; *) identity_valid=0 ;; esac\n",
+                "    fi\n",
                 "    window_absent=0\n",
                 "    if terminal_windows=$(LC_ALL=C tmux list-windows -t agentapp_{agent_id}: -F '#{{window_name}}' 2>&1); then\n",
                 "      if ! printf '%s\\n' \"$terminal_windows\" | grep -Fqx \"$expected_window\"; then window_absent=1; fi\n",
@@ -1521,6 +1791,7 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
             expected_session_id = shell_quote(&expected_session_id),
             expected_tty = shell_quote(expected_tty),
             prepared_rollback = prepared_rollback,
+            stale_running_recovery_loss = stale_running_recovery_loss,
             process_id = process_id,
             agent_id = agent_id,
         ));
@@ -1540,6 +1811,12 @@ fn acknowledgement_keys(acknowledgement: &RecoveredExecutionAcknowledgement) -> 
                     }
                     RecoveredExecutionStatus::Terminated => {
                         ("terminated".to_string(), "143".to_string())
+                    }
+                    RecoveredExecutionStatus::RecoveryLost => {
+                        ("recovery-lost".to_string(), "125".to_string())
+                    }
+                    RecoveredExecutionStatus::LaunchInterrupted => {
+                        ("launch-interrupted".to_string(), "125".to_string())
                     }
                     _ => ("-".to_string(), "-".to_string()),
                 };
@@ -1600,6 +1877,12 @@ fn acknowledgement_command(
                 RecoveredExecutionStatus::Terminated => {
                     ("terminated".to_string(), "143".to_string())
                 }
+                RecoveredExecutionStatus::RecoveryLost => {
+                    ("recovery-lost".to_string(), "125".to_string())
+                }
+                RecoveredExecutionStatus::LaunchInterrupted => {
+                    ("launch-interrupted".to_string(), "125".to_string())
+                }
                 _ => ("-".to_string(), "-".to_string()),
             };
             (
@@ -1636,7 +1919,7 @@ fn acknowledgement_command(
             "[ \"$expected_output_sha256\" != - ] || {{ echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78; }}\n",
             "[ \"${{#expected_output_sha256}}\" -eq 64 ] || {{ echo AGENTAPP_TMUX_ACK_PROOF_MALFORMED >&2; exit 78; }}\n",
             "case \"$expected_output_sha256\" in *[!0-9a-f]*) echo AGENTAPP_TMUX_ACK_PROOF_MALFORMED >&2; exit 78 ;; esac\n",
-            "case \"$expected_terminal_state\" in completed|terminated) ;; *) echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78 ;; esac\n",
+            "case \"$expected_terminal_state\" in completed|terminated|recovery-lost|launch-interrupted) ;; *) echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78 ;; esac\n",
             "case \"$expected_exit_code\" in ''|*[!0-9-]*) echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78 ;; *) ;; esac\n",
             "process_id=${{token%%-*}}\n",
             "case \"$process_id\" in ''|*[!0-9a-f]*) echo AGENTAPP_TMUX_ACK_BAD_TOKEN >&2; exit 78 ;; esac\n",
@@ -1650,6 +1933,13 @@ fn acknowledgement_command(
             "watchdog_window=\"w_$process_id\"\n",
             "tombstone=\"$base/.acknowledged-$process_id-{acknowledgement_key}\"\n",
             "legacy_tombstone=\"$base/.acknowledged-$process_id-{legacy_acknowledgement_key}\"\n",
+            "agentapp_ack_probe_process_group() {{\n",
+            "  probe_state=unknown\n",
+            "  [ -x /bin/kill ] || return\n",
+            "  if /bin/kill -0 -- \"-$1\" 2>/dev/null; then probe_state=alive; return; fi\n",
+            "  if kill_error=$(LC_ALL=C /bin/kill -0 -- \"-$1\" 2>&1); then probe_state=alive; return; fi\n",
+            "  case \"$kill_error\" in *\"No such process\"*) probe_state=dead ;; esac\n",
+            "}}\n",
             "agentapp_ack_preflight_root() {{\n",
             "  for entry in \"$root\"/* \"$root\"/.[!.]* \"$root\"/..?*; do\n",
             "    [ -e \"$entry\" ] || continue\n",
@@ -1713,7 +2003,7 @@ fn acknowledgement_command(
             "  [ \"$(cat \"$root/acknowledgement-token\" 2>/dev/null || true)\" = \"$token\" ] || {{ echo AGENTAPP_TMUX_ACK_CHANGED >&2; exit 78; }}\n",
             "  [ \"$(cat \"$root/owner\" 2>/dev/null || true)\" = {owner} ] || {{ echo AGENTAPP_TMUX_ACK_UNOWNED >&2; exit 78; }}\n",
             "  state=$(cat \"$root/state\" 2>/dev/null || true)\n",
-            "  case \"$state\" in completed|terminated|launch-interrupted) ;; *) echo AGENTAPP_TMUX_ACK_NONTERMINAL >&2; exit 78 ;; esac\n",
+            "  case \"$state\" in completed|terminated|recovery-lost|launch-interrupted) ;; *) echo AGENTAPP_TMUX_ACK_NONTERMINAL >&2; exit 78 ;; esac\n",
             "  [ \"$state\" = \"$expected_terminal_state\" ] || {{ echo AGENTAPP_TMUX_ACK_TERMINAL_STATUS_CHANGED >&2; exit 78; }}\n",
             "  code=$(cat \"$root/status\" 2>/dev/null || printf '-')\n",
             "  [ \"$code\" = \"$expected_exit_code\" ] || {{ echo AGENTAPP_TMUX_ACK_EXIT_STATUS_CHANGED >&2; exit 78; }}\n",
@@ -1735,7 +2025,8 @@ fn acknowledgement_command(
             "    pgid=${{process_identity#*:}}\n",
             "    case \"$pane_pid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_ACK_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
             "    case \"$pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_ACK_PROCESS_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
-            "    ! kill -0 \"-$pgid\" 2>/dev/null || {{ echo AGENTAPP_TMUX_ACK_PROCESS_GROUP_ALIVE >&2; exit 81; }}\n",
+            "    agentapp_ack_probe_process_group \"$pgid\"\n",
+            "    case \"$probe_state\" in dead) ;; alive) echo AGENTAPP_TMUX_ACK_PROCESS_GROUP_ALIVE >&2; exit 81 ;; *) echo AGENTAPP_TMUX_ACK_PROCESS_QUERY_UNCERTAIN >&2; exit 80 ;; esac\n",
             "  fi\n",
             "  agentapp_ack_windows\n",
             "  [ \"$command_window_present\" -eq 0 ] || {{ echo AGENTAPP_TMUX_ACK_TARGET_PRESENT >&2; exit 78; }}\n",
@@ -1764,7 +2055,8 @@ fn acknowledgement_command(
             "  [ \"$claim_window\" = \"$expected_window\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80; }}\n",
             "  live_operation_pgid=$(ps -o pgid= -p \"$claim_operation_pid\" 2>/dev/null | tr -d ' ')\n",
             "  [ \"$live_operation_pgid\" != \"$claim_operation_pgid\" ] || {{ echo AGENTAPP_TMUX_ACK_BUSY >&2; exit 79; }}\n",
-            "  ! kill -0 \"-$claim_operation_pgid\" 2>/dev/null || {{ echo AGENTAPP_TMUX_ACK_BUSY >&2; exit 79; }}\n",
+            "  agentapp_ack_probe_process_group \"$claim_operation_pgid\"\n",
+            "  case \"$probe_state\" in dead) ;; alive) echo AGENTAPP_TMUX_ACK_BUSY >&2; exit 79 ;; *) echo AGENTAPP_TMUX_TRANSITION_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
             "  if [ \"$claim_pane:$claim_pgid\" != -:- ]; then\n",
             "    case \"$claim_pane\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
             "    case \"$claim_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
@@ -1937,6 +2229,7 @@ fn parse_recovered_executions(output: &[u8]) -> Result<Vec<RecoveredExecution>, 
                     })?)
                 }
                 "terminated" => RecoveredExecutionStatus::Terminated,
+                "recovery-lost" => RecoveredExecutionStatus::RecoveryLost,
                 "unknown" => RecoveredExecutionStatus::Unknown,
                 _ => {
                     return Err(ExecServerError::Protocol(

@@ -704,6 +704,78 @@ fn recovered_output_is_truthful_and_preserves_exact_bytes() {
 }
 
 #[test]
+fn recovered_output_names_unrecoverable_terminal_result_truthfully() {
+    let execution = codex_exec_server::RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: String::new(),
+            call_id: "call-recovery-lost".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: None,
+        output: b"exact output\n".to_vec(),
+        status: codex_exec_server::RecoveredExecutionStatus::RecoveryLost,
+        terminal_verified_dead: true,
+        session_id: Some(43),
+        committed_output_cursor: 13,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "0123456789abcdef-recovery-lost".to_string(),
+        ),
+    };
+
+    let output = format_recovered_execution_output(&execution);
+
+    assert_eq!(
+        output,
+        "The exact remote process ended, but its exit or signal result was not recoverable\n\
+         Output:\nexact output\n"
+    );
+    assert!(!output.contains("code 125"));
+    assert!(!output.contains("terminated"));
+}
+
+#[test]
+fn recovered_terminal_acknowledgement_binds_exact_output_and_status() {
+    let execution = codex_exec_server::RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: "turn".to_string(),
+            call_id: "call-recovery-lost".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: Some("digest".to_string()),
+        output: b"exact output\n".to_vec(),
+        status: codex_exec_server::RecoveredExecutionStatus::RecoveryLost,
+        terminal_verified_dead: true,
+        session_id: Some(43),
+        committed_output_cursor: 13,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "0123456789abcdef-recovery-lost".to_string(),
+        ),
+    };
+
+    let acknowledgement =
+        terminal_acknowledgement_for_recovered_execution(&execution).expect("terminal proof");
+    let proof = acknowledgement.terminal_proof().expect("bound proof");
+    assert_eq!(proof.range_start, 0);
+    assert_eq!(proof.range_end, 13);
+    assert_eq!(
+        proof.status,
+        codex_exec_server::RecoveredExecutionStatus::RecoveryLost
+    );
+    assert_eq!(
+        proof.output_sha256,
+        "1de7edcfb5d1a77e878e4411456fa5ce9ea0a2b23ad095cfbb63ab10ddf0580a"
+    );
+
+    let mut uncertain = execution;
+    uncertain.terminal_verified_dead = false;
+    assert!(terminal_acknowledgement_for_recovered_execution(&uncertain).is_err());
+}
+
+#[test]
 fn running_foreground_recovery_adopts_and_waits_before_rollout_repair() {
     let source = include_str!("thread_manager.rs");
     let repair = source
@@ -770,22 +842,24 @@ fn running_foreground_adoption_preserves_persisted_session_id() {
 
 #[test]
 fn resumed_background_sessions_restore_before_thread_exposure() {
-    let source = include_str!("thread_manager.rs");
-    let spawn = source
-        .split("pub(crate) async fn spawn_thread_with_source")
+    let source = include_str!("session/session.rs");
+    let session_new = source
+        .split("pub(crate) async fn new(")
         .nth(1)
-        .expect("thread spawn")
-        .split("async fn finalize_thread_spawn")
+        .expect("session construction")
+        .split("pub(crate) async fn")
         .next()
-        .expect("spawn body");
-    let session_spawn = spawn.find("Session::spawn").expect("session construction");
-    let restore = spawn
-        .find("restore_committed_background_sessions")
+        .expect("session construction body");
+    let session = session_new
+        .find("let sess = Arc::new(Session")
+        .expect("session value");
+    let restore = session_new
+        .find("repair_pending_empty_polls_before_reconstruction")
         .expect("background restoration");
-    let exposure = spawn
-        .find("finalize_thread_spawn")
-        .expect("thread exposure");
-    assert!(session_spawn < restore);
+    let exposure = session_new
+        .find("SessionConfiguredEvent")
+        .expect("first externally visible event");
+    assert!(session < restore);
     assert!(restore < exposure);
 }
 

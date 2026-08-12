@@ -81,6 +81,8 @@ void codex_free_string(char *s);
  *                   versions; older libraries simply never emit kind 15.
  *              16 = turn aborted. This is terminal and is never followed by
  *                   event kind 2 (done) for the same turn.
+ *              17 = turn starting. `text` is an interrupt-only handle; the
+ *                   same handle becomes steerable only if kind 8 follows.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */
@@ -321,6 +323,20 @@ char *codex_download_ssh_workspace_file(const char *ssh_host,
  * 7 = the active turn rejected steering.
  */
 int codex_steer_turn(uint64_t turn_handle, const char *text);
+
+/*
+ * Attachment-aware same-turn steering. `uploads_json` uses the same local_path
+ * and relative_path manifest as turn startup. Supported images are submitted
+ * as multimodal input; server-mode turns first mirror all files into the SSH
+ * workspace. Empty text is accepted when at least one upload is present.
+ *
+ * Returns the same codes as codex_steer_turn(), plus 8 = invalid upload
+ * manifest, 9 = attachment upload failed, and 10 = upload compensation failed
+ * after the exact turn rejected steering.
+ */
+int codex_steer_turn_with_uploads(uint64_t turn_handle,
+                                  const char *text,
+                                  const char *uploads_json);
 
 /*
  * Interrupt a registered streaming turn. The handle is emitted through event

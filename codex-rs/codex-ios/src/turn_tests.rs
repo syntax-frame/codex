@@ -37,6 +37,7 @@ use super::KIND_DONE;
 use super::KIND_ERROR;
 use super::KIND_ITEM_STARTED;
 use super::KIND_TURN_READY;
+use super::KIND_TURN_STARTING;
 use super::PersistedThreadPointer;
 use super::ServerFileUpload;
 use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
@@ -51,10 +52,12 @@ use super::codex_interrupt_turn;
 use super::codex_ios_tool_discovery_contract_version;
 use super::codex_run_turn_streaming_apikey;
 use super::codex_steer_turn;
+use super::codex_steer_turn_with_uploads;
 use super::disable_upstream_multi_agent;
 use super::emit;
 use super::emit_item_started_events;
 use super::emit_turn_result;
+use super::finish_host_detach_cleanup;
 use super::finish_turn_after_cleanup;
 use super::finish_turn_with_cleanup;
 use super::interrupted_model_turn_cleanup_error;
@@ -62,6 +65,7 @@ use super::model_context_resume_error_class;
 use super::model_context_resume_error_reason;
 use super::parse_agentapp_dynamic_tools_json;
 use super::parse_reasoning_effort;
+use super::parse_server_file_uploads;
 use super::parse_ssh_authentication;
 use super::parse_tmux_mode;
 use super::persistent_model_context_resume_error;
@@ -72,6 +76,7 @@ use super::register_starting_turn;
 use super::resolve_oauth_effort;
 use super::resolve_oauth_preset;
 use super::startup_interrupt_requested;
+use super::steering_user_input;
 use super::tool_discovery_event_json;
 use super::validate_relative_rollout_path;
 use super::write_thread_pointer;
@@ -242,7 +247,7 @@ fn pre_submit_interrupt_gate_is_idempotent_and_registry_guard_cleans_up() {
     let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
     let (handle, guard) = register_starting_turn(capture_event, ctx).expect("register turn");
 
-    assert_eq!(events, vec![(KIND_TURN_READY, handle.to_string())]);
+    assert_eq!(events, vec![(KIND_TURN_STARTING, handle.to_string())]);
     assert!(!startup_interrupt_requested(handle).expect("startup state"));
     assert_eq!(codex_interrupt_turn(handle), 0);
     assert!(startup_interrupt_requested(handle).expect("interrupted startup state"));
@@ -305,6 +310,103 @@ fn prompt_image_limit_matches_agentapp_picker_without_silent_truncation() {
     assert_eq!(
         prompt_image_uploads(&overflow).expect_err("overflow must be explicit"),
         "too many prompt images: received 11, maximum is 10"
+    );
+}
+
+#[test]
+fn steering_upload_manifest_requires_bounded_unique_regular_files() {
+    let directory = tempfile::tempdir().expect("upload directory");
+    let first = directory.path().join("first.png");
+    let second = directory.path().join("second.pdf");
+    std::fs::write(&first, b"image").expect("first upload");
+    std::fs::write(&second, b"document").expect("second upload");
+    let valid = serde_json::json!([
+        {
+            "local_path": first,
+            "relative_path": "uploads/first.png"
+        },
+        {
+            "local_path": second,
+            "relative_path": "uploads/second.pdf"
+        }
+    ]);
+    assert_eq!(
+        parse_server_file_uploads(&valid.to_string())
+            .expect("valid manifest")
+            .len(),
+        2
+    );
+
+    let relative_local = serde_json::json!([{
+        "local_path": "relative.png",
+        "relative_path": "uploads/relative.png"
+    }]);
+    assert!(
+        parse_server_file_uploads(&relative_local.to_string())
+            .expect_err("local path must be absolute")
+            .contains("must be absolute")
+    );
+
+    let duplicate = serde_json::json!([
+        {
+            "local_path": directory.path().join("first.png"),
+            "relative_path": "uploads/duplicate.png"
+        },
+        {
+            "local_path": directory.path().join("second.pdf"),
+            "relative_path": "uploads/duplicate.png"
+        }
+    ]);
+    assert!(
+        parse_server_file_uploads(&duplicate.to_string())
+            .expect_err("remote destination must be unique")
+            .contains("was duplicated")
+    );
+
+    let malformed = serde_json::json!([{
+        "local_path": directory.path().join("first.png"),
+        "relative_path": "uploads//first.png"
+    }]);
+    assert!(
+        parse_server_file_uploads(&malformed.to_string())
+            .expect_err("remote path must be normalized")
+            .contains("normalized relative path")
+    );
+
+    let too_many = (0..33)
+        .map(|index| {
+            serde_json::json!({
+                "local_path": directory.path().join("first.png"),
+                "relative_path": format!("uploads/{index}.png")
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        parse_server_file_uploads(&serde_json::Value::Array(too_many).to_string())
+            .expect_err("manifest count must be bounded")
+            .contains("maximum is 32")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn steering_upload_manifest_rejects_local_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().expect("upload directory");
+    let target = directory.path().join("target.png");
+    let link = directory.path().join("link.png");
+    std::fs::write(&target, b"image").expect("target upload");
+    symlink(&target, &link).expect("upload symlink");
+    let manifest = serde_json::json!([{
+        "local_path": link,
+        "relative_path": "uploads/link.png"
+    }]);
+
+    assert!(
+        parse_server_file_uploads(&manifest.to_string())
+            .expect_err("symlink must be rejected")
+            .contains("regular non-symlink file")
     );
 }
 
@@ -487,6 +589,21 @@ fn failed_protected_first_turn_leaves_a_resumable_rollout() {
     let server = RejectingResponsesServer::start();
 
     let first = run_apikey_turn_against(home.path(), &server.base_url);
+    let first_kinds = first.iter().map(|(kind, _)| *kind).collect::<Vec<_>>();
+    let starting_index = first_kinds
+        .iter()
+        .position(|kind| *kind == KIND_TURN_STARTING)
+        .expect("starting event");
+    let ready_index = first_kinds
+        .iter()
+        .position(|kind| *kind == KIND_TURN_READY)
+        .expect("ready event");
+    let error_index = first_kinds
+        .iter()
+        .position(|kind| *kind == KIND_ERROR)
+        .expect("protected error");
+    assert!(starting_index < ready_index);
+    assert!(ready_index < error_index);
     assert_eq!(
         first
             .iter()
@@ -801,6 +918,61 @@ fn done_is_emitted_only_after_successful_persistence_cleanup() {
 }
 
 #[test]
+fn completed_turn_survives_post_detach_shutdown_failure() {
+    let private_detail = "/private/context/rollout.jsonl: secret SessionEnd failure";
+    let shutdown_error = persistent_model_context_storage_error("shutdown", &private_detail);
+    let cleanup_result =
+        finish_host_detach_cleanup(/*completed_turn*/ true, Ok(()), Err(shutdown_error));
+    let mut events = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+
+    let result = finish_turn_after_cleanup(
+        capture_event,
+        ctx,
+        /*completed_turn*/ true,
+        /*protected_error_emitted*/ false,
+        Ok(()),
+        cleanup_result,
+    );
+    emit_turn_result(capture_event, ctx, Ok(result));
+
+    assert_eq!(events, vec![(KIND_DONE, String::new())]);
+    assert!(events.iter().all(|(_, message)| {
+        !message.contains(private_detail) && !message.contains("/private/context")
+    }));
+}
+
+#[test]
+fn completed_turn_still_fails_when_host_detach_durability_barrier_fails() {
+    let detach_error = persistent_model_context_storage_error(
+        "flush",
+        &"/private/context/rollout.jsonl: secret flush failure",
+    );
+    let cleanup_result =
+        finish_host_detach_cleanup(/*completed_turn*/ true, Err(detach_error), Ok(()));
+    let mut events = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+
+    let result = finish_turn_after_cleanup(
+        capture_event,
+        ctx,
+        /*completed_turn*/ true,
+        /*protected_error_emitted*/ false,
+        Ok(()),
+        cleanup_result,
+    );
+    emit_turn_result(capture_event, ctx, Ok(result));
+
+    assert_eq!(
+        events,
+        vec![(
+            KIND_ERROR,
+            "failed to flush persistent model context".to_string(),
+        )]
+    );
+}
+
+#[test]
 fn password_authentication_preserves_secret_without_temp_file() {
     let secret = " password with spaces ".to_string();
     let (authentication, guard) =
@@ -1036,6 +1208,56 @@ fn steering_rejects_invalid_text_and_expired_handles() {
 
     let text = CString::new("Please change direction.").unwrap();
     assert_eq!(codex_steer_turn(u64::MAX, text.as_ptr()), 6);
+
+    let malformed = CString::new("{not-json").unwrap();
+    assert_eq!(
+        codex_steer_turn_with_uploads(u64::MAX, text.as_ptr(), malformed.as_ptr()),
+        8
+    );
+}
+
+#[test]
+fn starting_turn_handle_rejects_attachment_steering_until_ready() {
+    let mut events = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+    let (handle, guard) = register_starting_turn(capture_event, ctx).expect("register turn");
+    let text = CString::new("Inspect this attachment.").expect("steering text");
+    let uploads = CString::new("[]").expect("empty uploads");
+
+    assert_eq!(
+        codex_steer_turn_with_uploads(handle, text.as_ptr(), uploads.as_ptr()),
+        6
+    );
+    assert_eq!(events, vec![(KIND_TURN_STARTING, handle.to_string())]);
+
+    drop(guard);
+}
+
+#[test]
+fn attachment_steering_builds_text_and_local_image_input_without_silent_truncation() {
+    let uploads = vec![
+        ServerFileUpload {
+            local_path: "/tmp/screenshot.png".to_string(),
+            relative_path: "uploads/screenshot.png".to_string(),
+        },
+        ServerFileUpload {
+            local_path: "/tmp/report.pdf".to_string(),
+            relative_path: "uploads/report.pdf".to_string(),
+        },
+    ];
+    let input = steering_user_input("Please inspect both attachments.".to_string(), &uploads)
+        .expect("valid steering input");
+    assert_eq!(input.len(), 2);
+    assert!(matches!(
+        &input[0],
+        codex_protocol::user_input::UserInput::Text { text, .. }
+            if text == "Please inspect both attachments."
+    ));
+    assert!(matches!(
+        &input[1],
+        codex_protocol::user_input::UserInput::LocalImage { path, .. }
+            if path == Path::new("/tmp/screenshot.png")
+    ));
 }
 
 #[test]
@@ -1089,7 +1311,7 @@ fn malformed_model_context_pointer_surfaces_error_without_replacement() {
 
     assert_eq!(
         events.iter().map(|event| event.0).collect::<Vec<_>>(),
-        vec![KIND_TURN_READY, KIND_ERROR]
+        vec![KIND_TURN_STARTING, KIND_ERROR]
     );
     assert!(events[1].1.contains("invalid model-context pointer"));
     assert_eq!(
@@ -1120,7 +1342,7 @@ fn failed_model_context_resume_preserves_pointer_and_rollout() {
 
     assert_eq!(
         events.iter().map(|event| event.0).collect::<Vec<_>>(),
-        vec![KIND_TURN_READY, KIND_ERROR]
+        vec![KIND_TURN_STARTING, KIND_ERROR]
     );
     assert_eq!(
         events[1].1,
@@ -1167,7 +1389,7 @@ fn truncated_model_context_resume_preserves_typed_failure() {
 
     assert_eq!(
         events.iter().map(|event| event.0).collect::<Vec<_>>(),
-        vec![KIND_TURN_READY, KIND_ERROR]
+        vec![KIND_TURN_STARTING, KIND_ERROR]
     );
     assert_eq!(
         events[1].1,

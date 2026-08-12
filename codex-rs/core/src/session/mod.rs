@@ -2532,6 +2532,9 @@ impl Session {
                             RemoteExecutionTerminalStatus::Terminated => {
                                 codex_exec_server::RecoveredExecutionStatus::Terminated
                             }
+                            RemoteExecutionTerminalStatus::RecoveryLost => {
+                                codex_exec_server::RecoveredExecutionStatus::RecoveryLost
+                            }
                         },
                     });
             let receipt_marker = RemoteExecutionSessionAcknowledged {
@@ -2810,7 +2813,8 @@ impl Session {
                         }
                     }
                     codex_exec_server::RecoveredExecutionStatus::Exited(_)
-                    | codex_exec_server::RecoveredExecutionStatus::Terminated => {
+                    | codex_exec_server::RecoveredExecutionStatus::Terminated
+                    | codex_exec_server::RecoveredExecutionStatus::RecoveryLost => {
                         if !execution.terminal_verified_dead {
                             return Err(CodexErr::Fatal(format!(
                                 "terminal background session {} lacks exact death proof",
@@ -3215,7 +3219,8 @@ impl Session {
                 }
             }
             codex_exec_server::RecoveredExecutionStatus::Exited(_)
-            | codex_exec_server::RecoveredExecutionStatus::Terminated => {}
+            | codex_exec_server::RecoveredExecutionStatus::Terminated
+            | codex_exec_server::RecoveredExecutionStatus::RecoveryLost => {}
             _ => {
                 return Err(CodexErr::Fatal(format!(
                     "background session {} is not safely recoverable for nonempty write",
@@ -3243,6 +3248,7 @@ impl Session {
         let observed_exit_code = match execution.status {
             codex_exec_server::RecoveredExecutionStatus::Exited(exit_code) => exit_code,
             codex_exec_server::RecoveredExecutionStatus::Terminated => 143,
+            codex_exec_server::RecoveredExecutionStatus::RecoveryLost => 125,
             _ => {
                 return Err(CodexErr::Fatal(format!(
                     "background session {} lacks terminal proof after nonempty write recovery",
@@ -3291,6 +3297,10 @@ impl Session {
             }
             RemoteExecutionTerminalStatus::Terminated => {
                 "Process was terminated during SSH lifecycle recovery; stdin delivery is unknown"
+                    .to_string()
+            }
+            RemoteExecutionTerminalStatus::RecoveryLost => {
+                "The exact remote process ended during SSH lifecycle recovery, but its exit or signal result and stdin delivery are unknown"
                     .to_string()
             }
         };
@@ -4117,6 +4127,11 @@ impl Session {
                 if observed_exit_code == 143 =>
             {
                 Some(RemoteExecutionTerminalStatus::Terminated)
+            }
+            codex_exec_server::RecoveredExecutionStatus::RecoveryLost
+                if observed_exit_code == 125 =>
+            {
+                Some(RemoteExecutionTerminalStatus::RecoveryLost)
             }
             _ => None,
         };

@@ -322,6 +322,9 @@ pub struct ExecCommandToolOutput {
     pub max_output_tokens: Option<usize>,
     pub process_id: Option<i32>,
     pub exit_code: Option<i32>,
+    /// Durable recovery proved the process and command window are gone, but
+    /// could not recover a trustworthy exit or signal result.
+    pub recovery_lost: bool,
     pub original_token_count: Option<usize>,
     /// Bytes omitted by the output collection cap before model-facing truncation.
     pub output_omitted_bytes: Option<NonZeroUsize>,
@@ -381,6 +384,8 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             exit_code: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            terminal_status: Option<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             session_id: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
@@ -391,6 +396,7 @@ impl ToolOutput for ExecCommandToolOutput {
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
             wall_time_seconds: self.wall_time.as_secs_f64(),
             exit_code: self.exit_code,
+            terminal_status: self.recovery_lost.then_some("recovery_lost"),
             session_id: self.process_id,
             original_token_count: self.original_token_count,
             output: match self.max_output_tokens {
@@ -450,7 +456,13 @@ impl ExecCommandToolOutput {
         let wall_time_seconds = self.wall_time.as_secs_f64();
         sections.push(format!("Wall time: {wall_time_seconds:.4} seconds"));
 
-        if let Some(exit_code) = self.exit_code {
+        if self.recovery_lost {
+            sections.push(
+                "Remote process recovery was lost: the exact process and terminal window are \
+                 gone, but no trustworthy exit or signal result was available"
+                    .to_string(),
+            );
+        } else if let Some(exit_code) = self.exit_code {
             sections.push(format!("Process exited with code {exit_code}"));
         }
 

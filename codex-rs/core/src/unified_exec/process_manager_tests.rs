@@ -185,6 +185,72 @@ fn unified_exec_env_injects_defaults() {
     assert_eq!(env, expected);
 }
 
+#[tokio::test]
+async fn recovery_lost_background_restore_is_truthful_on_poll() {
+    let (session, _turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let recovered = codex_exec_server::RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: session.thread_id.to_string(),
+            turn_id: "exec-turn-recovery-lost".to_string(),
+            call_id: "exec-call-recovery-lost".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: Some("digest-recovery-lost".to_string()),
+        output: b"committedtail".to_vec(),
+        status: codex_exec_server::RecoveredExecutionStatus::RecoveryLost,
+        terminal_verified_dead: true,
+        session_id: Some(43),
+        committed_output_cursor: 13,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "acknowledgement-recovery-lost".to_string(),
+        ),
+    };
+    session
+        .services
+        .unified_exec_manager
+        .restore_terminal_background_process(
+            &recovered,
+            9,
+            &session,
+            "exec-call-recovery-lost".to_string(),
+            PathUri::parse("file:///tmp").expect("cwd"),
+            "command".to_string(),
+            /*tty*/ false,
+        )
+        .await
+        .expect("restore recovery-lost terminal process");
+
+    let response = session
+        .services
+        .unified_exec_manager
+        .write_stdin(WriteStdinRequest {
+            process_id: 43,
+            input: "",
+            yield_time_ms: crate::unified_exec::MIN_YIELD_TIME_MS,
+            max_output_tokens: None,
+            truncation_policy: codex_protocol::protocol::TruncationPolicy::Bytes(1_024),
+            interaction_event: None,
+        })
+        .await
+        .expect("poll recovery-lost terminal process");
+
+    assert_eq!(response.raw_output, b"tail");
+    assert_eq!(response.exit_code, Some(125));
+    assert!(response.recovery_lost);
+    assert!(
+        response
+            .response_text()
+            .contains("Remote process recovery was lost")
+    );
+    assert!(
+        !response
+            .response_text()
+            .contains("Process exited with code 125")
+    );
+}
+
 #[test]
 fn unified_exec_env_overrides_existing_values() {
     let mut base = HashMap::new();
@@ -744,6 +810,7 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                 },
                 call_id: format!("call-{process_id}"),
                 process_id,
+                recovery_lost: false,
                 cwd: cwd.clone(),
                 initial_exec_command_active: Arc::new(AtomicBool::new(false)),
                 hook_command: format!("command-{process_id}"),
@@ -787,6 +854,7 @@ async fn shutdown_retains_process_when_remote_termination_is_unconfirmed() {
             process,
             call_id: "call-17".to_string(),
             process_id,
+            recovery_lost: false,
             cwd: PathUri::parse("file:///tmp").expect("test cwd should be valid"),
             initial_exec_command_active: Arc::new(AtomicBool::new(false)),
             hook_command: "sleep 30".to_string(),
@@ -841,6 +909,7 @@ async fn runtime_loss_detaches_durable_process_and_terminates_non_durable_proces
                 process: Arc::new(process),
                 call_id: format!("call-{process_id}"),
                 process_id,
+                recovery_lost: false,
                 cwd: cwd.clone(),
                 initial_exec_command_active: Arc::new(AtomicBool::new(false)),
                 hook_command: "sleep 30".to_string(),
@@ -889,6 +958,7 @@ async fn no_live_rollout_freezes_pending_receipt_but_allows_identity_free_output
             process,
             call_id: "exec-23".to_string(),
             process_id,
+            recovery_lost: false,
             cwd: PathUri::parse("file:///tmp").expect("test cwd should be valid"),
             initial_exec_command_active: Arc::new(AtomicBool::new(false)),
             hook_command: "sleep 30".to_string(),

@@ -181,6 +181,9 @@ struct ProcessEntry {
     process: Arc<UnifiedExecProcess>,
     call_id: String,
     process_id: i32,
+    /// The backend proved the process and command window are gone, but could
+    /// not recover a trustworthy exit or signal result.
+    recovery_lost: bool,
     cwd: PathUri,
     initial_exec_command_active: Arc<std::sync::atomic::AtomicBool>,
     hook_command: String,

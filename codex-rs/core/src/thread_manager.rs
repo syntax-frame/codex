@@ -2666,7 +2666,13 @@ async fn append_recovered_execution_outputs_to_rollout(
                     execution.identity.call_id
                 )));
             }
-            RecoveredExecutionStatus::Exited(_) | RecoveredExecutionStatus::Terminated => {}
+            RecoveredExecutionStatus::Exited(_)
+            | RecoveredExecutionStatus::Terminated
+            | RecoveredExecutionStatus::RecoveryLost => {}
+        }
+        if acknowledge_after_repair {
+            execution.acknowledgement =
+                terminal_acknowledgement_for_recovered_execution(&execution)?;
         }
         let output =
             FunctionCallOutputPayload::from_text(format_recovered_execution_output(&execution));
@@ -2680,6 +2686,41 @@ async fn append_recovered_execution_outputs_to_rollout(
         appended = true;
     }
     Ok(appended)
+}
+
+fn terminal_acknowledgement_for_recovered_execution(
+    execution: &RecoveredExecution,
+) -> CodexResult<codex_exec_server::RecoveredExecutionAcknowledgement> {
+    let status = match execution.status {
+        RecoveredExecutionStatus::Exited(exit_code) => RecoveredExecutionStatus::Exited(exit_code),
+        RecoveredExecutionStatus::Terminated => RecoveredExecutionStatus::Terminated,
+        RecoveredExecutionStatus::RecoveryLost => RecoveredExecutionStatus::RecoveryLost,
+        RecoveredExecutionStatus::LaunchInterrupted => RecoveredExecutionStatus::LaunchInterrupted,
+        _ => {
+            return Err(CodexErr::Fatal(format!(
+                "remote execution recovery cannot acknowledge nonterminal call {}",
+                execution.identity.call_id
+            )));
+        }
+    };
+    if !execution.terminal_verified_dead
+        || execution.delivery_unknown
+        || execution.committed_output_cursor != execution.output.len() as u64
+    {
+        return Err(CodexErr::Fatal(format!(
+            "remote execution recovery lacks full acknowledgement proof for call {}",
+            execution.identity.call_id
+        )));
+    }
+    Ok(codex_exec_server::RecoveredExecutionAcknowledgement::new(
+        execution.acknowledgement.persistence_token().to_string(),
+    )
+    .with_terminal_proof(codex_exec_server::TerminalAcknowledgementProof {
+        range_start: 0,
+        range_end: execution.committed_output_cursor,
+        output_sha256: format!("{:x}", Sha256::digest(&execution.output)),
+        status,
+    }))
 }
 
 fn foreground_adoption_request(
@@ -2843,6 +2884,10 @@ fn format_recovered_execution_output(execution: &RecoveredExecution) -> String {
             } else {
                 "Process was terminated during SSH lifecycle recovery".to_string()
             }
+        }
+        RecoveredExecutionStatus::RecoveryLost => {
+            "The exact remote process ended, but its exit or signal result was not recoverable"
+                .to_string()
         }
         RecoveredExecutionStatus::Unknown => "Remote process state is unknown".to_string(),
     };

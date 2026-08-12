@@ -163,6 +163,9 @@ pub enum RecoveredExecutionStatus {
     Running,
     Exited(i32),
     Terminated,
+    /// Exact ownership and death were proven, but no trustworthy natural
+    /// exit or delivered-signal status survived on the remote host.
+    RecoveryLost,
     Unknown,
 }
 
@@ -259,7 +262,7 @@ impl RecoveredExecutionAcknowledgement {
         &self.token
     }
 
-    pub(crate) fn terminal_proof(&self) -> Option<&TerminalAcknowledgementProof> {
+    pub fn terminal_proof(&self) -> Option<&TerminalAcknowledgementProof> {
         self.terminal_proof.as_ref()
     }
 }
@@ -296,28 +299,28 @@ pub fn select_execution_generation(
         (Prepared | Running, _) => {
             Err("generation zero is live while generation one exists".to_string())
         }
-        (Exited(_) | Terminated | LaunchInterrupted, Missing)
+        (Exited(_) | Terminated | RecoveryLost | LaunchInterrupted, Missing)
             if generation_zero.terminal_verified_dead =>
         {
             Ok(GenerationSelection::Selected(0))
         }
-        (Exited(_) | Terminated | LaunchInterrupted, Missing) => {
+        (Exited(_) | Terminated | RecoveryLost | LaunchInterrupted, Missing) => {
             Ok(GenerationSelection::NeedsTerminalVerification(0))
         }
-        (Exited(_) | Terminated | LaunchInterrupted, _)
+        (Exited(_) | Terminated | RecoveryLost | LaunchInterrupted, _)
             if !generation_zero.terminal_verified_dead =>
         {
             Ok(GenerationSelection::NeedsTerminalVerification(0))
         }
         (
-            Exited(_) | Terminated | LaunchInterrupted,
-            Exited(_) | Terminated | LaunchInterrupted,
+            Exited(_) | Terminated | RecoveryLost | LaunchInterrupted,
+            Exited(_) | Terminated | RecoveryLost | LaunchInterrupted,
         ) if !generation_one.terminal_verified_dead => {
             Ok(GenerationSelection::NeedsTerminalVerification(1))
         }
         (
-            Exited(_) | Terminated | LaunchInterrupted,
-            Prepared | Running | Exited(_) | Terminated | LaunchInterrupted,
+            Exited(_) | Terminated | RecoveryLost | LaunchInterrupted,
+            Prepared | Running | Exited(_) | Terminated | RecoveryLost | LaunchInterrupted,
         ) if generation_one.terminal_verified_dead
             || matches!(generation_one.status, Prepared | Running) =>
         {

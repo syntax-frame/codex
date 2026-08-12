@@ -433,6 +433,7 @@ fn exec_command_tool_output_formats_truncated_response() {
         max_output_tokens: Some(4),
         process_id: None,
         exit_code: Some(0),
+        recovery_lost: false,
         original_token_count: Some(10),
         output_omitted_bytes: None,
         hook_command: None,
@@ -464,6 +465,40 @@ fn exec_command_tool_output_formats_truncated_response() {
 }
 
 #[test]
+fn exec_command_tool_output_reports_recovery_loss_without_inventing_exit() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".to_string(),
+    };
+    let response = ExecCommandToolOutput {
+        event_call_id: "call-recovery-lost".to_string(),
+        chunk_id: "recovery".to_string(),
+        wall_time: std::time::Duration::ZERO,
+        raw_output: b"last durable bytes".to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: None,
+        process_id: None,
+        exit_code: Some(125),
+        recovery_lost: true,
+        original_token_count: None,
+        output_omitted_bytes: None,
+        hook_command: None,
+    }
+    .to_response_item("call-recovery-lost", &payload);
+
+    let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+        panic!("expected FunctionCallOutput");
+    };
+    let text = output
+        .body
+        .to_text()
+        .expect("exec output should serialize as text");
+    assert!(text.contains("Remote process recovery was lost"));
+    assert!(text.contains("no trustworthy exit or signal result"));
+    assert!(text.contains("last durable bytes"));
+    assert!(!text.contains("Process exited with code 125"));
+}
+
+#[test]
 fn exec_command_tool_output_preserves_omission_metadata_when_truncated() {
     let payload = ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -484,6 +519,7 @@ fn exec_command_tool_output_preserves_omission_metadata_when_truncated() {
         max_output_tokens: Some(4),
         process_id: None,
         exit_code: Some(0),
+        recovery_lost: false,
         original_token_count: Some(42_000),
         output_omitted_bytes: NonZeroUsize::new(/*n*/ 123_456),
         hook_command: None,

@@ -13,6 +13,7 @@ use super::SharedState;
 use super::SshProcess;
 use crate::ProcessId;
 use crate::process::ExecProcessEventLog;
+use crate::protocol::ProcessSignal;
 
 fn process_with_command_pump() -> (Arc<SshProcess>, mpsc::Receiver<ChannelCommand>) {
     let (cmd_tx, cmd_rx) = mpsc::channel(1);
@@ -20,8 +21,6 @@ fn process_with_command_pump() -> (Arc<SshProcess>, mpsc::Receiver<ChannelComman
     (
         Arc::new(SshProcess {
             process_id: ProcessId::from("process"),
-            tty: false,
-            tmux: true,
             events: ExecProcessEventLog::new(
                 PROCESS_EVENT_CHANNEL_CAPACITY,
                 RETAINED_OUTPUT_BYTES_PER_PROCESS,
@@ -33,6 +32,64 @@ fn process_with_command_pump() -> (Arc<SshProcess>, mpsc::Receiver<ChannelComman
         }),
         cmd_rx,
     )
+}
+
+#[tokio::test]
+async fn signal_waits_for_remote_acknowledgement() {
+    let (process, mut commands) = process_with_command_pump();
+    let signalling = tokio::spawn(async move {
+        ExecProcessImpl::signal(process.as_ref(), ProcessSignal::Interrupt).await
+    });
+
+    let Some(ChannelCommand::Signal { ack, .. }) = commands.recv().await else {
+        panic!("expected acknowledged signal");
+    };
+    assert!(!signalling.is_finished());
+    ack.send(Ok(())).expect("deliver acknowledgement");
+
+    signalling
+        .await
+        .expect("signal task")
+        .expect("acknowledged signal");
+}
+
+#[tokio::test]
+async fn signal_propagates_remote_failure() {
+    let (process, mut commands) = process_with_command_pump();
+    let signalling = tokio::spawn(async move {
+        ExecProcessImpl::signal(process.as_ref(), ProcessSignal::Interrupt).await
+    });
+
+    let Some(ChannelCommand::Signal { ack, .. }) = commands.recv().await else {
+        panic!("expected acknowledged signal");
+    };
+    ack.send(Err("remote interrupt failed".to_string()))
+        .expect("deliver failure");
+
+    let error = signalling
+        .await
+        .expect("signal task")
+        .expect_err("signal must fail");
+    assert!(error.to_string().contains("remote interrupt failed"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn signal_times_out_without_remote_acknowledgement() {
+    let (process, mut commands) = process_with_command_pump();
+    let signalling = tokio::spawn(async move {
+        ExecProcessImpl::signal(process.as_ref(), ProcessSignal::Interrupt).await
+    });
+
+    let Some(ChannelCommand::Signal { ack: _ack, .. }) = commands.recv().await else {
+        panic!("expected acknowledged signal");
+    };
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+
+    let error = signalling
+        .await
+        .expect("signal task")
+        .expect_err("signal must time out");
+    assert!(error.to_string().contains("timed out"));
 }
 
 #[tokio::test]

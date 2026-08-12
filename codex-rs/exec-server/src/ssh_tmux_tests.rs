@@ -123,7 +123,7 @@ fn adoption_is_exact_fenced_and_never_enters_launch_path() {
         "kill -0",
         "transition-claim",
         "adoption|a_",
-        "! kill -0 \"-$claim_operation_pgid\"",
+        "agentapp_adopt_probe_process_group \"$claim_operation_pgid\"",
         "[ \"$claim_operation_pgid\" != \"$pgid\" ]",
         "transition-claim.quarantine.$claim_nonce",
         "agentapp_adopt_authority",
@@ -548,7 +548,8 @@ fn reconciliation_terminal_death_requires_complete_exact_identity_proof() {
     assert!(command.contains("[ \"$pane_pid:$pgid\" = \"$process_identity\" ]"));
     assert!(command.contains("[ \"$window\" = \"$expected_window\" ]"));
     assert!(command.contains("completed:completed|terminated:terminated"));
-    assert!(command.contains("! kill -0 \"-$pgid\""));
+    assert!(command.contains("agentapp_probe_process_group \"$pgid\""));
+    assert!(command.contains("AGENTAPP_TMUX_RECONCILE_PROCESS_QUERY_UNCERTAIN"));
     assert!(command.contains("grep -Fqx \"$expected_window\""));
 }
 
@@ -722,6 +723,757 @@ fn prepared_descriptor_without_go_rolls_back_before_repair() {
         fs::read_to_string(root.join("terminal-claim/kind")).expect("claim kind"),
         "launch-interrupted\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_running_descriptor_with_dead_process_and_missing_window_records_recovery_loss() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("expected-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let command = exact_reconciliation_command("agent", &request);
+    let home = tempfile::tempdir().expect("temp home");
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin");
+    let tmux = bin.join("tmux");
+    fs::write(
+        &tmux,
+        "#!/bin/sh\ncase \"$1\" in list-windows) exit 0 ;; kill-window) exit 0 ;; *) exit 0 ;; esac\n",
+    )
+    .expect("fake tmux");
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+
+    let agent_id = stable_identifier("agent");
+    let process_id = stable_identifier("thread\0turn\0call\00");
+    let expected_window = format!("p_{process_id}");
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&agent_id)
+        .join(&process_id);
+    fs::create_dir_all(&root).expect("descriptor root");
+    for (name, value) in [
+        ("owner", "agentapp-tmux-v2"),
+        ("identity", process_id.as_str()),
+        ("thread-id", "dGhyZWFk"),
+        ("turn-id", "dHVybg=="),
+        ("call-id", "Y2FsbA=="),
+        ("attempt-generation", "0"),
+        ("session-id", "42"),
+        ("tty", "0"),
+        ("digest", "expected-digest"),
+        ("acknowledgement-token", "token"),
+        ("window", expected_window.as_str()),
+        ("process-identity", "2147483646:2147483646"),
+        ("controller", "7:previous-controller"),
+        ("lease-generation", "7"),
+        ("state", "running"),
+        ("output", "captured output"),
+        ("go", ""),
+    ] {
+        fs::write(root.join(name), value).expect("descriptor field");
+    }
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&command)
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .output()
+        .expect("run exact reconciliation");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recovered =
+        parse_recovered_executions(&output.stdout).expect("parse reconciliation output");
+    assert_eq!(recovered[0].status, RecoveredExecutionStatus::RecoveryLost);
+    assert!(recovered[0].terminal_verified_dead);
+    assert_eq!(recovered[0].output, b"captured output");
+    assert_eq!(
+        fs::read_to_string(root.join("terminal-claim/kind")).expect("claim kind"),
+        "recovery-lost\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("status")).expect("status"),
+        "125\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("state"),
+        "recovery-lost\n"
+    );
+    assert!(!root.join("transition-claim").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_running_descriptor_recovers_dead_bootstrap_and_interrupt_claims() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("expected-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let command = exact_reconciliation_command("agent", &request);
+    let agent_id = stable_identifier("agent");
+    let process_id = stable_identifier("thread\0turn\0call\00");
+    let expected_window = format!("p_{process_id}");
+
+    for (claim_kind, claim_nonce, claim_identity) in [
+        ("bootstrap", "b_crashed", "-:-".to_string()),
+        (
+            "interrupt",
+            "i_2147483645_2147483645",
+            "2147483646:2147483646".to_string(),
+        ),
+    ] {
+        let home = tempfile::tempdir().expect("temp home");
+        let bin = home.path().join("bin");
+        fs::create_dir(&bin).expect("fake bin");
+        let tmux = bin.join("tmux");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\ncase \"$1\" in list-windows) exit 0 ;; kill-window) exit 0 ;; *) exit 0 ;; esac\n",
+        )
+        .expect("fake tmux");
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+
+        let root = home
+            .path()
+            .join(".agentapp/tmux")
+            .join(&agent_id)
+            .join(&process_id);
+        fs::create_dir_all(&root).expect("descriptor root");
+        for (name, value) in [
+            ("owner", "agentapp-tmux-v2"),
+            ("identity", process_id.as_str()),
+            ("thread-id", "dGhyZWFk"),
+            ("turn-id", "dHVybg=="),
+            ("call-id", "Y2FsbA=="),
+            ("attempt-generation", "0"),
+            ("session-id", "42"),
+            ("tty", "0"),
+            ("digest", "expected-digest"),
+            ("acknowledgement-token", "token"),
+            ("window", expected_window.as_str()),
+            ("process-identity", "2147483646:2147483646"),
+            ("controller", "7:previous-controller"),
+            ("lease-generation", "7"),
+            ("state", "running"),
+            ("output", "captured output"),
+            ("go", ""),
+        ] {
+            fs::write(root.join(name), value).expect("descriptor field");
+        }
+        let (claim_pane, claim_pgid) = claim_identity.split_once(':').expect("claim identity");
+        let claim = format!(
+            "{claim_kind}|{claim_nonce}|7:previous-controller|2147483645|2147483645|{expected_window}|{claim_pane}|{claim_pgid}\n"
+        );
+        let candidate = root.join(format!(".transition-candidate.{claim_nonce}.2147483645"));
+        fs::write(&candidate, &claim).expect("orphaned transition candidate");
+        fs::hard_link(&candidate, root.join("transition-claim"))
+            .expect("orphaned transition claim");
+
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("HOME", home.path())
+            .env("PATH", path)
+            .output()
+            .expect("run exact reconciliation");
+        assert!(
+            output.status.success(),
+            "{claim_kind}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let recovered =
+            parse_recovered_executions(&output.stdout).expect("parse reconciliation output");
+        assert_eq!(recovered[0].status, RecoveredExecutionStatus::RecoveryLost);
+        assert!(recovered[0].terminal_verified_dead);
+        assert!(!root.join("transition-claim").exists());
+        assert!(!candidate.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_running_descriptor_rolls_forward_torn_terminal_tuple() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("expected-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let command = exact_reconciliation_command("agent", &request);
+    let agent_id = stable_identifier("agent");
+    let process_id = stable_identifier("thread\0turn\0call\00");
+    let expected_window = format!("p_{process_id}");
+
+    for (kind, status, expected_state, expected_status) in [
+        ("completed", Some("7"), "completed", "7\n"),
+        ("completed", None, "recovery-lost", "125\n"),
+        ("terminated", Some("143"), "terminated", "143\n"),
+        ("terminated", None, "recovery-lost", "125\n"),
+        ("recovery-lost", Some("125"), "recovery-lost", "125\n"),
+    ] {
+        let home = tempfile::tempdir().expect("temp home");
+        let bin = home.path().join("bin");
+        fs::create_dir(&bin).expect("fake bin");
+        let tmux = bin.join("tmux");
+        fs::write(&tmux, "#!/bin/sh\nexit 0\n").expect("fake tmux");
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+        let root = home
+            .path()
+            .join(".agentapp/tmux")
+            .join(&agent_id)
+            .join(&process_id);
+        fs::create_dir_all(root.join("terminal-claim")).expect("terminal claim");
+        for (name, value) in [
+            ("owner", "agentapp-tmux-v2"),
+            ("identity", process_id.as_str()),
+            ("thread-id", "dGhyZWFk"),
+            ("turn-id", "dHVybg=="),
+            ("call-id", "Y2FsbA=="),
+            ("attempt-generation", "0"),
+            ("session-id", "42"),
+            ("tty", "0"),
+            ("digest", "expected-digest"),
+            ("acknowledgement-token", "token"),
+            ("window", expected_window.as_str()),
+            ("process-identity", "2147483646:2147483646"),
+            ("controller", "7:previous-controller"),
+            ("lease-generation", "7"),
+            ("state", "running"),
+            ("output", "captured output"),
+            ("go", ""),
+            ("terminal-claim/kind", kind),
+        ] {
+            fs::write(root.join(name), value).expect("descriptor field");
+        }
+        if let Some(status) = status {
+            fs::write(root.join("status"), format!("{status}\n")).expect("terminal status");
+        }
+
+        let expected_state = format!("{expected_state}\n");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("HOME", home.path())
+            .env("PATH", path)
+            .output()
+            .expect("run exact reconciliation");
+        assert!(
+            output.status.success(),
+            "{kind}:{status:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("state")).expect("terminal state"),
+            expected_state
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("status")).expect("terminal status"),
+            expected_status
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_running_descriptor_with_uncertain_process_query_fails_closed() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("expected-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let command = exact_reconciliation_command("agent", &request);
+    let home = tempfile::tempdir().expect("temp home");
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin");
+    let tmux = bin.join("tmux");
+    fs::write(&tmux, "#!/bin/sh\nexit 0\n").expect("fake tmux");
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+    let kill = bin.join("kill");
+    fs::write(
+        &kill,
+        "#!/bin/sh\necho 'Operation not permitted' >&2\nexit 1\n",
+    )
+    .expect("fake kill");
+    fs::set_permissions(&kill, fs::Permissions::from_mode(0o755)).expect("kill mode");
+    let command = command.replace("/bin/kill", &kill.to_string_lossy());
+
+    let agent_id = stable_identifier("agent");
+    let process_id = stable_identifier("thread\0turn\0call\00");
+    let expected_window = format!("p_{process_id}");
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&agent_id)
+        .join(&process_id);
+    fs::create_dir_all(&root).expect("descriptor root");
+    for (name, value) in [
+        ("owner", "agentapp-tmux-v2"),
+        ("identity", process_id.as_str()),
+        ("thread-id", "dGhyZWFk"),
+        ("turn-id", "dHVybg=="),
+        ("call-id", "Y2FsbA=="),
+        ("attempt-generation", "0"),
+        ("session-id", "42"),
+        ("tty", "0"),
+        ("digest", "expected-digest"),
+        ("acknowledgement-token", "token"),
+        ("window", expected_window.as_str()),
+        ("process-identity", "2147483646:2147483646"),
+        ("controller", "7:previous-controller"),
+        ("lease-generation", "7"),
+        ("state", "running"),
+        ("output", "captured output"),
+        ("go", ""),
+    ] {
+        fs::write(root.join(name), value).expect("descriptor field");
+    }
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&command)
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .output()
+        .expect("run exact reconciliation");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("AGENTAPP_TMUX_RECONCILE_PROCESS_QUERY_UNCERTAIN")
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("state"),
+        "running"
+    );
+    assert!(!root.join("status").exists());
+    assert!(!root.join("terminal-claim").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_running_descriptor_recovers_an_empty_torn_terminal_claim() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("expected-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let command = exact_reconciliation_command("agent", &request);
+    let home = tempfile::tempdir().expect("temp home");
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin");
+    let tmux = bin.join("tmux");
+    fs::write(&tmux, "#!/bin/sh\nexit 0\n").expect("fake tmux");
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+
+    let agent_id = stable_identifier("agent");
+    let process_id = stable_identifier("thread\0turn\0call\00");
+    let expected_window = format!("p_{process_id}");
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&agent_id)
+        .join(&process_id);
+    fs::create_dir_all(root.join("terminal-claim")).expect("torn terminal claim");
+    for (name, value) in [
+        ("owner", "agentapp-tmux-v2"),
+        ("identity", process_id.as_str()),
+        ("thread-id", "dGhyZWFk"),
+        ("turn-id", "dHVybg=="),
+        ("call-id", "Y2FsbA=="),
+        ("attempt-generation", "0"),
+        ("session-id", "42"),
+        ("tty", "0"),
+        ("digest", "expected-digest"),
+        ("acknowledgement-token", "token"),
+        ("window", expected_window.as_str()),
+        ("process-identity", "2147483646:2147483646"),
+        ("controller", "7:previous-controller"),
+        ("lease-generation", "7"),
+        ("state", "running"),
+        ("output", "captured output"),
+        ("go", ""),
+    ] {
+        fs::write(root.join(name), value).expect("descriptor field");
+    }
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&command)
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .output()
+        .expect("run exact reconciliation");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recovered =
+        parse_recovered_executions(&output.stdout).expect("parse reconciliation output");
+    assert_eq!(recovered[0].status, RecoveredExecutionStatus::RecoveryLost);
+    assert!(recovered[0].terminal_verified_dead);
+    assert_eq!(
+        fs::read_to_string(root.join("terminal-claim/kind")).expect("claim kind"),
+        "recovery-lost\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_running_descriptor_with_live_process_fails_closed() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("expected-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let command = exact_reconciliation_command("agent", &request);
+    let home = tempfile::tempdir().expect("temp home");
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin");
+    let tmux = bin.join("tmux");
+    fs::write(&tmux, "#!/bin/sh\nexit 0\n").expect("fake tmux");
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+
+    let agent_id = stable_identifier("agent");
+    let process_id = stable_identifier("thread\0turn\0call\00");
+    let expected_window = format!("p_{process_id}");
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&agent_id)
+        .join(&process_id);
+    fs::create_dir_all(&root).expect("descriptor root");
+    let current_pid = std::process::id();
+    let current_pgid_output = Command::new("ps")
+        .args(["-o", "pgid=", "-p", &current_pid.to_string()])
+        .output()
+        .expect("current process group");
+    let current_pgid = String::from_utf8_lossy(&current_pgid_output.stdout)
+        .trim()
+        .to_string();
+    for (name, value) in [
+        ("owner", "agentapp-tmux-v2".to_string()),
+        ("identity", process_id),
+        ("thread-id", "dGhyZWFk".to_string()),
+        ("turn-id", "dHVybg==".to_string()),
+        ("call-id", "Y2FsbA==".to_string()),
+        ("attempt-generation", "0".to_string()),
+        ("session-id", "42".to_string()),
+        ("tty", "0".to_string()),
+        ("digest", "expected-digest".to_string()),
+        ("acknowledgement-token", "token".to_string()),
+        ("window", expected_window),
+        ("process-identity", format!("{current_pid}:{current_pgid}")),
+        ("controller", "7:previous-controller".to_string()),
+        ("state", "running".to_string()),
+        ("output", String::new()),
+        ("go", String::new()),
+    ] {
+        fs::write(root.join(name), value).expect("descriptor field");
+    }
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&command)
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .output()
+        .expect("run exact reconciliation");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("AGENTAPP_TMUX_RECONCILE_PROCESS_WITHOUT_WINDOW")
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("state"),
+        "running"
+    );
+    assert!(!root.join("status").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_running_descriptor_with_live_window_remains_running() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("expected-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let command = exact_reconciliation_command("agent", &request);
+    let home = tempfile::tempdir().expect("temp home");
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin");
+
+    let agent_id = stable_identifier("agent");
+    let process_id = stable_identifier("thread\0turn\0call\00");
+    let expected_window = format!("p_{process_id}");
+    let tmux = bin.join("tmux");
+    fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in list-windows) printf '%s\\n' '{expected_window}' ;; *) exit 0 ;; esac\n"
+        ),
+    )
+    .expect("fake tmux");
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&agent_id)
+        .join(&process_id);
+    fs::create_dir_all(&root).expect("descriptor root");
+    for (name, value) in [
+        ("owner", "agentapp-tmux-v2"),
+        ("identity", process_id.as_str()),
+        ("thread-id", "dGhyZWFk"),
+        ("turn-id", "dHVybg=="),
+        ("call-id", "Y2FsbA=="),
+        ("attempt-generation", "0"),
+        ("session-id", "42"),
+        ("tty", "0"),
+        ("digest", "expected-digest"),
+        ("acknowledgement-token", "token"),
+        ("window", expected_window.as_str()),
+        ("process-identity", "2147483646:2147483646"),
+        ("controller", "7:live-controller"),
+        ("lease-generation", "7"),
+        ("state", "running"),
+        ("output", "still live"),
+        ("go", ""),
+    ] {
+        fs::write(root.join(name), value).expect("descriptor field");
+    }
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&command)
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .output()
+        .expect("run exact reconciliation");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recovered =
+        parse_recovered_executions(&output.stdout).expect("parse reconciliation output");
+    assert_eq!(recovered[0].status, RecoveredExecutionStatus::Running);
+    assert!(!recovered[0].terminal_verified_dead);
+    assert_eq!(recovered[0].output, b"still live");
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("state"),
+        "running"
+    );
+    assert!(!root.join("status").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_running_descriptor_with_malformed_identity_fails_closed() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("expected-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let command = exact_reconciliation_command("agent", &request);
+    let home = tempfile::tempdir().expect("temp home");
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin");
+    let tmux = bin.join("tmux");
+    fs::write(&tmux, "#!/bin/sh\nexit 0\n").expect("fake tmux");
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+
+    let agent_id = stable_identifier("agent");
+    let process_id = stable_identifier("thread\0turn\0call\00");
+    let expected_window = format!("p_{process_id}");
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&agent_id)
+        .join(&process_id);
+    fs::create_dir_all(&root).expect("descriptor root");
+    for (name, value) in [
+        ("owner", "agentapp-tmux-v2"),
+        ("identity", process_id.as_str()),
+        ("thread-id", "dGhyZWFk"),
+        ("turn-id", "dHVybg=="),
+        ("call-id", "Y2FsbA=="),
+        ("attempt-generation", "0"),
+        ("session-id", "42"),
+        ("tty", "0"),
+        ("digest", "expected-digest"),
+        ("acknowledgement-token", "token"),
+        ("window", expected_window.as_str()),
+        ("process-identity", "malformed"),
+        ("controller", "7:previous-controller"),
+        ("lease-generation", "7"),
+        ("state", "running"),
+        ("output", ""),
+        ("go", ""),
+    ] {
+        fs::write(root.join(name), value).expect("descriptor field");
+    }
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&command)
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .output()
+        .expect("run exact reconciliation");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("AGENTAPP_TMUX_RECONCILE_PROCESS_IDENTITY_UNKNOWN")
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("state"),
+        "running"
+    );
+    assert!(!root.join("status").exists());
 }
 
 #[test]
@@ -965,7 +1717,7 @@ fn acknowledgement_resolves_one_descriptor_without_scanning() {
     assert!(command.contains("\"$root/terminal-claim/kind\""));
     assert!(command.contains("acknowledgement|k_"));
     assert!(command.contains("ln \"$transition_candidate\" \"$root/transition-claim\""));
-    assert!(command.contains("! kill -0 \"-$claim_operation_pgid\""));
+    assert!(command.contains("agentapp_ack_probe_process_group \"$claim_operation_pgid\""));
     assert!(command.contains("\"$root/controller.tmp\""));
     assert!(command.contains("\"$root/lease.tmp\""));
     assert!(command.contains("\"$root/state.tmp\""));
@@ -987,6 +1739,15 @@ fn acknowledgement_resolves_one_descriptor_without_scanning() {
     );
     assert!(terminated_command.contains("expected_terminal_state='terminated'"));
     assert!(terminated_command.contains("expected_exit_code='143'"));
+    let launch_interrupted_command = acknowledgement_command(
+        "agent",
+        &terminal_acknowledgement_with_status(
+            format!("{process_id}-deadbeef"),
+            RecoveredExecutionStatus::LaunchInterrupted,
+        ),
+    );
+    assert!(launch_interrupted_command.contains("expected_terminal_state='launch-interrupted'"));
+    assert!(launch_interrupted_command.contains("expected_exit_code='125'"));
 
     let rename = command
         .find("mv \"$root\" \"$tombstone\"")
@@ -1495,6 +2256,10 @@ fn termination_does_not_release_descriptor_before_rollout_repair() {
     let terminate = descriptor.confirmed_process_group_termination();
 
     assert!(!terminate.contains("touch \"$root/release\""));
+    assert!(terminate.contains("agentapp_termination_probe_group"));
+    assert!(terminate.contains("LC_ALL=C /bin/kill -0"));
+    assert!(terminate.contains("\"No such process\""));
+    assert!(terminate.contains("AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN"));
     assert!(!descriptor.process_script(&params).contains("rm -rf"));
 }
 

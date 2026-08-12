@@ -409,6 +409,7 @@ impl UnifiedExecProcessManager {
                 process,
                 call_id: format!("call-{process_id}"),
                 process_id,
+                recovery_lost: false,
                 cwd: PathUri::parse("file:///tmp").expect("valid test cwd"),
                 initial_exec_command_active: Arc::new(AtomicBool::new(false)),
                 hook_command: "sleep 30".to_string(),
@@ -462,6 +463,7 @@ impl UnifiedExecProcessManager {
             process,
             call_id: original_call_id,
             process_id,
+            recovery_lost: false,
             cwd,
             initial_exec_command_active: Arc::new(AtomicBool::new(false)),
             hook_command,
@@ -503,6 +505,7 @@ impl UnifiedExecProcessManager {
         let exit_code = match &recovered.status {
             codex_exec_server::RecoveredExecutionStatus::Exited(exit_code) => *exit_code,
             codex_exec_server::RecoveredExecutionStatus::Terminated => 143,
+            codex_exec_server::RecoveredExecutionStatus::RecoveryLost => 125,
             _ => {
                 return Err(UnifiedExecError::create_process(format!(
                     "background session {process_id} is not terminal"
@@ -542,6 +545,10 @@ impl UnifiedExecProcessManager {
             process,
             call_id: original_call_id,
             process_id,
+            recovery_lost: matches!(
+                recovered.status,
+                codex_exec_server::RecoveredExecutionStatus::RecoveryLost
+            ),
             cwd,
             initial_exec_command_active: Arc::new(AtomicBool::new(false)),
             hook_command,
@@ -906,6 +913,7 @@ impl UnifiedExecProcessManager {
             max_output_tokens: request.max_output_tokens,
             process_id: response_process_id,
             exit_code,
+            recovery_lost: false,
             original_token_count: Some(original_token_count),
             output_omitted_bytes,
             hook_command: Some(request.hook_command.clone()),
@@ -967,13 +975,13 @@ impl UnifiedExecProcessManager {
         // Different terminal sessions can be polled concurrently, but reads and
         // writes against one terminal must not overlap because they share a
         // draining output buffer and process lifecycle.
-        let locked_process = {
+        let (locked_process, recovery_lost) = {
             let store = self.process_store.lock().await;
             let entry = store
                 .processes
                 .get(&process_id)
                 .ok_or(UnifiedExecError::UnknownProcessId { process_id })?;
-            Arc::clone(&entry.process)
+            (Arc::clone(&entry.process), entry.recovery_lost)
         };
         let _interaction_guard = locked_process.interaction_lock().lock_owned().await;
 
@@ -1180,6 +1188,7 @@ impl UnifiedExecProcessManager {
             max_output_tokens: request.max_output_tokens,
             process_id,
             exit_code,
+            recovery_lost,
             original_token_count: Some(original_token_count),
             output_omitted_bytes,
             hook_command: Some(hook_command),
@@ -1429,6 +1438,7 @@ impl UnifiedExecProcessManager {
             process: Arc::clone(&process),
             call_id: context.call_id.clone(),
             process_id,
+            recovery_lost: false,
             cwd: cwd.clone(),
             initial_exec_command_active,
             hook_command,

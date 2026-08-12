@@ -297,6 +297,9 @@ const KIND_TOOL_DISCOVERY: c_int = 15;
 /// The native Codex turn was aborted. This is terminal and is never followed
 /// by KIND_DONE for the same handle.
 const KIND_TURN_ABORTED: c_int = 16;
+/// Announces a startup-only control handle. The client may use it to record an
+/// interrupt, but must not expose same-turn steering until KIND_TURN_READY.
+const KIND_TURN_STARTING: c_int = 17;
 const TOOL_DISCOVERY_CONTRACT_VERSION: u32 = 1;
 const KIND_ERROR: c_int = 3;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
@@ -309,6 +312,11 @@ const PROMPT_IMAGE_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Matches AgentApp's ordered photo-picker limit. Overflow is rejected instead
 /// of silently claiming images are attached after their bytes were dropped.
 const MAX_PROMPT_IMAGE_UPLOADS: usize = 10;
+const MAX_STEERING_UPLOADS: usize = 32;
+const MAX_UPLOAD_LOCAL_PATH_BYTES: usize = 4_096;
+const MAX_UPLOAD_RELATIVE_PATH_BYTES: usize = 1_024;
+const MAX_UPLOAD_FILE_BYTES: u64 = 1_024 * 1_024 * 1_024;
+const MAX_UPLOAD_TOTAL_BYTES: u64 = 2 * MAX_UPLOAD_FILE_BYTES;
 const TURN_RUNTIME_MAX_BLOCKING_THREADS: usize = 16;
 const TURN_RUNTIME_BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_secs(1);
 
@@ -599,8 +607,16 @@ fn parse_server_file_uploads(uploads_json: &str) -> Result<Vec<ServerFileUpload>
     let Some(items) = value.as_array() else {
         return Err("uploads_json must be a JSON array".to_string());
     };
+    if items.len() > MAX_STEERING_UPLOADS {
+        return Err(format!(
+            "uploads_json had {} entries; maximum is {MAX_STEERING_UPLOADS}",
+            items.len()
+        ));
+    }
 
     let mut uploads = Vec::with_capacity(items.len());
+    let mut relative_paths = HashSet::with_capacity(items.len());
+    let mut total_bytes = 0_u64;
     for (index, item) in items.iter().enumerate() {
         let local_path = item
             .get("local_path")
@@ -614,8 +630,40 @@ fn parse_server_file_uploads(uploads_json: &str) -> Result<Vec<ServerFileUpload>
         if local_path.trim().is_empty() {
             return Err(format!("uploads_json[{index}].local_path was empty"));
         }
+        if !Path::new(local_path).is_absolute() {
+            return Err(format!("uploads_json[{index}].local_path must be absolute"));
+        }
+        if local_path.len() > MAX_UPLOAD_LOCAL_PATH_BYTES {
+            return Err(format!("uploads_json[{index}].local_path was too long"));
+        }
+        if relative_path.len() > MAX_UPLOAD_RELATIVE_PATH_BYTES {
+            return Err(format!("uploads_json[{index}].relative_path was too long"));
+        }
         validate_upload_relative_path(relative_path)
             .map_err(|e| format!("uploads_json[{index}].relative_path {e}"))?;
+        if !relative_paths.insert(relative_path) {
+            return Err(format!(
+                "uploads_json[{index}].relative_path was duplicated"
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(local_path)
+            .map_err(|e| format!("uploads_json[{index}].local_path is unavailable: {e}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "uploads_json[{index}].local_path must be a regular non-symlink file"
+            ));
+        }
+        if metadata.len() > MAX_UPLOAD_FILE_BYTES {
+            return Err(format!(
+                "uploads_json[{index}].local_path exceeded the per-file limit"
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| "uploads_json aggregate size overflowed".to_string())?;
+        if total_bytes > MAX_UPLOAD_TOTAL_BYTES {
+            return Err("uploads_json exceeded the aggregate size limit".to_string());
+        }
 
         uploads.push(ServerFileUpload {
             local_path: local_path.to_string(),
@@ -633,19 +681,14 @@ fn validate_upload_relative_path(path: &str) -> Result<(), String> {
     if path.starts_with('/') {
         return Err("must be relative".to_string());
     }
-    if path.split('/').any(|part| part == "..") {
-        return Err("must not contain '..' segments".to_string());
+    if path.contains('\\')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err("must be a normalized relative path".to_string());
     }
     Ok(())
-}
-
-fn join_remote_workspace_path(workspace: &str, relative_path: &str) -> String {
-    let workspace = workspace.trim_end_matches('/');
-    if workspace.is_empty() {
-        relative_path.to_string()
-    } else {
-        format!("{workspace}/{relative_path}")
-    }
 }
 
 /// Invoke the caller's callback with an owned Rust string. The C string is
@@ -695,6 +738,28 @@ fn finish_turn_after_cleanup(
     result
 }
 
+fn finish_host_detach_cleanup(
+    completed_turn: bool,
+    detach_result: Result<(), String>,
+    shutdown_result: Result<(), String>,
+) -> Result<(), String> {
+    match (detach_result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(_)) if completed_turn => {
+            // TurnComplete and prepare_for_host_detach form the durable
+            // completion boundary. A later SessionEnd/shutdown failure must
+            // remain diagnosable without replacing the already durable answer
+            // or making restart-safe remote sessions look like a failed turn.
+            tracing::warn!("post-completion persistent model context shutdown failed");
+            Ok(())
+        }
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => {
+            Err(format!("{error}; additionally: {shutdown_error}"))
+        }
+    }
+}
+
 fn emit_turn_result(
     callback: EventCallback,
     ctx: *mut c_void,
@@ -726,6 +791,7 @@ fn emit_debug_stage(callback: EventCallback, ctx: *mut c_void, stage: &str) {
 /// the client through `codex_respond_dynamic_tool` to route the response to the
 /// correct in-flight turn.
 static NEXT_TURN_HANDLE: AtomicU64 = AtomicU64::new(1);
+static NEXT_UPLOAD_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
 type ResponseSender = tokio::sync::mpsc::UnboundedSender<(String, DynamicToolResponse)>;
 
@@ -739,6 +805,9 @@ enum TurnBridge {
     Active {
         dynamic_response_sender: ResponseSender,
         thread: Arc<CodexThread>,
+        turn_id: Option<String>,
+        server_mode: Option<ServerMode>,
+        workspace: String,
         interrupt_requested: bool,
         cleanup_claimed: bool,
     },
@@ -772,13 +841,16 @@ fn register_starting_turn(
                 cleanup_claimed: false,
             },
         );
-    emit(callback, ctx, KIND_TURN_READY, &turn_handle.to_string());
+    emit(callback, ctx, KIND_TURN_STARTING, &turn_handle.to_string());
     Ok((turn_handle, RegistryGuard(turn_handle)))
 }
 
 fn activate_turn(
     turn_handle: u64,
     thread: Arc<CodexThread>,
+    turn_id: Option<String>,
+    server_mode: Option<ServerMode>,
+    workspace: String,
 ) -> Result<
     (
         tokio::sync::mpsc::UnboundedReceiver<(String, DynamicToolResponse)>,
@@ -805,6 +877,9 @@ fn activate_turn(
     *entry = TurnBridge::Active {
         dynamic_response_sender: response_sender,
         thread,
+        turn_id,
+        server_mode,
+        workspace,
         interrupt_requested,
         cleanup_claimed,
     };
@@ -1662,7 +1737,16 @@ pub(crate) async fn run_turn_async(
         emit_debug_stage(callback, ctx, "prompt_submit_end");
         Some(turn_id)
     };
-    let (mut resp_rx, interrupted_during_submit) = activate_turn(turn_handle, Arc::clone(&thread))?;
+    let (mut resp_rx, interrupted_during_submit) = activate_turn(
+        turn_handle,
+        Arc::clone(&thread),
+        expected_turn_id.clone(),
+        server_mode.clone(),
+        workspace.clone(),
+    )?;
+    if expected_turn_id.is_some() {
+        emit(callback, ctx, KIND_TURN_READY, &turn_handle.to_string());
+    }
     let mut interrupting_after_submit = submit_timed_out || interrupted_during_submit;
     if interrupting_after_submit {
         // The input operation is already ordered (or its submit future timed
@@ -2044,13 +2128,7 @@ pub(crate) async fn run_turn_async(
                     .shutdown_and_wait()
                     .await
                     .map_err(|error| persistent_model_context_storage_error("shutdown", &error));
-                match (detach_result, shutdown_result) {
-                    (Ok(()), Ok(())) => Ok(()),
-                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                    (Err(error), Err(shutdown_error)) => {
-                        Err(format!("{error}; additionally: {shutdown_error}"))
-                    }
-                }
+                finish_host_detach_cleanup(completed_turn, detach_result, shutdown_result)
             }
             TurnExitDisposition::UserInterrupt => thread
                 .shutdown_and_wait()
@@ -2103,6 +2181,106 @@ fn prompt_image_uploads(uploads: &[ServerFileUpload]) -> Result<Vec<&ServerFileU
         ));
     }
     Ok(images)
+}
+
+async fn upload_server_files_for_steering(
+    server_mode: Option<&ServerMode>,
+    workspace: &str,
+    uploads: &[ServerFileUpload],
+    attempt_scope: &str,
+) -> Result<Vec<crate::ssh::SshWorkspaceUploadReceipt>, String> {
+    prompt_image_uploads(uploads)?;
+    let Some(server_mode) = server_mode else {
+        return Ok(Vec::new());
+    };
+    let attempt_nonce = NEXT_UPLOAD_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+    let mut receipts = Vec::with_capacity(uploads.len());
+    for (index, upload) in uploads.iter().enumerate() {
+        let attempt_id = format!("{attempt_scope}-{attempt_nonce}-{index}");
+        let upload_result = crate::ssh::ssh_upload_workspace_file_atomic(
+            &server_mode.host,
+            server_mode.port,
+            &server_mode.user,
+            &server_mode.authentication,
+            server_mode.host_fingerprint.clone(),
+            &upload.local_path,
+            workspace,
+            &upload.relative_path,
+            &attempt_id,
+            MAX_UPLOAD_FILE_BYTES,
+        )
+        .await;
+        match upload_result {
+            Ok(receipt) => receipts.push(receipt),
+            Err(error) => {
+                let rollback =
+                    rollback_server_file_uploads(Some(server_mode), workspace, &receipts).await;
+                return Err(match rollback {
+                    Ok(()) => format!(
+                        "failed to upload {} to SSH workspace: {error}",
+                        upload.relative_path
+                    ),
+                    Err(rollback_error) => format!(
+                        "failed to upload {} to SSH workspace: {error}; \
+                         failed to compensate earlier uploads: {rollback_error}",
+                        upload.relative_path
+                    ),
+                });
+            }
+        }
+    }
+    Ok(receipts)
+}
+
+async fn rollback_server_file_uploads(
+    server_mode: Option<&ServerMode>,
+    workspace: &str,
+    receipts: &[crate::ssh::SshWorkspaceUploadReceipt],
+) -> Result<(), String> {
+    let Some(server_mode) = server_mode else {
+        return Ok(());
+    };
+    let mut first_error = None;
+    for receipt in receipts.iter().rev() {
+        if let Err(error) = crate::ssh::ssh_rollback_workspace_file_upload(
+            &server_mode.host,
+            server_mode.port,
+            &server_mode.user,
+            &server_mode.authentication,
+            server_mode.host_fingerprint.clone(),
+            workspace,
+            receipt,
+        )
+        .await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn steering_user_input(
+    text: String,
+    uploads: &[ServerFileUpload],
+) -> Result<Vec<UserInput>, String> {
+    let image_uploads = prompt_image_uploads(uploads)?;
+    let mut input = vec![UserInput::Text {
+        text,
+        text_elements: Vec::new(),
+    }];
+    input.extend(
+        image_uploads
+            .into_iter()
+            .map(|upload| UserInput::LocalImage {
+                path: PathBuf::from(upload.local_path.clone()),
+                detail: Some(ImageDetail::Auto),
+            }),
+    );
+    Ok(input)
 }
 
 /// Drive ONE user turn through the real Codex turn loop and stream events to
@@ -2489,26 +2667,13 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
                 let _secret_guard = secret_guard;
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(async move {
-                    for upload in &uploads {
-                        let remote_path =
-                            join_remote_workspace_path(&workspace, &upload.relative_path);
-                        crate::ssh::ssh_upload_file(
-                            &server_mode.host,
-                            server_mode.port,
-                            &server_mode.user,
-                            &server_mode.authentication,
-                            server_mode.host_fingerprint.clone(),
-                            &upload.local_path,
-                            &remote_path,
-                        )
-                        .await
-                        .map_err(|e| {
-                            format!(
-                                "failed to upload {} to SSH workspace: {e}",
-                                upload.relative_path
-                            )
-                        })?;
-                    }
+                    let _receipts = upload_server_files_for_steering(
+                        Some(&server_mode),
+                        &workspace,
+                        &uploads,
+                        &format!("turn-{turn_handle}"),
+                    )
+                    .await?;
 
                     run_turn_async(
                         turn_handle,
@@ -2698,26 +2863,13 @@ pub extern "C" fn codex_run_turn_streaming_server(
                 let _secret_guard = secret_guard;
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(async move {
-                    for upload in &uploads {
-                        let remote_path =
-                            join_remote_workspace_path(&workspace, &upload.relative_path);
-                        crate::ssh::ssh_upload_file(
-                            &server_mode.host,
-                            server_mode.port,
-                            &server_mode.user,
-                            &server_mode.authentication,
-                            server_mode.host_fingerprint.clone(),
-                            &upload.local_path,
-                            &remote_path,
-                        )
-                        .await
-                        .map_err(|e| {
-                            format!(
-                                "failed to upload {} to SSH workspace: {e}",
-                                upload.relative_path
-                            )
-                        })?;
-                    }
+                    let _receipts = upload_server_files_for_steering(
+                        Some(&server_mode),
+                        &workspace,
+                        &uploads,
+                        &format!("turn-{turn_handle}"),
+                    )
+                    .await?;
 
                     run_turn_async(
                         turn_handle,
@@ -2920,15 +3072,51 @@ pub extern "C" fn codex_respond_dynamic_tool(
 /// `text` must be a valid NUL-terminated UTF-8 C string.
 #[unsafe(no_mangle)]
 pub extern "C" fn codex_steer_turn(turn_handle: u64, text: *const c_char) -> c_int {
+    codex_steer_turn_with_uploads(turn_handle, text, std::ptr::null())
+}
+
+/// Attachment-aware steering using the same upload manifest as turn startup.
+///
+/// Returns 8 for an invalid manifest, 9 when SSH mirroring fails, and 10 when
+/// the exact upload batch could not be compensated after steering was rejected.
+///
+/// # Safety
+/// Both pointers must be null or valid NUL-terminated UTF-8 C strings.
+#[unsafe(no_mangle)]
+pub extern "C" fn codex_steer_turn_with_uploads(
+    turn_handle: u64,
+    text: *const c_char,
+    uploads_json: *const c_char,
+) -> c_int {
     let text = match c_str_to_string(text, "text") {
         Ok(text) => text,
         Err(_) => return 1,
     };
-    if text.trim().is_empty() {
+    let uploads = if uploads_json.is_null() {
+        Vec::new()
+    } else {
+        let uploads_json = match c_str_to_string(uploads_json, "uploads_json") {
+            Ok(value) => value,
+            Err(_) => return 8,
+        };
+        match parse_server_file_uploads(&uploads_json) {
+            Ok(uploads) => uploads,
+            Err(_) => return 8,
+        }
+    };
+    // Attachment-aware same-turn steering remains fail-closed until the SSH
+    // upload transaction has a server-side, ownership-atomic rollback
+    // primitive. Text steering is safe; queued attachments stay durable and
+    // are admitted by the next turn instead of risking an orphaned or
+    // concurrently replaced remote file.
+    if !uploads.is_empty() {
+        return 8;
+    }
+    if text.trim().is_empty() && uploads.is_empty() {
         return 2;
     }
 
-    let thread = {
+    let active = {
         let map = match active_turn_registry().lock() {
             Ok(map) => map,
             Err(_) => return 4,
@@ -2936,37 +3124,84 @@ pub extern "C" fn codex_steer_turn(turn_handle: u64, text: *const c_char) -> c_i
         match map.get(&turn_handle) {
             Some(TurnBridge::Active {
                 thread,
+                turn_id: Some(turn_id),
+                server_mode,
+                workspace,
                 interrupt_requested: false,
                 ..
-            }) => Some(Arc::clone(thread)),
+            }) => Some((
+                Arc::clone(thread),
+                turn_id.clone(),
+                server_mode.clone(),
+                workspace.clone(),
+            )),
             Some(TurnBridge::Starting { .. })
             | Some(TurnBridge::Active {
                 interrupt_requested: true,
                 ..
             })
+            | Some(TurnBridge::Active { turn_id: None, .. })
             | None => None,
         }
     };
-    let Some(thread) = thread else {
+    let Some((thread, turn_id, server_mode, workspace)) = active else {
         return 6;
     };
 
-    let input = vec![UserInput::Text {
-        text,
-        text_elements: Vec::new(),
-    }];
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        turn_runtime().block_on(thread.steer_input(
-            input,
-            Default::default(),
-            /*expected_turn_id*/ None,
-            /*client_user_message_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        ))
+        turn_runtime().block_on(async {
+            // Validate every model-visible input before producing remote side
+            // effects. In particular, image-count overflow must fail before
+            // the first upload in the batch.
+            let input = steering_user_input(text, &uploads).map_err(|_| 8)?;
+            let receipts = upload_server_files_for_steering(
+                server_mode.as_ref(),
+                &workspace,
+                &uploads,
+                &format!("steer-{turn_handle}"),
+            )
+            .await
+            .map_err(|_| 9)?;
+            let still_exact = {
+                let registry = active_turn_registry().lock().map_err(|_| 4)?;
+                matches!(
+                    registry.get(&turn_handle),
+                    Some(TurnBridge::Active {
+                        thread: active_thread,
+                        turn_id: Some(active_turn_id),
+                        interrupt_requested: false,
+                        ..
+                    }) if Arc::ptr_eq(active_thread, &thread) && active_turn_id == &turn_id
+                )
+            };
+            if !still_exact {
+                rollback_server_file_uploads(server_mode.as_ref(), &workspace, &receipts)
+                    .await
+                    .map_err(|_| 10)?;
+                return Err(6);
+            }
+            let steer_result = thread
+                .steer_input(
+                    input,
+                    Default::default(),
+                    /*expected_turn_id*/ Some(&turn_id),
+                    /*client_user_message_id*/ None,
+                    /*responsesapi_client_metadata*/ None,
+                )
+                .await;
+            if steer_result.is_err() {
+                rollback_server_file_uploads(server_mode.as_ref(), &workspace, &receipts)
+                    .await
+                    .map_err(|_| 10)?;
+                return Err(7);
+            }
+            Ok(())
+        })
     }));
     match result {
-        Ok(Ok(_)) => 0,
-        Ok(Err(_)) | Err(_) => 7,
+        Ok(Ok(())) => 0,
+        Ok(Err(code)) => code,
+        Err(_) => 7,
     }
 }
 
