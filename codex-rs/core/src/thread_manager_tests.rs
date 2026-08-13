@@ -14,6 +14,7 @@ use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemReasoningSummary;
@@ -677,6 +678,19 @@ impl codex_exec_server::ExecBackend for ResumeRepairBackend {
                 .next()
                 .expect("length checked");
             let output = b"process running\r\n".to_vec();
+            if incomplete.turn_id != "exec-turn"
+                || incomplete.call_id != "exec-call"
+                || incomplete.attempt_generation != 0
+                || incomplete.expected_command_digest.as_deref() != Some("command-digest")
+                || incomplete.expected_session_id != Some(42)
+                || incomplete.expected_tty != Some(true)
+            {
+                return Err(codex_exec_server::ExecServerError::Protocol(
+                    "resume fixture received conflicting reconciliation authority".to_string(),
+                ));
+            }
+            let status = codex_exec_server::RecoveredExecutionStatus::RecoveryLost;
+            let output_sha256 = format!("{:x}", Sha256::digest(&output));
             Ok(vec![codex_exec_server::RecoveredExecution {
                 identity: codex_exec_server::ExecutionIdentity {
                     thread_id: request.thread_id,
@@ -687,15 +701,51 @@ impl codex_exec_server::ExecBackend for ResumeRepairBackend {
                 command_digest: incomplete.expected_command_digest,
                 committed_output_cursor: output.len() as u64,
                 output,
-                status: codex_exec_server::RecoveredExecutionStatus::Running,
-                terminal_verified_dead: false,
+                status: status.clone(),
+                terminal_verified_dead: true,
                 session_id: incomplete.expected_session_id,
                 delivery_unknown: false,
                 acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
                     "resume-fixture-terminal-proof".to_string(),
+                )
+                .with_terminal_proof(
+                    codex_exec_server::TerminalAcknowledgementProof {
+                        range_start: 0,
+                        range_end: 17,
+                        output_sha256,
+                        status,
+                    },
                 ),
             }])
         })
+    }
+}
+
+fn resume_repair_commit(
+    prepared: &RemoteExecutionSessionPrepared,
+) -> RemoteExecutionSessionCommitted {
+    RemoteExecutionSessionCommitted {
+        thread_id: prepared.thread_id.clone(),
+        exec_turn_id: prepared.exec_turn_id.clone(),
+        exec_call_id: prepared.exec_call_id.clone(),
+        receipt_turn_id: prepared.receipt_turn_id.clone(),
+        receipt_call_id: prepared.receipt_call_id.clone(),
+        receipt_kind: prepared.receipt_kind.clone(),
+        attempt_generation: prepared.attempt_generation,
+        session_id: prepared.session_id,
+        command_digest: prepared.command_digest.clone(),
+        range_start: prepared.range_start,
+        range_end: prepared.range_end,
+        receipt_output_digest: prepared.receipt_output_digest.clone(),
+        prepared_receipt_digest: crate::session::prepared_remote_receipt_digest_for_tests(prepared)
+            .expect("prepared receipt digest"),
+        rejection_reason: prepared.rejection_reason.clone(),
+        rejection_write_id: prepared.rejection_write_id.clone(),
+        rejection_input_sha256: prepared.rejection_input_sha256.clone(),
+        terminal_acknowledgement_token: prepared.terminal_acknowledgement_token.clone(),
+        terminal_output_digest: prepared.terminal_output_digest.clone(),
+        terminal_status: prepared.terminal_status.clone(),
+        terminal: prepared.terminal_candidate,
     }
 }
 
@@ -738,36 +788,65 @@ fn resume_repair_initial_receipt(
         internal_chat_message_metadata_passthrough: None,
     };
     output.set_turn_id_if_missing("exec-turn");
-    let committed = RemoteExecutionSessionCommitted {
-        thread_id: prepared.thread_id.clone(),
-        exec_turn_id: prepared.exec_turn_id.clone(),
-        exec_call_id: prepared.exec_call_id.clone(),
-        receipt_turn_id: prepared.receipt_turn_id.clone(),
-        receipt_call_id: prepared.receipt_call_id.clone(),
-        receipt_kind: prepared.receipt_kind.clone(),
-        attempt_generation: prepared.attempt_generation,
-        session_id: prepared.session_id,
-        command_digest: prepared.command_digest.clone(),
-        range_start: prepared.range_start,
-        range_end: prepared.range_end,
-        receipt_output_digest: prepared.receipt_output_digest.clone(),
-        prepared_receipt_digest: crate::session::prepared_remote_receipt_digest_for_tests(
-            &prepared,
-        )
-        .expect("initial prepared digest"),
+    let committed = resume_repair_commit(&prepared);
+    (
+        RolloutItem::RemoteExecutionSessionPrepared(prepared),
+        RolloutItem::ResponseItem(output),
+        committed,
+    )
+}
+
+fn resume_repair_committed_empty_poll(
+    base: &RemoteExecutionSessionPrepared,
+    turn_id: &str,
+    call_id: &str,
+) -> Vec<RolloutItem> {
+    let receipt_output_text = format!(
+        "Chunk ID: {call_id}\n\
+         Wall time: 5.0000 seconds\n\
+         Process running with session ID 42\n\
+         Original token count: 0\n\
+         Output:\n"
+    );
+    let prepared = RemoteExecutionSessionPrepared {
+        receipt_turn_id: turn_id.to_string(),
+        receipt_call_id: call_id.to_string(),
+        receipt_kind: RemoteExecutionReceiptKind::EmptyPoll,
+        range_start: 17,
+        range_end: 17,
+        receipt_output_digest: format!("{:x}", Sha256::digest(receipt_output_text.as_bytes())),
+        receipt_output_text: receipt_output_text.clone(),
         rejection_reason: None,
         rejection_write_id: None,
         rejection_input_sha256: None,
         terminal_acknowledgement_token: None,
         terminal_output_digest: None,
         terminal_status: None,
-        terminal: false,
+        terminal_candidate: false,
+        ..base.clone()
     };
-    (
+    let mut output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(receipt_output_text),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    output.set_turn_id_if_missing(turn_id);
+    let committed = resume_repair_commit(&prepared);
+    vec![
+        scanner_call(
+            "write_stdin",
+            call_id,
+            turn_id,
+            &serde_json::json!({"session_id": 42}).to_string(),
+        ),
         RolloutItem::RemoteExecutionSessionPrepared(prepared),
         RolloutItem::ResponseItem(output),
-        committed,
-    )
+        RolloutItem::RemoteExecutionSessionCommitted(committed),
+    ]
 }
 
 #[tokio::test]
@@ -842,6 +921,11 @@ async fn prepared_interrupt_rejection_resumes_once_and_preserves_completed_final
     let thread_id_text = thread_id.to_string();
     let (initial_prepared, initial_output, initial_commit) =
         resume_repair_initial_receipt(&thread_id_text, environment_id);
+    let RolloutItem::RemoteExecutionSessionPrepared(initial_prepared_metadata) =
+        initial_prepared.clone()
+    else {
+        unreachable!();
+    };
     let input = "\u{3}";
     let input_sha256 = format!("{:x}", Sha256::digest(input.as_bytes()));
     let write_id = "a".repeat(64);
@@ -903,6 +987,17 @@ async fn prepared_interrupt_rejection_resumes_once_and_preserves_completed_final
         terminal_status: None,
         terminal_candidate: false,
     };
+    let mut failed_output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "interrupt-call".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(failed_text.to_string()),
+            success: Some(false),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    failed_output.set_turn_id_if_missing("final-response-turn");
+    let rejection_commit = resume_repair_commit(&rejection);
     let final_turn_started = RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: "final-response-turn".to_string(),
         trace_id: None,
@@ -935,7 +1030,28 @@ async fn prepared_interrupt_rejection_resumes_once_and_preserves_completed_final
     });
     let task_complete = RolloutItem::EventMsg(task_complete_event.clone());
     let rollout_path = config.codex_home.join("rollouts/rejection.jsonl");
-    let history = vec![
+    let mut history = vec![
+        scanner_marker(&thread_id_text, "exec-turn", 2),
+        scanner_call(
+            "exec_command",
+            "exec-call",
+            "exec-turn",
+            &serde_json::json!({
+                "cmd": "sleep 30",
+                "tty": true,
+                "yield_time_ms": 1_000,
+            })
+            .to_string(),
+        ),
+        RolloutItem::RemoteExecutionLaunchIntent(RemoteExecutionLaunchIntent {
+            thread_id: thread_id_text.clone(),
+            turn_id: "exec-turn".to_string(),
+            call_id: "exec-call".to_string(),
+            attempt_generation: 0,
+            command_digest: "command-digest".to_string(),
+            original_session_id: 42,
+            tty: true,
+        }),
         initial_prepared,
         initial_output,
         RolloutItem::RemoteExecutionSessionCommitted(initial_commit),
@@ -945,13 +1061,24 @@ async fn prepared_interrupt_rejection_resumes_once_and_preserves_completed_final
         request,
         RolloutItem::RemoteExecutionWriteIntent(intent),
         RolloutItem::RemoteExecutionSessionPrepared(rejection),
-        plan.clone(),
-        final_response.clone(),
-        task_complete.clone(),
+        RolloutItem::ResponseItem(failed_output),
+        RolloutItem::RemoteExecutionSessionCommitted(rejection_commit),
     ];
+    history.extend(resume_repair_committed_empty_poll(
+        &initial_prepared_metadata,
+        "final-response-turn",
+        "poll-call-1",
+    ));
+    history.extend(resume_repair_committed_empty_poll(
+        &initial_prepared_metadata,
+        "final-response-turn",
+        "poll-call-2",
+    ));
+    history.extend([plan.clone(), final_response.clone(), task_complete.clone()]);
     let pending = ThreadManager::scan_active_remote_calls(thread_id_text.clone(), &history)
-        .expect("scan prepared rejection");
-    assert_eq!(pending.pending_writes.len(), 1);
+        .expect("scan fully committed terminal history");
+    assert!(pending.incomplete_executions.is_empty());
+    assert!(pending.pending_writes.is_empty());
 
     let resumed = manager
         .resume_thread_with_history_and_tools(
@@ -968,7 +1095,7 @@ async fn prepared_interrupt_rejection_resumes_once_and_preserves_completed_final
             pending.pending_writes,
         )
         .await
-        .expect("prepared rejection should resume");
+        .expect("fully committed terminal history should resume");
 
     let repaired = resumed
         .thread
@@ -1068,22 +1195,54 @@ async fn prepared_interrupt_rejection_resumes_once_and_preserves_completed_final
     }
     assert_eq!(reconcile_calls.load(Ordering::SeqCst), 1);
     assert_eq!(start_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(adopt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adopt_calls.load(Ordering::SeqCst), 0);
     assert_eq!(write_calls.load(Ordering::SeqCst), 0);
     assert_eq!(signal_calls.load(Ordering::SeqCst), 0);
     let calls = in_memory_store.calls().await;
     assert_eq!(calls.resume_thread - calls_before_resume.resume_thread, 1);
     assert_eq!(
         calls.append_items - calls_before_resume.append_items,
-        2,
-        "one failed output and one commit"
+        0,
+        "fully committed history must not be rewritten"
     );
 
-    resumed
+    let terminal = resumed
         .thread
-        .prepare_for_host_detach()
+        .session
+        .services
+        .unified_exec_manager
+        .write_stdin(crate::unified_exec::WriteStdinRequest {
+            process_id: 42,
+            input: "",
+            yield_time_ms: crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS,
+            max_output_tokens: None,
+            truncation_policy: TruncationPolicy::Bytes(2_048),
+            interaction_event: None,
+        })
         .await
-        .expect("detach adopted durable process");
+        .expect("retire restored recovery-lost session");
+    assert!(terminal.raw_output.is_empty());
+    assert_eq!(terminal.exit_code, Some(125));
+    assert!(terminal.recovery_lost);
+    let retired = resumed
+        .thread
+        .session
+        .services
+        .unified_exec_manager
+        .write_stdin(crate::unified_exec::WriteStdinRequest {
+            process_id: 42,
+            input: "",
+            yield_time_ms: crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS,
+            max_output_tokens: None,
+            truncation_policy: TruncationPolicy::Bytes(2_048),
+            interaction_event: None,
+        })
+        .await;
+    assert!(matches!(
+        retired,
+        Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id: 42 })
+    ));
+
     resumed
         .thread
         .shutdown_and_wait()
