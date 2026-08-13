@@ -15,16 +15,22 @@ use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::plan_tool::PlanItemArg;
+use codex_protocol::plan_tool::StepStatus;
+use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::RemoteExecutionLaunchIntent;
 use codex_protocol::protocol::RemoteExecutionProtocolMarker;
 use codex_protocol::protocol::RemoteExecutionReceiptKind;
+use codex_protocol::protocol::RemoteExecutionRejectionReason;
 use codex_protocol::protocol::RemoteExecutionSessionCommitted;
+use codex_protocol::protocol::RemoteExecutionSessionPrepared;
 use codex_protocol::protocol::RemoteExecutionWriteIntent;
 use codex_protocol::protocol::RemoteExecutionWriteRequest;
 use codex_protocol::protocol::ResumedHistory;
@@ -34,6 +40,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_utils_path_uri::PathUri;
@@ -42,6 +49,10 @@ use core_test_support::PathExt;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::strip_response_item_ids_from_json;
 use pretty_assertions::assert_eq;
+use sha2::Digest;
+use sha2::Sha256;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tempfile::tempdir;
 use wiremock::MockServer;
@@ -144,6 +155,9 @@ fn scanner_committed_session(
         range_end: cursor,
         receipt_output_digest: "receipt-output".to_string(),
         prepared_receipt_digest: "prepared-receipt".to_string(),
+        rejection_reason: None,
+        rejection_write_id: None,
+        rejection_input_sha256: None,
         terminal_acknowledgement_token: None,
         terminal_output_digest: None,
         terminal_status: None,
@@ -522,6 +536,560 @@ fn scanner_never_classifies_a_persisted_remote_interrupt_as_proven_unsent() {
         request.pending_writes[0].pre_send_intent_persisted,
         "restart must take delivery-unknown recovery and never send a second interrupt"
     );
+}
+
+struct ResumeRepairBackend {
+    reconcile_calls: Arc<AtomicUsize>,
+    start_calls: Arc<AtomicUsize>,
+    adopt_calls: Arc<AtomicUsize>,
+    write_calls: Arc<AtomicUsize>,
+    signal_calls: Arc<AtomicUsize>,
+    terminate_calls: Arc<AtomicUsize>,
+}
+
+struct ResumeRepairProcess {
+    process_id: codex_exec_server::ProcessId,
+    write_calls: Arc<AtomicUsize>,
+    signal_calls: Arc<AtomicUsize>,
+    terminate_calls: Arc<AtomicUsize>,
+    wake_tx: tokio::sync::watch::Sender<u64>,
+}
+
+impl codex_exec_server::ExecProcess for ResumeRepairProcess {
+    fn process_id(&self) -> &codex_exec_server::ProcessId {
+        &self.process_id
+    }
+
+    fn subscribe_wake(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.wake_tx.subscribe()
+    }
+
+    fn subscribe_events(&self) -> codex_exec_server::ExecProcessEventReceiver {
+        codex_exec_server::ExecProcessEventReceiver::empty()
+    }
+
+    fn read(
+        &self,
+        _after_seq: Option<u64>,
+        _max_bytes: Option<usize>,
+        _wait_ms: Option<u64>,
+    ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::ReadResponse> {
+        Box::pin(async {
+            Ok(codex_exec_server::ReadResponse {
+                chunks: Vec::new(),
+                next_seq: 1,
+                exited: false,
+                exit_code: None,
+                closed: false,
+                failure: None,
+                sandbox_denied: false,
+            })
+        })
+    }
+
+    fn write(
+        &self,
+        _chunk: Vec<u8>,
+    ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::WriteResponse> {
+        self.write_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Ok(codex_exec_server::WriteResponse {
+                status: codex_exec_server::WriteStatus::Accepted,
+            })
+        })
+    }
+
+    fn signal(
+        &self,
+        _signal: codex_exec_server::ProcessSignal,
+    ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::ProcessSignalOutcome> {
+        self.signal_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(codex_exec_server::ProcessSignalOutcome::Accepted) })
+    }
+
+    fn terminate(&self) -> codex_exec_server::ExecProcessFuture<'_, ()> {
+        self.terminate_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl codex_exec_server::ExecBackend for ResumeRepairBackend {
+    fn start(
+        &self,
+        _params: codex_exec_server::ExecParams,
+    ) -> codex_exec_server::ExecBackendFuture<'_> {
+        self.start_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(codex_exec_server::ExecServerError::Protocol(
+                "resume repair must not launch a process".to_string(),
+            ))
+        })
+    }
+
+    fn adopt_execution(
+        &self,
+        request: codex_exec_server::AdoptionRequest,
+    ) -> codex_exec_server::ExecBackendFuture<'_> {
+        self.adopt_calls.fetch_add(1, Ordering::SeqCst);
+        let write_calls = Arc::clone(&self.write_calls);
+        let signal_calls = Arc::clone(&self.signal_calls);
+        let terminate_calls = Arc::clone(&self.terminate_calls);
+        Box::pin(async move {
+            if request.identity.turn_id != "exec-turn"
+                || request.identity.call_id != "exec-call"
+                || request.identity.attempt_generation != 0
+                || request.expected_command_digest != "command-digest"
+                || request.original_session_id != Some(42)
+                || request.committed_output_cursor != 17
+                || !request.tty
+            {
+                return Err(codex_exec_server::ExecServerError::Protocol(
+                    "resume fixture received conflicting adoption authority".to_string(),
+                ));
+            }
+            let (wake_tx, _wake_rx) = tokio::sync::watch::channel(0);
+            Ok(codex_exec_server::StartedExecProcess {
+                process: Arc::new(ResumeRepairProcess {
+                    process_id: "42".to_string().into(),
+                    write_calls,
+                    signal_calls,
+                    terminate_calls,
+                    wake_tx,
+                }),
+            })
+        })
+    }
+
+    fn reconcile(
+        &self,
+        request: codex_exec_server::ReconciliationRequest,
+    ) -> codex_exec_server::ExecBackendReconcileFuture<'_> {
+        self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if request.incomplete_executions.len() != 1 || !request.pending_writes.is_empty() {
+                return Err(codex_exec_server::ExecServerError::Protocol(
+                    "resume fixture expected one execution and no signal replay".to_string(),
+                ));
+            }
+            let incomplete = request
+                .incomplete_executions
+                .into_iter()
+                .next()
+                .expect("length checked");
+            let output = b"process running\r\n".to_vec();
+            Ok(vec![codex_exec_server::RecoveredExecution {
+                identity: codex_exec_server::ExecutionIdentity {
+                    thread_id: request.thread_id,
+                    turn_id: incomplete.turn_id,
+                    call_id: incomplete.call_id,
+                    attempt_generation: incomplete.attempt_generation,
+                },
+                command_digest: incomplete.expected_command_digest,
+                committed_output_cursor: output.len() as u64,
+                output,
+                status: codex_exec_server::RecoveredExecutionStatus::Running,
+                terminal_verified_dead: false,
+                session_id: incomplete.expected_session_id,
+                delivery_unknown: false,
+                acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+                    "resume-fixture-terminal-proof".to_string(),
+                ),
+            }])
+        })
+    }
+}
+
+fn resume_repair_initial_receipt(
+    thread_id: &str,
+    environment_id: &str,
+) -> (RolloutItem, RolloutItem, RemoteExecutionSessionCommitted) {
+    let output_text = "process running\r\n";
+    let prepared = RemoteExecutionSessionPrepared {
+        thread_id: thread_id.to_string(),
+        exec_turn_id: "exec-turn".to_string(),
+        exec_call_id: "exec-call".to_string(),
+        receipt_turn_id: "exec-turn".to_string(),
+        receipt_call_id: "exec-call".to_string(),
+        receipt_kind: RemoteExecutionReceiptKind::InitialExec,
+        attempt_generation: 0,
+        session_id: 42,
+        command_digest: "command-digest".to_string(),
+        tty: true,
+        output_mode: "pty".to_string(),
+        environment_id: environment_id.to_string(),
+        cwd: "file:///workspace".to_string(),
+        hook_command: "sleep 30".to_string(),
+        range_start: 0,
+        range_end: 17,
+        receipt_output_digest: format!("{:x}", Sha256::digest(output_text.as_bytes())),
+        receipt_output_text: output_text.to_string(),
+        rejection_reason: None,
+        rejection_write_id: None,
+        rejection_input_sha256: None,
+        terminal_acknowledgement_token: None,
+        terminal_output_digest: None,
+        terminal_status: None,
+        terminal_candidate: false,
+    };
+    let mut output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "exec-call".to_string(),
+        output: FunctionCallOutputPayload::from_text(output_text.to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    output.set_turn_id_if_missing("exec-turn");
+    let committed = RemoteExecutionSessionCommitted {
+        thread_id: prepared.thread_id.clone(),
+        exec_turn_id: prepared.exec_turn_id.clone(),
+        exec_call_id: prepared.exec_call_id.clone(),
+        receipt_turn_id: prepared.receipt_turn_id.clone(),
+        receipt_call_id: prepared.receipt_call_id.clone(),
+        receipt_kind: prepared.receipt_kind.clone(),
+        attempt_generation: prepared.attempt_generation,
+        session_id: prepared.session_id,
+        command_digest: prepared.command_digest.clone(),
+        range_start: prepared.range_start,
+        range_end: prepared.range_end,
+        receipt_output_digest: prepared.receipt_output_digest.clone(),
+        prepared_receipt_digest: crate::session::prepared_remote_receipt_digest_for_tests(
+            &prepared,
+        )
+        .expect("initial prepared digest"),
+        rejection_reason: None,
+        rejection_write_id: None,
+        rejection_input_sha256: None,
+        terminal_acknowledgement_token: None,
+        terminal_output_digest: None,
+        terminal_status: None,
+        terminal: false,
+    };
+    (
+        RolloutItem::RemoteExecutionSessionPrepared(prepared),
+        RolloutItem::ResponseItem(output),
+        committed,
+    )
+}
+
+#[tokio::test]
+async fn prepared_interrupt_rejection_resumes_once_and_preserves_completed_final_response() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.experimental_thread_store = ThreadStoreConfig::InMemory {
+        id: format!("prepared-rejection-resume-{}", uuid::Uuid::new_v4()),
+    };
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let reconcile_calls = Arc::new(AtomicUsize::new(0));
+    let start_calls = Arc::new(AtomicUsize::new(0));
+    let adopt_calls = Arc::new(AtomicUsize::new(0));
+    let write_calls = Arc::new(AtomicUsize::new(0));
+    let signal_calls = Arc::new(AtomicUsize::new(0));
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(ResumeRepairBackend {
+        reconcile_calls: Arc::clone(&reconcile_calls),
+        start_calls: Arc::clone(&start_calls),
+        adopt_calls: Arc::clone(&adopt_calls),
+        write_calls: Arc::clone(&write_calls),
+        signal_calls: Arc::clone(&signal_calls),
+        terminate_calls: Arc::clone(&terminate_calls),
+    });
+    let environment_id = "resume-fixture";
+    let environment_manager = Arc::new(
+        codex_exec_server::EnvironmentManager::with_exec_backend_for_tests(
+            environment_id,
+            backend,
+            /*durable_remote_exec_recovery*/ true,
+        ),
+    );
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let thread_store = thread_store_from_config(&config, /*state_db*/ None);
+    let in_memory_store = thread_store
+        .as_any()
+        .downcast_ref::<InMemoryThreadStore>()
+        .expect("configured in-memory store");
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        environment_manager,
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        Arc::clone(&thread_store),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+
+    let source = manager
+        .start_thread(config.clone())
+        .await
+        .expect("create source thread");
+    source
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown source thread");
+    let _ = manager.remove_thread(&source.thread_id).await;
+    let calls_before_resume = in_memory_store.calls().await;
+    let thread_id = source.thread_id;
+    let thread_id_text = thread_id.to_string();
+    let (initial_prepared, initial_output, initial_commit) =
+        resume_repair_initial_receipt(&thread_id_text, environment_id);
+    let input = "\u{3}";
+    let input_sha256 = format!("{:x}", Sha256::digest(input.as_bytes()));
+    let write_id = "a".repeat(64);
+    let failed_text =
+        "write_stdin failed: remote interrupt rejected before delivery: process ownership changed";
+    let write_call = scanner_call(
+        "write_stdin",
+        "interrupt-call",
+        "final-response-turn",
+        &serde_json::json!({"session_id": 42, "chars": input}).to_string(),
+    );
+    let request = scanner_write_request(
+        &thread_id_text,
+        "final-response-turn",
+        "interrupt-call",
+        42,
+        "command-digest",
+        17,
+        input,
+    );
+    let intent = RemoteExecutionWriteIntent {
+        thread_id: thread_id_text.clone(),
+        exec_turn_id: "exec-turn".to_string(),
+        exec_call_id: "exec-call".to_string(),
+        receipt_turn_id: "final-response-turn".to_string(),
+        receipt_call_id: "interrupt-call".to_string(),
+        attempt_generation: 0,
+        session_id: 42,
+        command_digest: "command-digest".to_string(),
+        committed_output_cursor: 17,
+        write_id: write_id.clone(),
+        input_sha256: input_sha256.clone(),
+        input_len: 1,
+    };
+    let rejection = RemoteExecutionSessionPrepared {
+        thread_id: thread_id_text.clone(),
+        exec_turn_id: "exec-turn".to_string(),
+        exec_call_id: "exec-call".to_string(),
+        receipt_turn_id: "final-response-turn".to_string(),
+        receipt_call_id: "interrupt-call".to_string(),
+        receipt_kind: RemoteExecutionReceiptKind::RejectedBeforeDelivery,
+        attempt_generation: 0,
+        session_id: 42,
+        command_digest: "command-digest".to_string(),
+        tty: true,
+        output_mode: "pty".to_string(),
+        environment_id: environment_id.to_string(),
+        cwd: "file:///workspace".to_string(),
+        hook_command: "sleep 30".to_string(),
+        range_start: 17,
+        range_end: 17,
+        receipt_output_digest: format!("{:x}", Sha256::digest(failed_text.as_bytes())),
+        receipt_output_text: failed_text.to_string(),
+        rejection_reason: Some(RemoteExecutionRejectionReason::InterruptOwnershipMismatch),
+        rejection_write_id: Some(write_id),
+        rejection_input_sha256: Some(input_sha256),
+        terminal_acknowledgement_token: None,
+        terminal_output_digest: None,
+        terminal_status: None,
+        terminal_candidate: false,
+    };
+    let final_turn_started = RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+        turn_id: "final-response-turn".to_string(),
+        trace_id: None,
+        started_at: None,
+        model_context_window: None,
+        collaboration_mode_kind: Default::default(),
+    }));
+    let plan_event = EventMsg::PlanUpdate(UpdatePlanArgs {
+        explanation: Some("repair complete".to_string()),
+        plan: vec![PlanItemArg {
+            step: "preserve completed work".to_string(),
+            status: StepStatus::Completed,
+        }],
+    });
+    let plan = RolloutItem::EventMsg(plan_event.clone());
+    let mut final_response_item = assistant_msg("Build 148 repaired the resume path.");
+    if let ResponseItem::Message { phase, .. } = &mut final_response_item {
+        *phase = Some(MessagePhase::FinalAnswer);
+    }
+    final_response_item.set_turn_id_if_missing("final-response-turn");
+    let final_response = RolloutItem::ResponseItem(final_response_item.clone());
+    let task_complete_event = EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: "final-response-turn".to_string(),
+        last_agent_message: Some("Build 148 repaired the resume path.".to_string()),
+        error: None,
+        started_at: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+    });
+    let task_complete = RolloutItem::EventMsg(task_complete_event.clone());
+    let rollout_path = config.codex_home.join("rollouts/rejection.jsonl");
+    let history = vec![
+        initial_prepared,
+        initial_output,
+        RolloutItem::RemoteExecutionSessionCommitted(initial_commit),
+        final_turn_started,
+        scanner_marker(&thread_id_text, "final-response-turn", 2),
+        write_call,
+        request,
+        RolloutItem::RemoteExecutionWriteIntent(intent),
+        RolloutItem::RemoteExecutionSessionPrepared(rejection),
+        plan.clone(),
+        final_response.clone(),
+        task_complete.clone(),
+    ];
+    let pending = ThreadManager::scan_active_remote_calls(thread_id_text.clone(), &history)
+        .expect("scan prepared rejection");
+    assert_eq!(pending.pending_writes.len(), 1);
+
+    let resumed = manager
+        .resume_thread_with_history_and_tools(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: thread_id,
+                history: Arc::new(history),
+                rollout_path: Some(rollout_path.to_path_buf()),
+            }),
+            auth_manager,
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+            Vec::new(),
+            pending.pending_writes,
+        )
+        .await
+        .expect("prepared rejection should resume");
+
+    let repaired = resumed
+        .thread
+        .load_history(/*include_archived*/ true)
+        .await
+        .expect("load repaired history");
+    assert_eq!(
+        repaired
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                        call_id,
+                        output,
+                        ..
+                    }) if call_id == "interrupt-call"
+                        && output.body.to_text().as_deref() == Some(failed_text)
+                )
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        repaired
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    RolloutItem::RemoteExecutionSessionCommitted(committed)
+                        if committed.receipt_call_id == "interrupt-call"
+                            && committed.receipt_kind
+                                == RemoteExecutionReceiptKind::RejectedBeforeDelivery
+                )
+            })
+            .count(),
+        1
+    );
+    for retained in [&plan, &final_response, &task_complete] {
+        let retained_json = serde_json::to_value(retained).expect("serialize retained item");
+        assert_eq!(
+            repaired
+                .items
+                .iter()
+                .filter(|item| {
+                    serde_json::to_value(item).expect("serialize repaired item") == retained_json
+                })
+                .count(),
+            1
+        );
+    }
+    let rescanned = ThreadManager::scan_active_remote_calls(thread_id_text, &repaired.items)
+        .expect("repaired history should scan");
+    assert!(rescanned.pending_writes.is_empty());
+    let model_history = resumed.thread.session.clone_history().await;
+    assert_eq!(
+        model_history
+            .raw_items()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    ResponseItem::Message {
+                        role,
+                        content,
+                        phase: Some(MessagePhase::FinalAnswer),
+                        ..
+                    } if role == "assistant"
+                        && item.turn_id() == Some("final-response-turn")
+                        && content
+                            == &vec![ContentItem::OutputText {
+                                text: "Build 148 repaired the resume path.".to_string(),
+                            }]
+                )
+            })
+            .count(),
+        1
+    );
+    let initial_messages = resumed
+        .session_configured
+        .initial_messages
+        .as_ref()
+        .expect("resumed session should expose initial events");
+    for expected in [&plan_event, &task_complete_event] {
+        let expected_json = serde_json::to_value(expected).expect("serialize expected event");
+        assert_eq!(
+            initial_messages
+                .iter()
+                .filter(|event| {
+                    serde_json::to_value(event).expect("serialize initial event") == expected_json
+                })
+                .count(),
+            1
+        );
+    }
+    assert_eq!(reconcile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(adopt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(write_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(signal_calls.load(Ordering::SeqCst), 0);
+    let calls = in_memory_store.calls().await;
+    assert_eq!(calls.resume_thread - calls_before_resume.resume_thread, 1);
+    assert_eq!(
+        calls.append_items - calls_before_resume.append_items,
+        2,
+        "one failed output and one commit"
+    );
+
+    resumed
+        .thread
+        .prepare_for_host_detach()
+        .await
+        .expect("detach adopted durable process");
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown resumed thread");
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]

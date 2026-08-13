@@ -22,6 +22,8 @@ use tokio::sync::watch;
 use crate::AdoptionRequest;
 use crate::ExecServerError;
 use crate::PreparedExecution;
+use crate::ProcessSignalOutcome;
+use crate::ProcessSignalRejectionReason;
 use crate::ReconciliationRequest;
 use crate::RecoveredExecution;
 use crate::RecoveredExecutionAcknowledgement;
@@ -416,9 +418,7 @@ async fn monitor_pump(
                             let _ = ack.send(result);
                         }
                         Some(ChannelCommand::Signal { ack, .. }) => {
-                            let result = descriptor
-                                .interrupt(backend.transport())
-                                .await;
+                            let result = descriptor.interrupt(backend.transport()).await;
                             if let Err(error) = &result {
                                 tracing::debug!(
                                     session_key = %backend.session_key(),
@@ -1181,57 +1181,59 @@ impl TmuxProcessDescriptor {
     async fn interrupt(
         &self,
         transport: &crate::ssh_transport::SshTransport,
-    ) -> Result<(), ExecServerError> {
+    ) -> Result<ProcessSignalOutcome, ExecServerError> {
+        let result = transport
+            .exec_control(&with_remote_path(&self.interrupt_command()), None)
+            .await?;
+        interrupt_outcome_from_control_result(result.exit_code, &result.output)
+    }
+
+    fn interrupt_command(&self) -> String {
         let root = self.remote_directory();
-        self.run_control(
-            transport,
-            &format!(
-                concat!(
-                    "set -eu; root=\"{root}\"; {ownership}; ",
-                    "stored_identity=$(cat \"$root/process-identity\" 2>/dev/null || true); ",
-                    "pane_pid=${{stored_identity%%:*}}; pgid=${{stored_identity#*:}}; ",
-                    "case \"$stored_identity\" in *:*:*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
-                    "case \"$pane_pid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
-                    "case \"$pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
-                    "[ \"$pane_pid:$pgid\" = \"$stored_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80; }}; ",
-                    "current_identity=$(tmux display-message -p -t {target} '#{{pane_id}}:#{{pane_pid}}' 2>/dev/null || true); ",
-                    "pane_id=${{current_identity%%:*}}; current_pane=${{current_identity#*:}}; ",
-                    "case \"$pane_id\" in %*) ;; *) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
-                    "case \"$current_pane\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
-                    "current_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' '); ",
-                    "[ \"$current_pane:$current_pgid\" = \"$stored_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH >&2; exit 80; }}; ",
-                    "current_controller=$(cat \"$root/controller\" 2>/dev/null || true); ",
-                    "case \"$current_controller\" in *:*) ;; *) echo AGENTAPP_TMUX_INTERRUPT_CONTROLLER_UNKNOWN >&2; exit 80 ;; esac; ",
-                    "operation_pid=$$; operation_pgid=$(command -p ps -o pgid= -p \"$operation_pid\" 2>/dev/null | tr -d ' '); ",
-                    "case \"$operation_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
-                    "[ \"$operation_pgid\" != \"$pgid\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80; }}; ",
-                    "interrupt_nonce=i_${{operation_pid}}_${{operation_pgid}}; ",
-                    "transition_candidate=\"$root/.transition-candidate.$interrupt_nonce.$operation_pid\"; ",
-                    "expected_claim=\"interrupt|$interrupt_nonce|$current_controller|$operation_pid|$operation_pgid|$(cat \"$root/window\" 2>/dev/null || true)|$pane_pid|$pgid\"; ",
-                    "( umask 077; set -C; printf '%s\\n' \"$expected_claim\" > \"$transition_candidate\" ) || {{ echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}; ",
-                    "ln \"$transition_candidate\" \"$root/transition-claim\" 2>/dev/null || {{ rm -f \"$transition_candidate\"; echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}; ",
-                    "release_interrupt_claim() {{ if [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ]; then rm -f \"$root/transition-claim\"; fi; rm -f \"$transition_candidate\"; }}; ",
-                    "trap 'release_interrupt_claim' EXIT HUP INT TERM; ",
-                    "require_interrupt_claim() {{ [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] && [ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"$expected_claim\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}; }}; ",
-                    "require_interrupt_claim; ",
-                    "[ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$current_controller\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}; ",
-                    "[ ! -f \"$root/status\" ] && [ \"$(cat \"$root/state\" 2>/dev/null || true)\" = running ] || {{ echo AGENTAPP_TMUX_TRANSITION_STATE_CHANGED >&2; exit 79; }}; ",
-                    "{ownership}; ",
-                    "rechecked_identity=$(tmux display-message -p -t \"$pane_id\" '#{{pane_id}}:#{{pane_pid}}' 2>/dev/null || true); ",
-                    "[ \"$rechecked_identity\" = \"$current_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH >&2; exit 80; }}; ",
-                    "rechecked_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' '); ",
-                    "[ \"$current_pane:$rechecked_pgid\" = \"$stored_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH >&2; exit 80; }}; ",
-                    "require_interrupt_claim; ",
-                    "tmux send-keys -t \"$pane_id\" C-c; ",
-                    "release_interrupt_claim; trap - EXIT HUP INT TERM",
-                ),
-                root = root,
-                ownership = self.ownership_guard(),
-                target = shell_quote(&self.target()),
+        format!(
+            concat!(
+                "set -eu; root=\"{root}\"; {ownership}; ",
+                "stored_identity=$(cat \"$root/process-identity\" 2>/dev/null || true); ",
+                "pane_pid=${{stored_identity%%:*}}; pgid=${{stored_identity#*:}}; ",
+                "case \"$stored_identity\" in *:*:*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                "case \"$pane_pid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                "case \"$pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                "[ \"$pane_pid:$pgid\" = \"$stored_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80; }}; ",
+                "current_identity=$(tmux display-message -p -t {target} '#{{pane_id}}:#{{pane_pid}}' 2>/dev/null || true); ",
+                "pane_id=${{current_identity%%:*}}; current_pane=${{current_identity#*:}}; ",
+                "case \"$pane_id\" in %*) ;; *) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                "case \"$current_pane\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                "current_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' '); ",
+                "[ \"$current_pane:$current_pgid\" = \"$stored_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH >&2; exit 80; }}; ",
+                "current_controller=$(cat \"$root/controller\" 2>/dev/null || true); ",
+                "case \"$current_controller\" in *:*) ;; *) echo AGENTAPP_TMUX_INTERRUPT_CONTROLLER_UNKNOWN >&2; exit 80 ;; esac; ",
+                "operation_pid=$$; operation_pgid=$(command -p ps -o pgid= -p \"$operation_pid\" 2>/dev/null | tr -d ' '); ",
+                "case \"$operation_pgid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80 ;; esac; ",
+                "[ \"$operation_pgid\" != \"$pgid\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_IDENTITY_UNKNOWN >&2; exit 80; }}; ",
+                "interrupt_nonce=i_${{operation_pid}}_${{operation_pgid}}; ",
+                "transition_candidate=\"$root/.transition-candidate.$interrupt_nonce.$operation_pid\"; ",
+                "expected_claim=\"interrupt|$interrupt_nonce|$current_controller|$operation_pid|$operation_pgid|$(cat \"$root/window\" 2>/dev/null || true)|$pane_pid|$pgid\"; ",
+                "( umask 077; set -C; printf '%s\\n' \"$expected_claim\" > \"$transition_candidate\" ) || {{ echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}; ",
+                "ln \"$transition_candidate\" \"$root/transition-claim\" 2>/dev/null || {{ rm -f \"$transition_candidate\"; echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79; }}; ",
+                "release_interrupt_claim() {{ if [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ]; then rm -f \"$root/transition-claim\"; fi; rm -f \"$transition_candidate\"; }}; ",
+                "trap 'release_interrupt_claim' EXIT HUP INT TERM; ",
+                "require_interrupt_claim() {{ [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] && [ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"$expected_claim\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}; }}; ",
+                "require_interrupt_claim; ",
+                "[ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$current_controller\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}; ",
+                "[ ! -f \"$root/status\" ] && [ \"$(cat \"$root/state\" 2>/dev/null || true)\" = running ] || {{ echo AGENTAPP_TMUX_TRANSITION_STATE_CHANGED >&2; exit 79; }}; ",
+                "{ownership}; ",
+                "rechecked_identity=$(tmux display-message -p -t \"$pane_id\" '#{{pane_id}}:#{{pane_pid}}' 2>/dev/null || true); ",
+                "[ \"$rechecked_identity\" = \"$current_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH >&2; exit 80; }}; ",
+                "rechecked_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' '); ",
+                "[ \"$current_pane:$rechecked_pgid\" = \"$stored_identity\" ] || {{ echo AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH >&2; exit 80; }}; ",
+                "require_interrupt_claim; ",
+                "tmux send-keys -t \"$pane_id\" C-c; ",
+                "release_interrupt_claim; trap - EXIT HUP INT TERM",
             ),
-            "interrupt",
+            root = root,
+            ownership = self.ownership_guard(),
+            target = shell_quote(&self.target()),
         )
-        .await
     }
 
     async fn terminate(
@@ -2308,6 +2310,25 @@ fn parse_recovered_executions(output: &[u8]) -> Result<Vec<RecoveredExecution>, 
         }
     }
     Ok(recovered)
+}
+
+fn interrupt_outcome_from_control_result(
+    exit_code: i32,
+    output: &[u8],
+) -> Result<ProcessSignalOutcome, ExecServerError> {
+    if exit_code == 0 {
+        return Ok(ProcessSignalOutcome::Accepted);
+    }
+    let diagnostic = String::from_utf8_lossy(output);
+    if exit_code == 80 && diagnostic.trim() == "AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH" {
+        return Ok(ProcessSignalOutcome::RejectedBeforeDelivery(
+            ProcessSignalRejectionReason::OwnershipMismatch,
+        ));
+    }
+    Err(ExecServerError::Protocol(format!(
+        "ssh tmux interrupt failed with exit {exit_code}: {}",
+        diagnostic.trim()
+    )))
 }
 
 fn stable_identifier(value: &str) -> String {

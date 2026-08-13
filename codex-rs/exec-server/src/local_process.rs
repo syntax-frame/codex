@@ -45,6 +45,7 @@ use crate::protocol::ExecParams;
 use crate::protocol::ExecResponse;
 use crate::protocol::ProcessOutputChunk;
 use crate::protocol::ProcessSignal;
+use crate::protocol::ProcessSignalOutcome;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
 use crate::protocol::SignalParams;
@@ -521,7 +522,9 @@ impl LocalProcess {
             match process_map.get(&params.process_id) {
                 Some(ProcessEntry::Running(process)) => {
                     if process.exit_code.is_some() {
-                        return Ok(SignalResponse {});
+                        return Ok(SignalResponse {
+                            outcome: ProcessSignalOutcome::Accepted,
+                        });
                     }
                     process
                         .session
@@ -532,7 +535,9 @@ impl LocalProcess {
             }
         }
 
-        Ok(SignalResponse {})
+        Ok(SignalResponse {
+            outcome: ProcessSignalOutcome::Accepted,
+        })
     }
 
     pub(crate) async fn terminate_process(
@@ -631,7 +636,7 @@ impl LocalExecProcess {
         self.backend.write(&self.process_id, chunk).await
     }
 
-    async fn signal(&self, signal: ProcessSignal) -> Result<(), ExecServerError> {
+    async fn signal(&self, signal: ProcessSignal) -> Result<ProcessSignalOutcome, ExecServerError> {
         self.backend.signal(&self.process_id, signal).await
     }
 
@@ -666,7 +671,7 @@ impl ExecProcess for LocalExecProcess {
         Box::pin(LocalExecProcess::write(self, chunk))
     }
 
-    fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+    fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ProcessSignalOutcome> {
         Box::pin(LocalExecProcess::signal(self, signal))
     }
 
@@ -714,14 +719,15 @@ impl LocalProcess {
         &self,
         process_id: &ProcessId,
         signal: ProcessSignal,
-    ) -> Result<(), ExecServerError> {
-        self.signal_process(SignalParams {
-            process_id: process_id.clone(),
-            signal,
-        })
-        .await
-        .map_err(map_handler_error)?;
-        Ok(())
+    ) -> Result<ProcessSignalOutcome, ExecServerError> {
+        let response = self
+            .signal_process(SignalParams {
+                process_id: process_id.clone(),
+                signal,
+            })
+            .await
+            .map_err(map_handler_error)?;
+        Ok(response.outcome)
     }
 
     async fn terminate(&self, process_id: &ProcessId) -> Result<(), ExecServerError> {

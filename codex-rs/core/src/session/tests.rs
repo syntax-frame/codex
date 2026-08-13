@@ -27,6 +27,9 @@ fn background_prepared(session_id: i32, operation_call_id: &str, cursor: u64) ->
         range_end: cursor,
         receipt_output_digest: remote_receipt_output_digest("output"),
         receipt_output_text: "output".to_string(),
+        rejection_reason: None,
+        rejection_write_id: None,
+        rejection_input_sha256: None,
         terminal_acknowledgement_token: None,
         terminal_output_digest: None,
         terminal_status: None,
@@ -287,6 +290,9 @@ fn completed_v2_predispatch_write_failure_is_proven_unsent_after_round_trip() {
         receipt_output_digest: write_prepared.receipt_output_digest.clone(),
         prepared_receipt_digest: prepared_remote_receipt_digest(&write_prepared)
             .expect("matching preparation digest"),
+        rejection_reason: write_prepared.rejection_reason.clone(),
+        rejection_write_id: write_prepared.rejection_write_id.clone(),
+        rejection_input_sha256: write_prepared.rejection_input_sha256.clone(),
         terminal_acknowledgement_token: write_prepared.terminal_acknowledgement_token.clone(),
         terminal_output_digest: write_prepared.terminal_output_digest.clone(),
         terminal_status: write_prepared.terminal_status.clone(),
@@ -328,6 +334,241 @@ fn completed_v2_predispatch_write_failure_is_proven_unsent_after_round_trip() {
             .expect("v2 delivery-unknown classification"),
         Some("interrupt".to_string())
     );
+}
+
+#[test]
+fn exact_pre_delivery_interrupt_rejection_does_not_create_a_receipt_gap() {
+    let prepared = background_prepared(41, "exec-41", 7);
+    let initial_output = background_output("exec-41");
+    let committed = missing_background_session_commits(&[prepared.clone(), initial_output.clone()])
+        .expect("initial receipt")
+        .pop()
+        .expect("initial commit");
+    let marker = RolloutItem::RemoteExecutionProtocolMarker(RemoteExecutionProtocolMarker {
+        thread_id: "thread".to_string(),
+        turn_id: "same-turn".to_string(),
+        protocol_version: 2,
+        identity_schema: "thread-turn-call-generation".to_string(),
+        descriptor_before_go: true,
+        stdin_intent_before_write: true,
+    });
+    let input_sha256 = remote_receipt_bytes_digest(b"\x03");
+    let request = RemoteExecutionWriteRequest {
+        thread_id: committed.thread_id.clone(),
+        exec_turn_id: committed.exec_turn_id.clone(),
+        exec_call_id: committed.exec_call_id.clone(),
+        receipt_turn_id: "same-turn".to_string(),
+        receipt_call_id: "interrupt".to_string(),
+        attempt_generation: committed.attempt_generation,
+        session_id: committed.session_id,
+        command_digest: committed.command_digest.clone(),
+        committed_output_cursor: committed.range_end,
+        input_sha256: input_sha256.clone(),
+        input_len: 1,
+        yield_time_ms: crate::unified_exec::MIN_YIELD_TIME_MS,
+        max_output_tokens: None,
+        truncation_policy: TruncationPolicy::Bytes(2_048),
+    };
+    let intent = RemoteExecutionWriteIntent {
+        thread_id: request.thread_id.clone(),
+        exec_turn_id: request.exec_turn_id.clone(),
+        exec_call_id: request.exec_call_id.clone(),
+        receipt_turn_id: request.receipt_turn_id.clone(),
+        receipt_call_id: request.receipt_call_id.clone(),
+        attempt_generation: request.attempt_generation,
+        session_id: request.session_id,
+        command_digest: request.command_digest.clone(),
+        committed_output_cursor: request.committed_output_cursor,
+        write_id: "a".repeat(64),
+        input_sha256: input_sha256.clone(),
+        input_len: 1,
+    };
+    let text =
+        "write_stdin failed: remote interrupt rejected before delivery: process ownership changed";
+    let mut rejection = match background_prepared(41, "interrupt", committed.range_end) {
+        RolloutItem::RemoteExecutionSessionPrepared(prepared) => prepared,
+        _ => unreachable!(),
+    };
+    rejection.thread_id = committed.thread_id.clone();
+    rejection.exec_turn_id = committed.exec_turn_id.clone();
+    rejection.exec_call_id = committed.exec_call_id.clone();
+    rejection.receipt_turn_id = "same-turn".to_string();
+    rejection.receipt_kind = RemoteExecutionReceiptKind::RejectedBeforeDelivery;
+    rejection.attempt_generation = committed.attempt_generation;
+    rejection.command_digest = committed.command_digest.clone();
+    rejection.range_start = committed.range_end;
+    rejection.range_end = committed.range_end;
+    rejection.receipt_output_text = text.to_string();
+    rejection.receipt_output_digest = remote_receipt_output_digest(text);
+    rejection.rejection_reason = Some(RemoteExecutionRejectionReason::InterruptOwnershipMismatch);
+    rejection.rejection_write_id = Some(intent.write_id.clone());
+    rejection.rejection_input_sha256 = Some(input_sha256);
+    let failed_output = RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "interrupt".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(text.to_string()),
+            success: Some(false),
+        },
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some("same-turn".to_string()),
+        }),
+    });
+    let prefix = vec![
+        marker,
+        prepared,
+        initial_output,
+        RolloutItem::RemoteExecutionSessionCommitted(committed.clone()),
+        write_stdin_call("same-turn", "interrupt", 41, "\u{3}"),
+        RolloutItem::RemoteExecutionWriteRequest(request),
+        RolloutItem::RemoteExecutionWriteIntent(intent),
+        RolloutItem::RemoteExecutionSessionPrepared(rejection),
+        failed_output,
+    ];
+    let rejection_commit = missing_background_session_commits(&prefix)
+        .expect("rejection receipt")
+        .pop()
+        .expect("rejection commit");
+    let mut history = prefix;
+    history.push(RolloutItem::RemoteExecutionSessionCommitted(
+        rejection_commit,
+    ));
+    let history = history
+        .iter()
+        .map(persisted_rollout_item)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        completed_nonempty_write_after_commit(&history, &committed, 3)
+            .expect("typed rejection classification"),
+        None
+    );
+
+    let mut mismatched = history;
+    let RolloutItem::RemoteExecutionSessionPrepared(mut bad) = mismatched[7].clone() else {
+        unreachable!();
+    };
+    bad.rejection_write_id = Some("b".repeat(64));
+    mismatched[7] = RolloutItem::RemoteExecutionSessionPrepared(bad);
+    assert_eq!(
+        completed_nonempty_write_after_commit(&mismatched, &committed, 3)
+            .expect("mismatched rejection classification"),
+        Some("interrupt".to_string())
+    );
+}
+
+#[test]
+fn prepared_pre_delivery_interrupt_rejection_recovers_exact_failed_output_once() {
+    let initial = background_prepared(41, "exec-41", 7);
+    let initial_output = background_output("exec-41");
+    let committed = missing_background_session_commits(&[initial.clone(), initial_output.clone()])
+        .expect("initial receipt")
+        .pop()
+        .expect("initial commit");
+    let pending = PendingWriteInteraction {
+        call_id: "interrupt".to_string(),
+        turn_id: "same-turn".to_string(),
+        session_id: 41,
+        input_is_empty: false,
+        pre_send_intent_required: true,
+        pre_send_intent_persisted: true,
+        protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+    };
+    let input_sha256 = remote_receipt_bytes_digest(b"\x03");
+    let request = RemoteExecutionWriteRequest {
+        thread_id: "thread".to_string(),
+        exec_turn_id: committed.exec_turn_id.clone(),
+        exec_call_id: committed.exec_call_id.clone(),
+        receipt_turn_id: pending.turn_id.clone(),
+        receipt_call_id: pending.call_id.clone(),
+        attempt_generation: committed.attempt_generation,
+        session_id: pending.session_id,
+        command_digest: committed.command_digest.clone(),
+        committed_output_cursor: committed.range_end,
+        input_sha256: input_sha256.clone(),
+        input_len: 1,
+        yield_time_ms: crate::unified_exec::MIN_YIELD_TIME_MS,
+        max_output_tokens: None,
+        truncation_policy: TruncationPolicy::Bytes(2_048),
+    };
+    let intent = RemoteExecutionWriteIntent {
+        thread_id: request.thread_id.clone(),
+        exec_turn_id: request.exec_turn_id.clone(),
+        exec_call_id: request.exec_call_id.clone(),
+        receipt_turn_id: request.receipt_turn_id.clone(),
+        receipt_call_id: request.receipt_call_id.clone(),
+        attempt_generation: request.attempt_generation,
+        session_id: request.session_id,
+        command_digest: request.command_digest.clone(),
+        committed_output_cursor: request.committed_output_cursor,
+        write_id: "a".repeat(64),
+        input_sha256: input_sha256.clone(),
+        input_len: 1,
+    };
+    let text =
+        "write_stdin failed: remote interrupt rejected before delivery: process ownership changed";
+    let mut rejection = match background_prepared(41, "interrupt", committed.range_end) {
+        RolloutItem::RemoteExecutionSessionPrepared(prepared) => prepared,
+        _ => unreachable!(),
+    };
+    rejection.receipt_turn_id = pending.turn_id.clone();
+    rejection.receipt_kind = RemoteExecutionReceiptKind::RejectedBeforeDelivery;
+    rejection.range_start = committed.range_end;
+    rejection.range_end = committed.range_end;
+    rejection.receipt_output_text = text.to_string();
+    rejection.receipt_output_digest = remote_receipt_output_digest(text);
+    rejection.rejection_reason = Some(RemoteExecutionRejectionReason::InterruptOwnershipMismatch);
+    rejection.rejection_write_id = Some(intent.write_id.clone());
+    rejection.rejection_input_sha256 = Some(input_sha256);
+    let history = vec![
+        initial,
+        initial_output,
+        RolloutItem::RemoteExecutionSessionCommitted(committed),
+        write_stdin_call(&pending.turn_id, &pending.call_id, 41, "\u{3}"),
+        RolloutItem::RemoteExecutionWriteRequest(request),
+        RolloutItem::RemoteExecutionWriteIntent(intent),
+        RolloutItem::RemoteExecutionSessionPrepared(rejection.clone()),
+    ];
+
+    let PreparedPreDeliveryRejectionRepair::Ready { output_to_append } =
+        prepared_pre_delivery_rejection_repair(&history, "thread", &pending)
+            .expect("prepared rejection repair")
+    else {
+        panic!("expected prepared rejection");
+    };
+    let output = output_to_append.expect("missing failed output");
+    assert!(remote_rejection_output_matches(
+        &output,
+        &pending,
+        &rejection.receipt_output_text
+    ));
+    let mut with_output = history;
+    with_output.push(output);
+    let PreparedPreDeliveryRejectionRepair::Ready { output_to_append } =
+        prepared_pre_delivery_rejection_repair(&with_output, "thread", &pending)
+            .expect("idempotent prepared rejection repair")
+    else {
+        panic!("expected prepared rejection");
+    };
+    assert!(output_to_append.is_none());
+    let commits = missing_background_session_commits(&with_output)
+        .expect("rejection commit after recovered output");
+    assert_eq!(commits.len(), 1);
+    assert_eq!(
+        commits[0].receipt_kind,
+        RemoteExecutionReceiptKind::RejectedBeforeDelivery
+    );
+    let mut committed_history = with_output;
+    committed_history.push(RolloutItem::RemoteExecutionSessionCommitted(
+        commits[0].clone(),
+    ));
+    let PreparedPreDeliveryRejectionRepair::Ready { output_to_append } =
+        prepared_pre_delivery_rejection_repair(&committed_history, "thread", &pending)
+            .expect("committed rejection repair remains idempotent")
+    else {
+        panic!("expected committed prepared rejection");
+    };
+    assert!(output_to_append.is_none());
 }
 
 #[test]
@@ -668,6 +909,9 @@ fn terminal_background_commit_retires_the_session_index() {
             _ => unreachable!(),
         })
         .expect("prepared digest"),
+        rejection_reason: None,
+        rejection_write_id: None,
+        rejection_input_sha256: None,
         terminal_acknowledgement_token: Some("terminal-token".to_string()),
         terminal_output_digest: Some(remote_receipt_bytes_digest(b"terminal")),
         terminal_status: Some(RemoteExecutionTerminalStatus::Exited(0)),
@@ -954,6 +1198,9 @@ fn committed_delivery_unknown_write_round_trip_is_restart_idempotent() {
         receipt_output_digest: delivery.receipt_output_digest.clone(),
         prepared_receipt_digest: prepared_remote_receipt_digest(&delivery)
             .expect("prepared digest"),
+        rejection_reason: delivery.rejection_reason.clone(),
+        rejection_write_id: delivery.rejection_write_id.clone(),
+        rejection_input_sha256: delivery.rejection_input_sha256.clone(),
         terminal_acknowledgement_token: delivery.terminal_acknowledgement_token.clone(),
         terminal_output_digest: delivery.terminal_output_digest.clone(),
         terminal_status: delivery.terminal_status.clone(),

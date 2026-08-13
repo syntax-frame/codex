@@ -58,6 +58,8 @@ use crate::unified_exec::process::OutputBuffer;
 use crate::unified_exec::process::OutputHandles;
 use crate::unified_exec::process::SpawnLifecycleHandle;
 use crate::unified_exec::process::UnifiedExecProcess;
+use codex_exec_server::ProcessSignalOutcome;
+use codex_exec_server::ProcessSignalRejectionReason;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::error::CodexErr;
@@ -1012,14 +1014,14 @@ impl UnifiedExecProcessManager {
                     // stdin write-ID protocol. Persist the side-effect intent
                     // first so a crash after signal delivery is classified as
                     // delivery-unknown and never replays a second signal.
-                    if process.detaches_on_drop() {
+                    let durable_interaction = if process.detaches_on_drop() {
                         let interaction = request.interaction_event.as_ref().ok_or_else(|| {
                             UnifiedExecError::create_process(format!(
                                 "durable remote session {process_id} requires interrupt intent \
                                  context"
                             ))
                         })?;
-                        interaction
+                        let write_id = interaction
                             .session
                             .persist_remote_execution_write_intent(
                                 process_id,
@@ -1029,8 +1031,36 @@ impl UnifiedExecProcessManager {
                             )
                             .await
                             .map_err(|error| UnifiedExecError::create_process(error.to_string()))?;
+                        Some((interaction, write_id))
+                    } else {
+                        None
+                    };
+                    match process.interrupt().await? {
+                        ProcessSignalOutcome::Accepted => {}
+                        ProcessSignalOutcome::RejectedBeforeDelivery(
+                            ProcessSignalRejectionReason::OwnershipMismatch,
+                        ) => {
+                            let error = UnifiedExecError::RemoteInterruptRejectedBeforeDelivery;
+                            if let Some((interaction, write_id)) = durable_interaction {
+                                let output = format!("write_stdin failed: {error}");
+                                interaction
+                                    .session
+                                    .persist_remote_interrupt_rejected_before_delivery(
+                                        process_id,
+                                        interaction.receipt_turn_id,
+                                        interaction.call_id,
+                                        &write_id,
+                                        request.input,
+                                        &output,
+                                    )
+                                    .await
+                                    .map_err(|persist_error| {
+                                        UnifiedExecError::create_process(persist_error.to_string())
+                                    })?;
+                            }
+                            return Err(error);
+                        }
                     }
-                    process.interrupt().await?;
                 } else {
                     return Err(UnifiedExecError::StdinClosed);
                 }

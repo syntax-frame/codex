@@ -294,6 +294,21 @@ pub enum ProcessSignal {
     Interrupt,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProcessSignalRejectionReason {
+    OwnershipMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "reason", rename_all = "camelCase")]
+#[derive(Default)]
+pub enum ProcessSignalOutcome {
+    #[default]
+    Accepted,
+    RejectedBeforeDelivery(ProcessSignalRejectionReason),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalParams {
@@ -303,7 +318,13 @@ pub struct SignalParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SignalResponse {}
+pub struct SignalResponse {
+    /// Older exec servers returned an empty object after accepting a signal.
+    /// Preserve that wire compatibility while newer servers provide an
+    /// explicit pre-delivery rejection outcome.
+    #[serde(default)]
+    pub outcome: ProcessSignalOutcome,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -761,7 +782,10 @@ mod tests {
     use super::FsReadFileParams;
     use super::HttpRequestParams;
     use super::ProcessId;
+    use super::ProcessSignalOutcome;
+    use super::ProcessSignalRejectionReason;
     use super::ShellInfo;
+    use super::SignalResponse;
     use codex_file_system::FileSystemSandboxContext;
     use codex_network_proxy::ManagedNetworkSandboxContext;
     use codex_network_proxy::NetworkProxyAuditMetadata;
@@ -785,6 +809,7 @@ mod tests {
                 .expect("cwd URI");
         let params = ExecParams {
             process_id: ProcessId::from("managed-network"),
+            execution_identity: None,
             argv: vec!["true".to_string()],
             cwd,
             env_policy: None,
@@ -843,6 +868,29 @@ mod tests {
         let legacy_serialized =
             serde_json::to_value(&legacy).expect("serialize exec params without proxy launch");
         assert!(legacy_serialized.get("networkProxy").is_none());
+    }
+
+    #[test]
+    fn signal_response_accepts_legacy_success_and_round_trips_typed_rejection() {
+        assert_eq!(
+            serde_json::from_value::<SignalResponse>(serde_json::json!({}))
+                .expect("legacy signal response"),
+            SignalResponse {
+                outcome: ProcessSignalOutcome::Accepted,
+            }
+        );
+        let rejection = SignalResponse {
+            outcome: ProcessSignalOutcome::RejectedBeforeDelivery(
+                ProcessSignalRejectionReason::OwnershipMismatch,
+            ),
+        };
+        assert_eq!(
+            serde_json::from_value::<SignalResponse>(
+                serde_json::to_value(&rejection).expect("serialize typed rejection")
+            )
+            .expect("deserialize typed rejection"),
+            rejection
+        );
     }
 
     #[test]

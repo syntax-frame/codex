@@ -14,6 +14,8 @@ pub(crate) enum UnifiedExecError {
     UnknownProcessId { process_id: i32 },
     #[error("failed to write to stdin")]
     WriteToStdin,
+    #[error("remote interrupt rejected before delivery: process ownership changed")]
+    RemoteInterruptRejectedBeforeDelivery,
     #[error(
         "stdin is closed for this session; rerun exec_command with tty=true to keep stdin open"
     )]

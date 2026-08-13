@@ -293,8 +293,11 @@ impl ExecProcess for BlockingTerminateExecProcess {
         Box::pin(BlockingTerminateExecProcess::write(self))
     }
 
-    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+    fn signal(
+        &self,
+        _signal: ProcessSignal,
+    ) -> ExecProcessFuture<'_, codex_exec_server::ProcessSignalOutcome> {
+        Box::pin(async { Ok(codex_exec_server::ProcessSignalOutcome::Accepted) })
     }
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {

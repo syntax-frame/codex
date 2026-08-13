@@ -226,6 +226,37 @@ impl EnvironmentManager {
         }
     }
 
+    /// Builds a test manager around an injected backend.
+    ///
+    /// This is feature-gated because it deliberately bypasses transport
+    /// construction so downstream crates can exercise restart behavior
+    /// without a live SSH or WebSocket server.
+    #[cfg(feature = "test-support")]
+    pub fn with_exec_backend_for_tests(
+        environment_id: impl Into<String>,
+        exec_backend: Arc<dyn ExecBackend>,
+        durable_remote_exec_recovery: bool,
+    ) -> Self {
+        let environment_id = environment_id.into();
+        let environment = Arc::new(Environment {
+            remote_client: None,
+            ready_info: None,
+            startup_task: Arc::new(Mutex::new(None)),
+            exec_backend,
+            filesystem: Arc::new(LocalFileSystem::unsandboxed()),
+            http_client: Arc::new(ReqwestHttpClient),
+            local_runtime_paths: None,
+            force_backend_exec: true,
+            durable_remote_exec_recovery,
+        });
+        Self {
+            default_environment: Some(environment_id.clone()),
+            environments: RwLock::new(HashMap::from([(environment_id, environment)])),
+            local_environment: None,
+            local_runtime_paths: None,
+        }
+    }
+
     /// Builds a manager with no configured execution environments.
     pub fn without_environments() -> Self {
         Self {

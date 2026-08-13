@@ -42,6 +42,7 @@ use crate::protocol::ExecOutputStream;
 use crate::protocol::ExecParams;
 use crate::protocol::ProcessOutputChunk;
 use crate::protocol::ProcessSignal;
+use crate::protocol::ProcessSignalOutcome;
 use crate::protocol::ReadResponse;
 use crate::protocol::WriteResponse;
 use crate::protocol::WriteStatus;
@@ -498,7 +499,7 @@ enum ChannelCommand {
     },
     Signal {
         signal: Sig,
-        ack: oneshot::Sender<Result<(), String>>,
+        ack: oneshot::Sender<Result<ProcessSignalOutcome, String>>,
     },
     Terminate {
         ack: oneshot::Sender<Result<(), String>>,
@@ -630,7 +631,7 @@ impl ExecProcessImpl for SshProcess {
         }
     }
 
-    async fn signal(&self, signal: ProcessSignal) -> Result<(), ExecServerError> {
+    async fn signal(&self, signal: ProcessSignal) -> Result<ProcessSignalOutcome, ExecServerError> {
         let sig = match signal {
             ProcessSignal::Interrupt => Sig::INT,
         };
@@ -645,7 +646,7 @@ impl ExecProcessImpl for SshProcess {
                 ExecServerError::Protocol("ssh signal: channel pump unavailable".to_string())
             })?;
         match tokio::time::timeout(SSH_SIGNAL_ACK_TIMEOUT, ack_rx).await {
-            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Ok(outcome))) => Ok(outcome),
             Ok(Ok(Err(error))) => Err(ExecServerError::Protocol(format!("ssh signal: {error}"))),
             Ok(Err(_)) => Err(ExecServerError::Protocol(
                 "ssh signal acknowledgement channel closed".to_string(),
@@ -701,7 +702,7 @@ trait ExecProcessImpl: Send + Sync {
         chunk: Vec<u8>,
         write_id: Option<String>,
     ) -> Result<WriteResponse, ExecServerError>;
-    async fn signal(&self, signal: ProcessSignal) -> Result<(), ExecServerError>;
+    async fn signal(&self, signal: ProcessSignal) -> Result<ProcessSignalOutcome, ExecServerError>;
     async fn terminate(&self) -> Result<(), ExecServerError>;
 }
 
@@ -739,7 +740,7 @@ impl ExecProcess for SshProcess {
         Box::pin(ExecProcessImpl::write_with_id(self, chunk, Some(write_id)))
     }
 
-    fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+    fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ProcessSignalOutcome> {
         Box::pin(ExecProcessImpl::signal(self, signal))
     }
 

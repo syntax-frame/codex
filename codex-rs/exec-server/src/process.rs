@@ -17,6 +17,7 @@ use crate::protocol::ExecParams;
 use crate::protocol::ExecutionIdentity;
 use crate::protocol::ProcessOutputChunk;
 use crate::protocol::ProcessSignal;
+use crate::protocol::ProcessSignalOutcome;
 use crate::protocol::ReadResponse;
 use crate::protocol::WriteResponse;
 use crate::protocol::WriteStatus;
@@ -578,8 +579,8 @@ impl ExecProcess for RecoveredTerminalExecProcess {
         })))
     }
 
-    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
-        Box::pin(std::future::ready(Ok(())))
+    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ProcessSignalOutcome> {
+        Box::pin(std::future::ready(Ok(ProcessSignalOutcome::Accepted)))
     }
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {
@@ -620,7 +621,7 @@ pub trait ExecProcess: Send + Sync {
         self.write(chunk)
     }
 
-    fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>;
+    fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ProcessSignalOutcome>;
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()>;
 }

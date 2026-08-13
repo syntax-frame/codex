@@ -12,6 +12,8 @@ use super::RETAINED_OUTPUT_BYTES_PER_PROCESS;
 use super::SharedState;
 use super::SshProcess;
 use crate::ProcessId;
+use crate::ProcessSignalOutcome;
+use crate::ProcessSignalRejectionReason;
 use crate::process::ExecProcessEventLog;
 use crate::protocol::ProcessSignal;
 
@@ -45,12 +47,42 @@ async fn signal_waits_for_remote_acknowledgement() {
         panic!("expected acknowledged signal");
     };
     assert!(!signalling.is_finished());
-    ack.send(Ok(())).expect("deliver acknowledgement");
+    ack.send(Ok(ProcessSignalOutcome::Accepted))
+        .expect("deliver acknowledgement");
 
-    signalling
-        .await
-        .expect("signal task")
-        .expect("acknowledged signal");
+    assert_eq!(
+        signalling
+            .await
+            .expect("signal task")
+            .expect("acknowledged signal"),
+        ProcessSignalOutcome::Accepted
+    );
+}
+
+#[tokio::test]
+async fn signal_preserves_typed_pre_delivery_rejection() {
+    let (process, mut commands) = process_with_command_pump();
+    let signalling = tokio::spawn(async move {
+        ExecProcessImpl::signal(process.as_ref(), ProcessSignal::Interrupt).await
+    });
+
+    let Some(ChannelCommand::Signal { ack, .. }) = commands.recv().await else {
+        panic!("expected acknowledged signal");
+    };
+    ack.send(Ok(ProcessSignalOutcome::RejectedBeforeDelivery(
+        ProcessSignalRejectionReason::OwnershipMismatch,
+    )))
+    .expect("deliver rejection");
+
+    assert_eq!(
+        signalling
+            .await
+            .expect("signal task")
+            .expect("typed rejection"),
+        ProcessSignalOutcome::RejectedBeforeDelivery(
+            ProcessSignalRejectionReason::OwnershipMismatch
+        )
+    );
 }
 
 #[tokio::test]

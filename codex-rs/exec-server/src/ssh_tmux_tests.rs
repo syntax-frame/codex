@@ -8,6 +8,7 @@ use super::TmuxProcessDescriptor;
 use super::acknowledgement_command;
 use super::acknowledgement_release_command;
 use super::exact_reconciliation_command;
+use super::interrupt_outcome_from_control_result;
 use super::parse_monitor_exit_classification;
 use super::parse_recovered_executions;
 use super::stable_identifier;
@@ -17,6 +18,8 @@ use crate::GenerationSelection;
 use crate::IncompleteExecution;
 use crate::PreparedExecution;
 use crate::ProcessId;
+use crate::ProcessSignalOutcome;
+use crate::ProcessSignalRejectionReason;
 use crate::ReconciliationRequest;
 use crate::RecoveredExecution;
 use crate::RecoveredExecutionAcknowledgement;
@@ -2278,6 +2281,175 @@ fn ownership_guard_is_scoped_to_agentapp_metadata() {
     assert!(guard.contains("AGENTAPP_TMUX_OWNERSHIP_MISMATCH"));
 }
 
+#[test]
+fn interrupt_rejection_is_typed_only_for_exact_pre_delivery_marker() {
+    assert_eq!(
+        interrupt_outcome_from_control_result(80, b"AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH\n",)
+            .expect("typed rejection"),
+        ProcessSignalOutcome::RejectedBeforeDelivery(
+            ProcessSignalRejectionReason::OwnershipMismatch
+        )
+    );
+    assert_eq!(
+        interrupt_outcome_from_control_result(0, b"").expect("accepted signal"),
+        ProcessSignalOutcome::Accepted
+    );
+    assert!(
+        interrupt_outcome_from_control_result(
+            80,
+            b"prefix AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH suffix\n",
+        )
+        .is_err()
+    );
+    assert!(
+        interrupt_outcome_from_control_result(
+            80,
+            b"AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH\nunexpected trailing output\n",
+        )
+        .is_err()
+    );
+    assert!(
+        interrupt_outcome_from_control_result(79, b"AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH\n",)
+            .is_err()
+    );
+    assert!(
+        interrupt_outcome_from_control_result(79, b"AGENTAPP_TMUX_TRANSITION_CHANGED\n").is_err()
+    );
+}
+
+#[test]
+fn interrupt_command_rechecks_authority_before_its_only_signal_operation() {
+    let descriptor = TmuxProcessDescriptor::new(
+        "agent",
+        "1720000000000-controller",
+        &exec_params("process", "sleep 30"),
+    );
+    let command = descriptor.interrupt_command();
+    assert_eq!(command.matches("tmux send-keys").count(), 1);
+    let send = command.find("tmux send-keys").expect("signal operation");
+    for required in [
+        "rechecked_identity",
+        "rechecked_pgid",
+        "require_interrupt_claim",
+        "AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH",
+    ] {
+        assert!(
+            command.find(required).is_some_and(|index| index < send),
+            "{required} must precede signal delivery"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupt_second_identity_mismatch_is_rejected_before_signal_and_releases_claim() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let home = tempfile::tempdir().expect("temp home");
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin");
+    let tmux = bin.join("tmux");
+    fs::write(
+        &tmux,
+        concat!(
+            "#!/bin/sh\n",
+            "case \"$1\" in\n",
+            "  display-message)\n",
+            "    count=$(cat \"$HOME/tmux-display-count\" 2>/dev/null || printf 0)\n",
+            "    count=$((count + 1))\n",
+            "    printf '%s\\n' \"$count\" > \"$HOME/tmux-display-count\"\n",
+            "    if [ \"$count\" -eq 1 ]; then\n",
+            "      printf '%%fixture:%s\\n' \"$FAKE_PANE_PID\"\n",
+            "    else\n",
+            "      printf '%%changed:%s\\n' \"$FAKE_PANE_PID\"\n",
+            "    fi\n",
+            "    ;;\n",
+            "  send-keys)\n",
+            "    : > \"$HOME/tmux-send-keys-called\"\n",
+            "    ;;\n",
+            "  *) exit 64 ;;\n",
+            "esac\n",
+        ),
+    )
+    .expect("fake tmux");
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+
+    let mut target = Command::new("/bin/sleep");
+    target.arg("30").process_group(0);
+    let mut target = target.spawn().expect("spawn target process group");
+    let pane_pid = target.id();
+    let pgid_output = Command::new("/bin/ps")
+        .args(["-o", "pgid=", "-p", &pane_pid.to_string()])
+        .output()
+        .expect("read target process group");
+    let pane_pgid = String::from_utf8(pgid_output.stdout)
+        .expect("utf8 process group")
+        .trim()
+        .to_string();
+    assert_eq!(pane_pgid, pane_pid.to_string());
+
+    let descriptor =
+        TmuxProcessDescriptor::new("agent", "1:controller", &exec_params("process", "sleep 30"));
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&descriptor.agent_id)
+        .join(&descriptor.process_id);
+    fs::create_dir_all(&root).expect("descriptor root");
+    let process_identity = format!("{pane_pid}:{pane_pgid}");
+    for (name, value) in [
+        ("owner", "agentapp-tmux-v2"),
+        ("controller", descriptor.controller_id.as_str()),
+        ("digest", descriptor.command_digest.as_str()),
+        ("process-identity", process_identity.as_str()),
+        ("window", descriptor.window_name.as_str()),
+        ("state", "running"),
+    ] {
+        fs::write(root.join(name), value).expect("descriptor field");
+    }
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(descriptor.interrupt_command())
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .env("FAKE_PANE_PID", pane_pid.to_string())
+        .output()
+        .expect("run interrupt command");
+    let _ = target.kill();
+    let _ = target.wait();
+
+    assert_eq!(output.status.code(), Some(80));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("utf8 stderr"),
+        "AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH\n"
+    );
+    assert!(!home.path().join("tmux-send-keys-called").exists());
+    assert!(!root.join("transition-claim").exists());
+    assert_eq!(
+        fs::read_dir(&root)
+            .expect("descriptor entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".transition-candidate."))
+            })
+            .count(),
+        0
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn generated_remote_shell_is_syntactically_valid() {
@@ -2307,6 +2479,7 @@ fn generated_remote_shell_is_syntactically_valid() {
         descriptor.process_script(&params),
         descriptor.watchdog_script(),
         descriptor.monitor_command(1),
+        descriptor.interrupt_command(),
         descriptor.ownership_guard(),
         exact_reconciliation_command("agent", &reconciliation),
         acknowledgement_command("agent", &acknowledgement),

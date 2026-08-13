@@ -102,6 +102,7 @@ use crate::protocol::InitializeParams;
 use crate::protocol::InitializeResponse;
 use crate::protocol::ProcessOutputChunk;
 use crate::protocol::ProcessSignal;
+use crate::protocol::ProcessSignalOutcome;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
 use crate::protocol::SignalParams;
@@ -722,8 +723,8 @@ impl ExecServerClient {
         &self,
         process_id: &ProcessId,
         signal: ProcessSignal,
-    ) -> Result<(), ExecServerError> {
-        let _response: SignalResponse = self
+    ) -> Result<ProcessSignalOutcome, ExecServerError> {
+        let response: SignalResponse = self
             .call(
                 EXEC_SIGNAL_METHOD,
                 &SignalParams {
@@ -732,7 +733,7 @@ impl ExecServerClient {
                 },
             )
             .await?;
-        Ok(())
+        Ok(response.outcome)
     }
 
     pub async fn terminate(
@@ -1324,7 +1325,10 @@ impl Session {
         }
     }
 
-    pub(crate) async fn signal(&self, signal: ProcessSignal) -> Result<(), ExecServerError> {
+    pub(crate) async fn signal(
+        &self,
+        signal: ProcessSignal,
+    ) -> Result<ProcessSignalOutcome, ExecServerError> {
         self.client.signal(&self.process_id, signal).await
     }
 

@@ -6,6 +6,7 @@ use codex_exec_server::ExecProcessFuture;
 use codex_exec_server::ExecServerError;
 use codex_exec_server::ProcessId;
 use codex_exec_server::ProcessSignal;
+use codex_exec_server::ProcessSignalOutcome;
 use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
@@ -93,8 +94,8 @@ impl ExecProcess for MockExecProcess {
         })
     }
 
-    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ProcessSignalOutcome> {
+        Box::pin(async { Ok(ProcessSignalOutcome::Accepted) })
     }
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()> {

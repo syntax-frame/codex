@@ -10,6 +10,9 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 arc-swap = { workspace = true }
 async-trait = "0.1"

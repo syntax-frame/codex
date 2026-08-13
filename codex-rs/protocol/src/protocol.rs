@@ -3331,7 +3331,14 @@ pub enum RemoteExecutionReceiptKind {
     InitialExec,
     EmptyPoll,
     NonemptyWrite,
+    RejectedBeforeDelivery,
     DeliveryUnknownWrite,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteExecutionRejectionReason {
+    InterruptOwnershipMismatch,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
@@ -3369,6 +3376,16 @@ pub struct RemoteExecutionSessionPrepared {
     /// Exact model-visible FunctionCallOutput text used for deterministic
     /// recovery of an unmatched receipt.
     pub receipt_output_text: String,
+    /// Typed authority for a backend rejection that occurred before its
+    /// signal-delivery operation. Present only for `RejectedBeforeDelivery`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<RemoteExecutionRejectionReason>,
+    /// Exact durable write identity rejected before delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_write_id: Option<String>,
+    /// SHA-256 binding the rejection to the persisted write request and call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_input_sha256: Option<String>,
     /// Backend-issued, idempotent authority for retiring the exact remote
     /// descriptor after the terminal receipt and its commit are durable.
     /// Required exactly when `terminal_candidate` is true.
@@ -3402,6 +3419,16 @@ pub struct RemoteExecutionSessionCommitted {
     /// SHA-256 of the complete serialized Prepared receipt, binding adoption
     /// and rendering metadata as well as the output digest.
     pub prepared_receipt_digest: String,
+    /// Typed pre-effect rejection authority copied from the Prepared receipt.
+    /// Present only for `RejectedBeforeDelivery`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<RemoteExecutionRejectionReason>,
+    /// Exact durable write identity copied from the Prepared receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_write_id: Option<String>,
+    /// Input digest copied from the Prepared receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_input_sha256: Option<String>,
     /// Exact backend retirement authority copied from the Prepared receipt.
     /// Required exactly when `terminal` is true.
     pub terminal_acknowledgement_token: Option<String>,

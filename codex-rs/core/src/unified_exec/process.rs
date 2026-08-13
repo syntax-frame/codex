@@ -17,6 +17,7 @@ use crate::exec::is_likely_sandbox_denied;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEvent;
 use codex_exec_server::ProcessSignal as ExecServerProcessSignal;
+use codex_exec_server::ProcessSignalOutcome;
 use codex_exec_server::ReadResponse as ExecReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteStatus;
@@ -286,11 +287,14 @@ impl UnifiedExecProcess {
         Ok(())
     }
 
-    pub(super) async fn interrupt(&self) -> Result<(), UnifiedExecError> {
+    pub(super) async fn interrupt(&self) -> Result<ProcessSignalOutcome, UnifiedExecError> {
         match &self.process_handle {
-            ProcessHandle::Local(process_handle) => process_handle
-                .signal(PtyProcessSignal::Interrupt)
-                .map_err(|err| UnifiedExecError::process_failed(err.to_string())),
+            ProcessHandle::Local(process_handle) => {
+                process_handle
+                    .signal(PtyProcessSignal::Interrupt)
+                    .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
+                Ok(ProcessSignalOutcome::Accepted)
+            }
             ProcessHandle::ExecServer(process_handle) => process_handle
                 .signal(ExecServerProcessSignal::Interrupt)
                 .await
