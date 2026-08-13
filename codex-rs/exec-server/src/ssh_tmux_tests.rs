@@ -227,7 +227,8 @@ fn bootstrap_compare_and_attach_is_exact_and_generation_fenced() {
     assert!(command.contains("AGENTAPP_TMUX_EXECUTION_STATE_UNKNOWN"));
     assert!(command.contains("AGENTAPP_TMUX_STALE_CONTROLLER"));
     assert!(!command.contains(".lifecycle-lock"));
-    assert!(command.contains("mkdir \"$root\" 2>/dev/null"));
+    assert!(command.contains("mkdir \"$staging\""));
+    assert!(command.contains("mv -n \"$staging\" \"$root\""));
     assert!(command.contains("AGENTAPP_TMUX_DESCRIPTOR_CAS_CONFLICT"));
     assert!(command.contains("lease-generation"));
     assert!(command.contains("controller-$candidate_controller"));
@@ -249,8 +250,273 @@ fn bootstrap_uses_exact_descriptor_cas_without_a_global_remote_lock() {
     assert!(!command.contains(".lifecycle-lock"));
     assert!(!command.contains("release_lock"));
     assert!(!command.contains("kill -0 \"$owner_pid\""));
-    assert!(command.contains("if ! mkdir \"$root\" 2>/dev/null"));
+    assert!(command.contains("staging=\"$agent_root/$staging_name\""));
+    assert!(command.contains("[ -e \"$root\" ] || [ -L \"$root\" ]"));
+    assert!(command.contains("if ! mv -n \"$staging\" \"$root\""));
+    assert!(command.contains("[ -d \"$staging\" ]"));
+    assert!(command.contains("[ -d \"$root/$staging_name\" ]"));
     assert!(command.contains("AGENTAPP_TMUX_DESCRIPTOR_CAS_CONFLICT"));
+}
+
+#[test]
+fn bootstrap_initializes_descriptor_before_atomic_publication() {
+    let params = exec_params("process", "sleep 30");
+    let descriptor = TmuxProcessDescriptor::new("agent", "1720000000000-controller", &params);
+    let command = descriptor.bootstrap_command(&params);
+
+    let stage = command.find("mkdir \"$staging\"").expect("private staging");
+    let final_metadata = command
+        .find("printf 'prepared\\n' > \"$staging/state\"")
+        .expect("prepared state initialization");
+    let publish = command
+        .find("mv -n \"$staging\" \"$root\"")
+        .expect("atomic descriptor publication");
+    assert!(stage < final_metadata);
+    assert!(final_metadata < publish);
+    assert!(!command.contains("> \"$root/owner\""));
+    assert!(!command.contains("> \"$root/identity\""));
+    assert!(!command.contains("> \"$root/digest\""));
+    assert!(!command.contains("> \"$root/window\""));
+    assert!(!command.contains("> \"$root/output\""));
+    assert!(!command.contains("> \"$root/state\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_interruption_before_publication_leaves_retryable_descriptor_path() {
+    use std::fs;
+    use std::process::Command;
+
+    let params = exec_params("process", "sleep 30");
+    let descriptor = TmuxProcessDescriptor::new("agent", "controller", &params);
+    let (home, path) = bootstrap_shell_fixture();
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&descriptor.agent_id)
+        .join(&descriptor.process_id);
+    let cutpoint = "  if [ -e \"$root\" ] || [ -L \"$root\" ]; then";
+    let interrupted_command = descriptor.bootstrap_command(&params).replacen(
+        cutpoint,
+        "  exit 70\n  if [ -e \"$root\" ] || [ -L \"$root\" ]; then",
+        1,
+    );
+    let interrupted = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(interrupted_command)
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .output()
+        .expect("interrupt bootstrap before publication");
+    assert_eq!(interrupted.status.code(), Some(70));
+    assert!(!root.exists());
+
+    let published_command = descriptor.bootstrap_command(&params).replacen(
+        "  owns_staging=0\n  trap - EXIT HUP INT TERM\n",
+        "  owns_staging=0\n  trap - EXIT HUP INT TERM\n  exit 0\n",
+        1,
+    );
+    let published = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(published_command)
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .output()
+        .expect("retry bootstrap publication");
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    assert_eq!(
+        fs::read_dir(&root)
+            .expect("published descriptor")
+            .map(|entry| entry.expect("descriptor entry").file_name())
+            .collect::<std::collections::HashSet<_>>(),
+        [
+            "acknowledgement-token",
+            "attempt-generation",
+            "call-id",
+            "digest",
+            "identity",
+            "output",
+            "owner",
+            "session-id",
+            "state",
+            "thread-id",
+            "tty",
+            "turn-id",
+            "window",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect()
+    );
+    let agent_root = root.parent().expect("agent descriptor root");
+    assert_eq!(
+        fs::read_dir(agent_root)
+            .expect("agent descriptor entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".descriptor-stage-"))
+            })
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_bootstrap_creator_loser_preserves_winner_and_cleans_own_staging() {
+    use std::fs;
+    use std::process::Command;
+
+    let params = exec_params("process", "sleep 30");
+    let first = TmuxProcessDescriptor::new("agent", "controller-a", &params);
+    let second = TmuxProcessDescriptor::new("agent", "controller-b", &params);
+    let (home, path) = bootstrap_shell_fixture();
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&first.agent_id)
+        .join(&first.process_id);
+    let concurrent_command = |descriptor: &TmuxProcessDescriptor| {
+        descriptor
+            .bootstrap_command(&params)
+            .replacen(
+                "  if [ -e \"$root\" ] || [ -L \"$root\" ]; then",
+                "  printf '%s\\n' \"$controller\" >> \"$HOME/bootstrap-ready\"\n  while [ \"$(wc -l < \"$HOME/bootstrap-ready\")\" -lt 2 ]; do :; done\n  if [ -e \"$root\" ] || [ -L \"$root\" ]; then",
+                1,
+            )
+            .replacen(
+                "  owns_staging=0\n  trap - EXIT HUP INT TERM\n",
+                "  owns_staging=0\n  trap - EXIT HUP INT TERM\n  exit 0\n",
+                1,
+            )
+    };
+    let mut first_child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(concurrent_command(&first))
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .spawn()
+        .expect("spawn first bootstrap");
+    let mut second_child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(concurrent_command(&second))
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .spawn()
+        .expect("spawn second bootstrap");
+    let first_status = first_child.wait().expect("wait for first bootstrap");
+    let second_status = second_child.wait().expect("wait for second bootstrap");
+    let mut status_codes = [
+        first_status.code().expect("first exit code"),
+        second_status.code().expect("second exit code"),
+    ];
+    status_codes.sort_unstable();
+    assert_eq!(status_codes, [0, 75]);
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("winner state"),
+        "prepared\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("identity")).expect("winner identity"),
+        format!("{}\n", first.process_id)
+    );
+    assert_eq!(
+        fs::read_dir(root.parent().expect("agent descriptor root"))
+            .expect("agent descriptor entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".descriptor-stage-"))
+            })
+            .count(),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(&root)
+            .expect("winner descriptor entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".descriptor-stage-"))
+            })
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_preserves_non_directory_destination_conflicts() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    let params = exec_params("process", "sleep 30");
+    let descriptor = TmuxProcessDescriptor::new("agent", "controller", &params);
+
+    for destination in ["file", "symlink"] {
+        let (home, path) = bootstrap_shell_fixture();
+        let root = home
+            .path()
+            .join(".agentapp/tmux")
+            .join(&descriptor.agent_id)
+            .join(&descriptor.process_id);
+        fs::create_dir_all(root.parent().expect("agent descriptor root"))
+            .expect("agent descriptor root");
+        if destination == "file" {
+            fs::write(&root, "genuine conflict").expect("conflicting file");
+        } else {
+            symlink("missing-target", &root).expect("conflicting symlink");
+        }
+
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(descriptor.bootstrap_command(&params))
+            .env("HOME", home.path())
+            .env("PATH", &path)
+            .output()
+            .expect("run conflicting bootstrap");
+        assert_eq!(output.status.code(), Some(75));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("AGENTAPP_TMUX_DESCRIPTOR_CAS_CONFLICT")
+        );
+        if destination == "file" {
+            assert_eq!(
+                fs::read_to_string(&root).expect("preserved conflicting file"),
+                "genuine conflict"
+            );
+        } else {
+            assert_eq!(
+                fs::read_link(&root).expect("preserved conflicting symlink"),
+                std::path::Path::new("missing-target")
+            );
+        }
+        assert_eq!(
+            fs::read_dir(root.parent().expect("agent descriptor root"))
+                .expect("agent descriptor entries")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(".descriptor-stage-"))
+                })
+                .count(),
+            0
+        );
+    }
 }
 
 #[test]
@@ -2686,4 +2952,23 @@ fn run_durable_write_command(
         .write_all(input)
         .expect("send durable stdin bytes");
     child.wait_with_output().expect("wait for durable stdin")
+}
+
+#[cfg(unix)]
+fn bootstrap_shell_fixture() -> (tempfile::TempDir, String) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().expect("temp home");
+    let bin = home.path().join("bin");
+    fs::create_dir(&bin).expect("fake bin");
+    let tmux = bin.join("tmux");
+    fs::write(&tmux, "#!/bin/sh\nexit 0\n").expect("fake tmux");
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (home, path)
 }
