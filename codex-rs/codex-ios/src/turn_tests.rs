@@ -807,6 +807,20 @@ fn model_context_resume_errors_are_content_free_stable_classes() {
         model_context_resume_error_reason(&receipt_gap),
         "remote_write_receipt_gap"
     );
+    let restoration = CodexErr::Fatal(
+        "committed background session private did not resolve to one exact descriptor".to_string(),
+    );
+    assert_eq!(
+        model_context_resume_error_reason(&restoration),
+        "remote_session_restoration"
+    );
+    let restoration_message = persistent_model_context_resume_error("thread_resume", &restoration);
+    assert_eq!(
+        restoration_message,
+        "failed to resume persistent model context \
+         [invalid_or_unavailable;stage=thread_resume;reason=remote_session_restoration]"
+    );
+    assert!(!restoration_message.contains("background session private"));
     let public_message = persistent_model_context_resume_error("thread_resume", &receipt_gap);
     assert_eq!(
         public_message,

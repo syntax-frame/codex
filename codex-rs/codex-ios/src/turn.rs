@@ -393,6 +393,15 @@ fn model_context_resume_error_reason(error: &codex_protocol::error::CodexErr) ->
         {
             "remote_write_receipt_gap"
         }
+        codex_protocol::error::CodexErr::Fatal(detail)
+            if detail.contains("committed background session")
+                && (detail.contains("failed to reconcile")
+                    || detail.contains("did not resolve to one exact descriptor")
+                    || detail.contains("conflicts with durable recovery authority")
+                    || detail.contains("is not safely recoverable")) =>
+        {
+            "remote_session_restoration"
+        }
         codex_protocol::error::CodexErr::Fatal(_) => "structural_invariant",
         codex_protocol::error::CodexErr::Io(error)
             if codex_rollout::rollout_read_error(error).is_some() =>

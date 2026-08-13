@@ -256,6 +256,7 @@ fn bootstrap_uses_exact_descriptor_cas_without_a_global_remote_lock() {
     assert!(command.contains("[ -d \"$staging\" ]"));
     assert!(command.contains("[ -d \"$root/$staging_name\" ]"));
     assert!(command.contains("AGENTAPP_TMUX_DESCRIPTOR_CAS_CONFLICT"));
+    assert!(command.contains("AGENTAPP_TMUX_DESCRIPTOR_PUBLISH_FAILED"));
 }
 
 #[test]
@@ -355,6 +356,53 @@ fn bootstrap_interruption_before_publication_leaves_retryable_descriptor_path() 
     let agent_root = root.parent().expect("agent descriptor root");
     assert_eq!(
         fs::read_dir(agent_root)
+            .expect("agent descriptor entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".descriptor-stage-"))
+            })
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_metadata_write_failure_is_not_reported_as_a_cas_collision() {
+    use std::process::Command;
+
+    let params = exec_params("process", "sleep 30");
+    let descriptor = TmuxProcessDescriptor::new("agent", "controller", &params);
+    let (home, path) = bootstrap_shell_fixture();
+    let root = home
+        .path()
+        .join(".agentapp/tmux")
+        .join(&descriptor.agent_id)
+        .join(&descriptor.process_id);
+    let command = descriptor.bootstrap_command(&params).replacen(
+        "  : > \"$staging/output\" || descriptor_publish_failed\n",
+        "  false || descriptor_publish_failed\n",
+        1,
+    );
+    let failed = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .output()
+        .expect("inject descriptor metadata publication failure");
+
+    assert_eq!(failed.status.code(), Some(74));
+    assert_eq!(
+        String::from_utf8(failed.stderr).expect("utf8 stderr"),
+        "AGENTAPP_TMUX_DESCRIPTOR_PUBLISH_FAILED\n"
+    );
+    assert!(!root.exists());
+    assert_eq!(
+        std::fs::read_dir(root.parent().expect("agent descriptor root"))
             .expect("agent descriptor entries")
             .filter_map(Result::ok)
             .filter(|entry| {
