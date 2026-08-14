@@ -1351,6 +1351,36 @@ fn pending_nonempty_write_replay_preserves_persisted_polling_parameters() {
 }
 
 #[test]
+fn receiptless_write_recovery_reuses_exact_persisted_failure_output() {
+    let pending = PendingWriteInteraction {
+        call_id: "stdin-receipt-gap".to_string(),
+        turn_id: "stdin-turn".to_string(),
+        session_id: 41,
+        input_is_empty: false,
+        pre_send_intent_required: true,
+        pre_send_intent_persisted: true,
+        protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+    };
+    let text = "write_stdin failed: failed to persist remote output receipt";
+    let output = persisted_rollout_item(&background_output_for_turn_with_text(
+        &pending.turn_id,
+        &pending.call_id,
+        text,
+    ));
+
+    assert_eq!(
+        existing_receiptless_write_failure_output(&[output], &pending)
+            .expect("recognized receiptless write failure"),
+        Some(text.to_string())
+    );
+    assert_eq!(
+        existing_receiptless_write_failure_output(&[], &pending)
+            .expect("missing output remains appendable"),
+        None
+    );
+}
+
+#[test]
 fn remote_write_request_accepts_both_valid_commit_marker_topologies() {
     assert!(remote_write_request_order_is_valid(0, 1, 2, Some(3)));
     assert!(remote_write_request_order_is_valid(0, 1, 2, None));

@@ -259,6 +259,74 @@ fn prepared_remote_receipt_digest(
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+fn retroactive_delivery_unknown_output_is_valid(
+    history: &[RolloutItem],
+    prepared_index: usize,
+    prepared: &RemoteExecutionSessionPrepared,
+    output_index: usize,
+    output_text: &str,
+    output_success: Option<bool>,
+) -> bool {
+    if prepared.receipt_kind != RemoteExecutionReceiptKind::DeliveryUnknownWrite
+        || output_index >= prepared_index
+        || output_success == Some(true)
+        || !output_text.starts_with("write_stdin failed: ")
+        || output_text != prepared.receipt_output_text
+        || remote_receipt_output_digest(output_text) != prepared.receipt_output_digest
+    {
+        return false;
+    }
+    let requests = history[..output_index]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            RolloutItem::RemoteExecutionWriteRequest(request)
+                if request.thread_id == prepared.thread_id
+                    && request.receipt_turn_id == prepared.receipt_turn_id
+                    && request.receipt_call_id == prepared.receipt_call_id =>
+            {
+                Some((index, request))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let intents = history[..output_index]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            RolloutItem::RemoteExecutionWriteIntent(intent)
+                if intent.thread_id == prepared.thread_id
+                    && intent.receipt_turn_id == prepared.receipt_turn_id
+                    && intent.receipt_call_id == prepared.receipt_call_id =>
+            {
+                Some((index, intent))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let ([(request_index, request)], [(intent_index, intent)]) =
+        (requests.as_slice(), intents.as_slice())
+    else {
+        return false;
+    };
+    request_index < intent_index
+        && request.exec_turn_id == prepared.exec_turn_id
+        && request.exec_call_id == prepared.exec_call_id
+        && request.attempt_generation == prepared.attempt_generation
+        && request.session_id == prepared.session_id
+        && request.command_digest == prepared.command_digest
+        && request.committed_output_cursor == prepared.range_start
+        && request.input_len > 0
+        && intent.exec_turn_id == request.exec_turn_id
+        && intent.exec_call_id == request.exec_call_id
+        && intent.attempt_generation == request.attempt_generation
+        && intent.session_id == request.session_id
+        && intent.command_digest == request.command_digest
+        && intent.committed_output_cursor == request.committed_output_cursor
+        && intent.input_sha256 == request.input_sha256
+        && intent.input_len == request.input_len
+}
+
 #[cfg(test)]
 pub(crate) fn prepared_remote_receipt_digest_for_tests(
     prepared: &RemoteExecutionSessionPrepared,
@@ -387,14 +455,26 @@ fn missing_background_session_commits(
                 ))
                 .map(Vec::as_slice)
                 .unwrap_or_default();
+            let output_is_ordered = output_indices.len() == 1
+                && ((output_indices[0].0 > *prepared_index
+                    && output_indices[0].0 < *commit_index
+                    && remote_receipt_output_success_matches(
+                        &prepared.receipt_kind,
+                        output_indices[0].2,
+                    ))
+                    || (output_indices[0].0 < *prepared_index
+                        && *prepared_index < *commit_index
+                        && retroactive_delivery_unknown_output_is_valid(
+                            history,
+                            *prepared_index,
+                            prepared,
+                            output_indices[0].0,
+                            &output_indices[0].1,
+                            output_indices[0].2,
+                        )));
             if output_indices.len() != 1
-                || output_indices[0].0 <= *prepared_index
-                || output_indices[0].0 >= *commit_index
+                || !output_is_ordered
                 || output_indices[0].1 != prepared.receipt_output_text
-                || !remote_receipt_output_success_matches(
-                    &prepared.receipt_kind,
-                    output_indices[0].2,
-                )
                 || prepared.session_id != *session_id
                 || prepared.exec_turn_id != commit.exec_turn_id
                 || prepared.exec_call_id != commit.exec_call_id
@@ -495,10 +575,23 @@ fn missing_background_session_commits(
         if output_indices.is_empty() {
             continue;
         }
+        let output_is_ordered = output_indices.len() == 1
+            && ((output_indices[0].0 > *prepared_index
+                && remote_receipt_output_success_matches(
+                    &prepared.receipt_kind,
+                    output_indices[0].2,
+                ))
+                || retroactive_delivery_unknown_output_is_valid(
+                    history,
+                    *prepared_index,
+                    prepared,
+                    output_indices[0].0,
+                    &output_indices[0].1,
+                    output_indices[0].2,
+                ));
         if output_indices.len() != 1
-            || output_indices[0].0 <= *prepared_index
+            || !output_is_ordered
             || output_indices[0].1 != prepared.receipt_output_text
-            || !remote_receipt_output_success_matches(&prepared.receipt_kind, output_indices[0].2)
             || remote_receipt_output_digest(&output_indices[0].1) != prepared.receipt_output_digest
         {
             return Err(CodexErr::Fatal(format!(
@@ -1382,6 +1475,64 @@ fn remote_poll_output_matches(
             .as_ref()
             .and_then(|metadata| metadata.turn_id.as_deref())
             == Some(pending.turn_id.as_str())
+}
+
+fn existing_receiptless_write_failure_output(
+    history: &[RolloutItem],
+    pending: &codex_exec_server::PendingWriteInteraction,
+) -> CodexResult<Option<String>> {
+    let matching_outputs = history
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(
+                output @ ResponseItem::FunctionCallOutput {
+                    call_id,
+                    output: payload,
+                    ..
+                },
+            ) if call_id == &pending.call_id => Some((output, payload)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match matching_outputs.as_slice() {
+        [] => Ok(None),
+        [(output, payload)]
+            if output.turn_id() == Some(pending.turn_id.as_str())
+                && payload
+                    .body
+                    .to_text()
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with("write_stdin failed: "))
+                && payload.success != Some(true) =>
+        {
+            Ok(payload.body.to_text())
+        }
+        _ => Err(CodexErr::Fatal(format!(
+            "pending nonempty write {} has a duplicate or unrecognized durable output",
+            pending.call_id
+        ))),
+    }
+}
+
+fn receiptless_write_failure_output_matches(
+    item: &RolloutItem,
+    pending: &codex_exec_server::PendingWriteInteraction,
+    text: &str,
+) -> bool {
+    let RolloutItem::ResponseItem(
+        output @ ResponseItem::FunctionCallOutput {
+            call_id,
+            output: payload,
+            ..
+        },
+    ) = item
+    else {
+        return false;
+    };
+    call_id == &pending.call_id
+        && output.turn_id() == Some(pending.turn_id.as_str())
+        && payload.body.to_text().as_deref() == Some(text)
+        && payload.success != Some(true)
 }
 
 fn remote_rejection_output_matches(
@@ -3637,6 +3788,9 @@ impl Session {
         )? {
             return Ok(());
         }
+        let existing_failure_output =
+            existing_receiptless_write_failure_output(&history.items, pending)?;
+        let reuses_existing_failure_output = existing_failure_output.is_some();
         let (committed, prepared) = latest_committed_background_session(
             &history.items,
             &self.thread_id.to_string(),
@@ -3817,8 +3971,8 @@ impl Session {
                     .to_string()
             }
         };
-        let receipt_output_text =
-            format!("{terminal}\nOutput:\n{}", String::from_utf8_lossy(suffix));
+        let receipt_output_text = existing_failure_output
+            .unwrap_or_else(|| format!("{terminal}\nOutput:\n{}", String::from_utf8_lossy(suffix)));
         self.persist_remote_execution_delivery_unknown_prepared(
             pending.session_id,
             &pending.turn_id,
@@ -3850,10 +4004,13 @@ impl Session {
                 )
             })
             .collect::<Vec<_>>();
-        if matching_outputs
-            .iter()
-            .any(|item| !remote_poll_output_matches(item, pending, &receipt_output_text))
-        {
+        if matching_outputs.iter().any(|item| {
+            if reuses_existing_failure_output {
+                !receiptless_write_failure_output_matches(item, pending, &receipt_output_text)
+            } else {
+                !remote_poll_output_matches(item, pending, &receipt_output_text)
+            }
+        }) {
             return Err(CodexErr::Fatal(format!(
                 "pending nonempty write {} has conflicting durable output",
                 pending.call_id

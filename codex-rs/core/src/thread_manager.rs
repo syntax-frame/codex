@@ -877,7 +877,7 @@ impl ThreadManager {
                 bool,
             ),
         >::new();
-        let mut outputs = HashSet::new();
+        let mut outputs = HashMap::<String, (usize, Option<String>, Option<String>)>::new();
         let mut marker_state = HashMap::<String, Option<(usize, bool, bool)>>::new();
         let mut launch_intents =
             HashMap::<(String, String, u32), RemoteExecutionLaunchIntent>::new();
@@ -885,6 +885,7 @@ impl ThreadManager {
             HashMap::<(String, String), (usize, RemoteExecutionWriteRequest)>::new();
         let mut write_intents =
             HashMap::<(String, String), (usize, RemoteExecutionWriteIntent)>::new();
+        let mut prepared_write_receipts = HashSet::<(String, String)>::new();
         let mut session_commits = Vec::new();
         let mut last_turn_id = None;
         for (rollout_index, item) in history.iter().enumerate() {
@@ -933,7 +934,7 @@ impl ThreadManager {
                                 && *protocol_evidence == RemoteExecutionProtocolEvidence::V2Proven
                         },
                     );
-                    if !call_precedes_intent || outputs.contains(&intent.call_id) {
+                    if !call_precedes_intent || outputs.contains_key(&intent.call_id) {
                         return Err(CodexErr::Fatal(format!(
                             "remote execution launch intent for call {} is early, late, or misordered",
                             intent.call_id
@@ -948,6 +949,19 @@ impl ThreadManager {
                 }
                 RolloutItem::RemoteExecutionSessionCommitted(committed) => {
                     session_commits.push((rollout_index, committed.clone()));
+                }
+                RolloutItem::RemoteExecutionSessionPrepared(prepared)
+                    if matches!(
+                        prepared.receipt_kind,
+                        codex_protocol::protocol::RemoteExecutionReceiptKind::NonemptyWrite
+                            | codex_protocol::protocol::RemoteExecutionReceiptKind::RejectedBeforeDelivery
+                            | codex_protocol::protocol::RemoteExecutionReceiptKind::DeliveryUnknownWrite
+                    ) =>
+                {
+                    prepared_write_receipts.insert((
+                        prepared.receipt_turn_id.clone(),
+                        prepared.receipt_call_id.clone(),
+                    ));
                 }
                 RolloutItem::RemoteExecutionWriteRequest(request) => {
                     if request.thread_id != thread_id
@@ -1019,7 +1033,7 @@ impl ThreadManager {
                         });
                     if matching_call_index.is_none()
                         || !committed_matches
-                        || outputs.contains(&request.receipt_call_id)
+                        || outputs.contains_key(&request.receipt_call_id)
                     {
                         return Err(CodexErr::Fatal(format!(
                             "remote stdin replay request for call {} is early, late, or conflicts with durable session authority",
@@ -1123,7 +1137,7 @@ impl ThreadManager {
                     if matching_call_index.is_none()
                         || !committed_matches
                         || !request_matches
-                        || outputs.contains(&intent.receipt_call_id)
+                        || outputs.contains_key(&intent.receipt_call_id)
                     {
                         return Err(CodexErr::Fatal(format!(
                             "remote stdin intent for call {} is early, late, or conflicts with durable session authority",
@@ -1245,8 +1259,22 @@ impl ThreadManager {
                         )));
                     }
                 }
-                RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { call_id, .. }) => {
-                    if !outputs.insert(call_id.clone()) {
+                RolloutItem::ResponseItem(output @ ResponseItem::FunctionCallOutput {
+                    call_id,
+                    output: payload,
+                    ..
+                }) => {
+                    if outputs
+                        .insert(
+                            call_id.clone(),
+                            (
+                                rollout_index,
+                                output.turn_id().map(str::to_owned),
+                                payload.body.to_text(),
+                            ),
+                        )
+                        .is_some()
+                    {
                         return Err(CodexErr::Fatal(format!(
                             "duplicate function output id {call_id}"
                         )));
@@ -1257,7 +1285,7 @@ impl ThreadManager {
         }
         let unmatched = calls
             .iter()
-            .filter(|(call_id, _)| !outputs.contains(*call_id))
+            .filter(|(call_id, _)| !outputs.contains_key(*call_id))
             .collect::<Vec<_>>();
         let unmatched_turns = unmatched
             .iter()
@@ -1350,6 +1378,40 @@ impl ThreadManager {
                 },
             )
             .collect::<Vec<_>>();
+        pending_writes.extend(calls.iter().filter_map(
+            |(call_id, (_, turn_id, interaction, protocol_evidence, pre_send_intent_required))| {
+                let (session_id, input_is_empty, _, _, _, _) = interaction.as_ref()?;
+                if *input_is_empty
+                    || *protocol_evidence != RemoteExecutionProtocolEvidence::V2Proven
+                    || !*pre_send_intent_required
+                    || prepared_write_receipts.contains(&(turn_id.clone(), call_id.clone()))
+                {
+                    return None;
+                }
+                let (intent_index, _) = write_intents.get(&(turn_id.clone(), call_id.clone()))?;
+                let (output_index, output_turn_id, output_text) = outputs.get(call_id)?;
+                if intent_index >= output_index
+                    || output_turn_id.as_deref() != Some(turn_id.as_str())
+                    || !output_text
+                        .as_deref()
+                        .is_some_and(|text| text.starts_with("write_stdin failed: "))
+                {
+                    return None;
+                }
+                Some((
+                    *output_index,
+                    codex_exec_server::PendingWriteInteraction {
+                        call_id: call_id.clone(),
+                        turn_id: turn_id.clone(),
+                        session_id: *session_id,
+                        input_is_empty: false,
+                        pre_send_intent_required: true,
+                        pre_send_intent_persisted: true,
+                        protocol_evidence: *protocol_evidence,
+                    },
+                ))
+            },
+        ));
         pending_writes.sort_by_key(|(rollout_index, _)| *rollout_index);
         let pending_writes = pending_writes
             .into_iter()

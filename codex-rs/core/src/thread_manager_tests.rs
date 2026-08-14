@@ -88,10 +88,14 @@ fn scanner_call(name: &str, call_id: &str, turn_id: &str, arguments: &str) -> Ro
 }
 
 fn scanner_output(call_id: &str, turn_id: &str) -> RolloutItem {
+    scanner_output_with_text(call_id, turn_id, "done")
+}
+
+fn scanner_output_with_text(call_id: &str, turn_id: &str, text: &str) -> RolloutItem {
     let mut item = ResponseItem::FunctionCallOutput {
         id: None,
         call_id: call_id.to_string(),
-        output: FunctionCallOutputPayload::from_text("done".to_string()),
+        output: FunctionCallOutputPayload::from_text(text.to_string()),
         internal_chat_message_metadata_passthrough: None,
     };
     item.set_turn_id_if_missing(turn_id);
@@ -539,6 +543,111 @@ fn scanner_never_classifies_a_persisted_remote_interrupt_as_proven_unsent() {
     );
 }
 
+#[test]
+fn scanner_recovers_receiptless_failed_write_even_after_later_plan_tools() {
+    let input = "continue\n";
+    let history = vec![
+        scanner_committed_session("thread", 42, "command-digest", 17),
+        scanner_marker("thread", "work-turn", 2),
+        scanner_call(
+            "write_stdin",
+            "write-call",
+            "work-turn",
+            r#"{"session_id":42,"chars":"continue\n","max_output_tokens":2000}"#,
+        ),
+        {
+            let mut request = scanner_write_request(
+                "thread",
+                "work-turn",
+                "write-call",
+                42,
+                "command-digest",
+                17,
+                input,
+            );
+            let RolloutItem::RemoteExecutionWriteRequest(metadata) = &mut request else {
+                unreachable!();
+            };
+            metadata.max_output_tokens = Some(2_000);
+            request
+        },
+        scanner_write_intent(
+            "thread",
+            "work-turn",
+            "write-call",
+            42,
+            "command-digest",
+            17,
+            input,
+        ),
+        scanner_output_with_text(
+            "write-call",
+            "work-turn",
+            "write_stdin failed: failed to persist remote output receipt",
+        ),
+        scanner_call("update_plan", "plan-call", "work-turn", "{}"),
+        scanner_output("plan-call", "work-turn"),
+        scanner_call("get_plan", "get-plan-call", "work-turn", "{}"),
+        scanner_output("get-plan-call", "work-turn"),
+    ];
+
+    let request =
+        ThreadManager::scan_active_remote_calls("thread".to_string(), &history).expect("scan");
+
+    assert_eq!(
+        request.pending_writes,
+        vec![codex_exec_server::PendingWriteInteraction {
+            call_id: "write-call".to_string(),
+            turn_id: "work-turn".to_string(),
+            session_id: 42,
+            input_is_empty: false,
+            pre_send_intent_required: true,
+            pre_send_intent_persisted: true,
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }]
+    );
+    assert!(request.incomplete_executions.is_empty());
+}
+
+#[test]
+fn scanner_does_not_reclassify_arbitrary_completed_write_output() {
+    let input = "continue\n";
+    let mut history = vec![
+        scanner_committed_session("thread", 42, "command-digest", 17),
+        scanner_marker("thread", "work-turn", 2),
+        scanner_call(
+            "write_stdin",
+            "write-call",
+            "work-turn",
+            r#"{"session_id":42,"chars":"continue\n"}"#,
+        ),
+        scanner_write_request(
+            "thread",
+            "work-turn",
+            "write-call",
+            42,
+            "command-digest",
+            17,
+            input,
+        ),
+        scanner_write_intent(
+            "thread",
+            "work-turn",
+            "write-call",
+            42,
+            "command-digest",
+            17,
+            input,
+        ),
+    ];
+    history.push(scanner_output("write-call", "work-turn"));
+
+    let request =
+        ThreadManager::scan_active_remote_calls("thread".to_string(), &history).expect("scan");
+
+    assert!(request.pending_writes.is_empty());
+}
+
 struct ResumeRepairBackend {
     reconcile_calls: Arc<AtomicUsize>,
     start_calls: Arc<AtomicUsize>,
@@ -847,6 +956,242 @@ fn resume_repair_committed_empty_poll(
         RolloutItem::ResponseItem(output),
         RolloutItem::RemoteExecutionSessionCommitted(committed),
     ]
+}
+
+#[tokio::test]
+async fn receiptless_write_error_is_sealed_without_replaying_stdin() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.experimental_thread_store = ThreadStoreConfig::InMemory {
+        id: format!("receiptless-write-resume-{}", uuid::Uuid::new_v4()),
+    };
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let reconcile_calls = Arc::new(AtomicUsize::new(0));
+    let start_calls = Arc::new(AtomicUsize::new(0));
+    let adopt_calls = Arc::new(AtomicUsize::new(0));
+    let write_calls = Arc::new(AtomicUsize::new(0));
+    let signal_calls = Arc::new(AtomicUsize::new(0));
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
+    let backend = Arc::new(ResumeRepairBackend {
+        reconcile_calls: Arc::clone(&reconcile_calls),
+        start_calls: Arc::clone(&start_calls),
+        adopt_calls: Arc::clone(&adopt_calls),
+        write_calls: Arc::clone(&write_calls),
+        signal_calls: Arc::clone(&signal_calls),
+        terminate_calls: Arc::clone(&terminate_calls),
+    });
+    let environment_id = "resume-fixture";
+    let environment_manager = Arc::new(
+        codex_exec_server::EnvironmentManager::with_exec_backend_for_tests(
+            environment_id,
+            backend,
+            /*durable_remote_exec_recovery*/ true,
+        ),
+    );
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let thread_store = thread_store_from_config(&config, /*state_db*/ None);
+    let in_memory_store = thread_store
+        .as_any()
+        .downcast_ref::<InMemoryThreadStore>()
+        .expect("configured in-memory store");
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        build_models_manager(&config, auth_manager.clone()),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        environment_manager,
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        Arc::clone(&thread_store),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+
+    let source = manager
+        .start_thread(config.clone())
+        .await
+        .expect("create source thread");
+    source
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown source thread");
+    let _ = manager.remove_thread(&source.thread_id).await;
+    let calls_before_resume = in_memory_store.calls().await;
+    let thread_id = source.thread_id;
+    let thread_id_text = thread_id.to_string();
+    let (initial_prepared, initial_output, initial_commit) =
+        resume_repair_initial_receipt(&thread_id_text, environment_id);
+    let input = "continue\n";
+    let failed_text = "write_stdin failed: failed to persist remote output receipt";
+    let mut request = scanner_write_request(
+        &thread_id_text,
+        "work-turn",
+        "write-call",
+        42,
+        "command-digest",
+        17,
+        input,
+    );
+    let RolloutItem::RemoteExecutionWriteRequest(request_metadata) = &mut request else {
+        unreachable!();
+    };
+    request_metadata.max_output_tokens = Some(2_000);
+    let plan = RolloutItem::EventMsg(EventMsg::PlanUpdate(UpdatePlanArgs {
+        explanation: Some("plan activity after remote write".to_string()),
+        plan: vec![PlanItemArg {
+            step: "continue after the short write".to_string(),
+            status: StepStatus::InProgress,
+        }],
+    }));
+    let history = vec![
+        scanner_marker(&thread_id_text, "exec-turn", 2),
+        scanner_call(
+            "exec_command",
+            "exec-call",
+            "exec-turn",
+            &serde_json::json!({
+                "cmd": "sleep 30",
+                "tty": true,
+                "yield_time_ms": 1_000,
+            })
+            .to_string(),
+        ),
+        RolloutItem::RemoteExecutionLaunchIntent(RemoteExecutionLaunchIntent {
+            thread_id: thread_id_text.clone(),
+            turn_id: "exec-turn".to_string(),
+            call_id: "exec-call".to_string(),
+            attempt_generation: 0,
+            command_digest: "command-digest".to_string(),
+            original_session_id: 42,
+            tty: true,
+        }),
+        initial_prepared,
+        initial_output,
+        RolloutItem::RemoteExecutionSessionCommitted(initial_commit),
+        scanner_marker(&thread_id_text, "work-turn", 2),
+        scanner_call(
+            "write_stdin",
+            "write-call",
+            "work-turn",
+            r#"{"session_id":42,"chars":"continue\n","max_output_tokens":2000}"#,
+        ),
+        request,
+        scanner_write_intent(
+            &thread_id_text,
+            "work-turn",
+            "write-call",
+            42,
+            "command-digest",
+            17,
+            input,
+        ),
+        scanner_output_with_text("write-call", "work-turn", failed_text),
+        plan.clone(),
+    ];
+    let pending = ThreadManager::scan_active_remote_calls(thread_id_text.clone(), &history)
+        .expect("scan receiptless write history");
+    assert!(pending.incomplete_executions.is_empty());
+    assert_eq!(pending.pending_writes.len(), 1);
+
+    let rollout_path = config.codex_home.join("rollouts/receiptless-write.jsonl");
+    let resumed = manager
+        .resume_thread_with_history_and_tools(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: thread_id,
+                history: Arc::new(history),
+                rollout_path: Some(rollout_path.to_path_buf()),
+            }),
+            auth_manager,
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+            Vec::new(),
+            pending.pending_writes,
+        )
+        .await
+        .expect("receiptless write history should resume");
+
+    let repaired = resumed
+        .thread
+        .load_history(/*include_archived*/ true)
+        .await
+        .expect("load repaired history");
+    assert_eq!(
+        repaired
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+                        call_id,
+                        output,
+                        ..
+                    }) if call_id == "write-call"
+                        && output.body.to_text().as_deref() == Some(failed_text)
+                )
+            })
+            .count(),
+        1,
+        "the already-visible tool error must be reused rather than duplicated"
+    );
+    assert_eq!(
+        repaired
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    RolloutItem::RemoteExecutionSessionCommitted(committed)
+                        if committed.receipt_call_id == "write-call"
+                            && committed.receipt_kind
+                                == RemoteExecutionReceiptKind::DeliveryUnknownWrite
+                            && committed.terminal
+                )
+            })
+            .count(),
+        1
+    );
+    let plan_json = serde_json::to_value(&plan).expect("serialize plan");
+    assert_eq!(
+        repaired
+            .items
+            .iter()
+            .filter(|item| serde_json::to_value(item).expect("serialize item") == plan_json)
+            .count(),
+        1,
+        "later plan activity must survive repair"
+    );
+    let rescanned = ThreadManager::scan_active_remote_calls(thread_id_text, &repaired.items)
+        .expect("repaired history should scan");
+    assert!(rescanned.pending_writes.is_empty());
+    assert_eq!(
+        reconcile_calls.load(Ordering::SeqCst),
+        3,
+        "repair proves terminal state twice, then normal restoration confirms it once"
+    );
+    assert_eq!(start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(adopt_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(write_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(signal_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 0);
+    let calls = in_memory_store.calls().await;
+    assert_eq!(calls.resume_thread - calls_before_resume.resume_thread, 1);
+
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown resumed thread");
 }
 
 #[tokio::test]
