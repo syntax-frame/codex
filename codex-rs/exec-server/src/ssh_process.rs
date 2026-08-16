@@ -415,12 +415,6 @@ fn build_remote_command(params: &ExecParams) -> String {
     build_remote_command_with_argv_prefix(params, "exec ")
 }
 
-/// Variant used inside the tmux wrapper, which must regain control after the
-/// child exits so it can persist the exit status for reconnection.
-fn build_remote_command_body(params: &ExecParams) -> String {
-    build_remote_command_with_argv_prefix(params, "")
-}
-
 fn build_remote_command_with_argv_prefix(params: &ExecParams, argv_prefix: &str) -> String {
     let mut prefix = String::new();
 

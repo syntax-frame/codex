@@ -11,6 +11,7 @@ use super::exact_reconciliation_command;
 use super::interrupt_outcome_from_control_result;
 use super::parse_monitor_exit_classification;
 use super::parse_recovered_executions;
+use super::shell_quote;
 use super::stable_identifier;
 use super::validate_reconciliation_request;
 use crate::AdoptionRequest;
@@ -98,7 +99,7 @@ fn prepared_execution_digest_matches_the_exact_launched_params() {
 }
 
 #[test]
-fn adoption_is_exact_fenced_and_never_enters_launch_path() {
+fn adoption_is_exact_fenced_and_only_rolls_forward_a_committed_stale_launch() {
     let request = AdoptionRequest {
         identity: ExecutionIdentity {
             thread_id: "thread".to_string(),
@@ -132,11 +133,14 @@ fn adoption_is_exact_fenced_and_never_enters_launch_path() {
         "agentapp_adopt_authority",
         "agentapp_adopt_live_pane",
         "next_generation=$((observed_generation + 1))",
+        "roll_forward_launch=1",
+        "supervisor-ready",
+        "payload-go",
+        "resume_stale_termination",
     ] {
         assert!(command.contains(proof), "missing adoption proof: {proof}");
     }
     assert!(!command.contains("adoption-claim"));
-    assert!(!command.contains("printf 'running\\n' > \"$root/state.tmp\""));
     assert!(!command.contains("new-window"));
     assert!(!command.contains("touch \"$root/go\""));
     assert!(!command.contains("command.sh"));
@@ -239,6 +243,63 @@ fn bootstrap_compare_and_attach_is_exact_and_generation_fenced() {
             < command.find("tmux new-window -d -t \"$session:\" -n \"$window\"")
     );
     assert!(!command.contains("tmux kill-session"));
+}
+
+#[test]
+fn bootstrap_protects_the_supervisor_and_pins_native_dead_pane_evidence_before_go() {
+    let params = exec_params("process", "sleep 30");
+    let descriptor = TmuxProcessDescriptor::new("agent", "1720000000000-controller", &params);
+    let bootstrap = descriptor.bootstrap_command(&params);
+    let process = descriptor.process_script(&params);
+    let payload = descriptor.payload_script(&params);
+    let sentinel = descriptor.group_sentinel_script();
+    let supervisor = descriptor.supervisor_start_command();
+    let watchdog = descriptor.watchdog_script();
+
+    let caught_interrupt = supervisor
+        .find("interrupt_seen=1")
+        .expect("caught supervisor interrupt");
+    let go_wait = supervisor.find("while [ ! -f").expect("supervisor go wait");
+    let supervisor_ready = supervisor
+        .find("supervisor-ready")
+        .expect("supervisor readiness");
+    let remain_on_exit = bootstrap
+        .find("remain-on-exit on")
+        .expect("retained dead pane");
+    let native_ids = bootstrap
+        .find("mv \"$root/pane-id.tmp\" \"$root/pane-id\"")
+        .expect("persisted native pane identity");
+    let release_go = bootstrap
+        .find("mv \"$root/go.tmp\" \"$root/go\"")
+        .expect("go release");
+    let release_payload = bootstrap
+        .find("mv \"$root/payload-go.tmp\" \"$root/payload-go\"")
+        .expect("payload release");
+    assert!(caught_interrupt < go_wait);
+    assert!(supervisor_ready < go_wait);
+    assert!(remain_on_exit < native_ids);
+    assert!(native_ids < release_payload);
+    assert!(release_payload < release_go);
+    assert_eq!(
+        bootstrap
+            .matches("mv \"$root/payload-go.tmp\" \"$root/payload-go\"")
+            .count(),
+        1
+    );
+    assert!(bootstrap.contains("pane_count"));
+    assert!(bootstrap.contains("show-options -w -v"));
+    assert!(process.contains("/bin/sh \"$root/payload.sh\""));
+    assert!(payload.contains("payload-identity"));
+    assert!(payload.contains("while [ ! -f \"$root/payload-go\" ]"));
+    assert!(process.contains("sentinel-ready"));
+    assert!(process.contains("sentinel-release"));
+    assert!(sentinel.contains("/bin/kill -KILL -- \"-$expected_pgid\""));
+    assert!(bootstrap.contains("payload-ready"));
+    assert!(bootstrap.contains("AGENTAPP_TMUX_PAYLOAD_RELEASE_MISSING"));
+    assert!(watchdog.contains("pane_dead"));
+    assert!(watchdog.contains("stored_window_id:$stored_pane_id:1"));
+    assert!(watchdog.contains("tmux kill-window -t \"$stored_window_id\""));
+    assert!(!process.contains("COMPLETED_WINDOW_RETENTION_SECONDS"));
 }
 
 #[test]
@@ -763,7 +824,7 @@ fn reconciliation_queries_only_explicit_identity_paths() {
         command
             .matches("windows=$(LC_ALL=C tmux list-windows")
             .count(),
-        4
+        6
     );
     assert!(
         command
@@ -967,7 +1028,7 @@ fn prepared_descriptor_without_go_rolls_back_before_repair() {
             attempt_generation: 0,
             expected_command_digest: Some("expected-digest".to_string()),
             expected_session_id: Some(42),
-            expected_tty: Some(false),
+            expected_tty: Some(true),
             protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
         }],
         pending_writes: Vec::new(),
@@ -1001,12 +1062,13 @@ fn prepared_descriptor_without_go_rolls_back_before_repair() {
         ("call-id", "Y2FsbA=="),
         ("attempt-generation", "0"),
         ("session-id", "42"),
-        ("tty", "0"),
+        ("tty", "1"),
         ("digest", "expected-digest"),
         ("acknowledgement-token", "token"),
         ("window", expected_window.as_str()),
         ("state", "prepared"),
         ("output", ""),
+        ("output-pipe-generation", "1"),
     ] {
         fs::write(root.join(name), value).expect("descriptor field");
     }
@@ -1144,7 +1206,7 @@ fn stale_running_descriptor_with_dead_process_and_missing_window_records_recover
 
 #[cfg(unix)]
 #[test]
-fn stale_running_descriptor_recovers_dead_bootstrap_and_interrupt_claims() {
+fn stale_running_descriptor_recovers_dead_lifecycle_claims() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -1172,6 +1234,12 @@ fn stale_running_descriptor_recovers_dead_bootstrap_and_interrupt_claims() {
         (
             "interrupt",
             "i_2147483645_2147483645",
+            "2147483646:2147483646".to_string(),
+        ),
+        ("recovery", "r_crashed", "2147483646:2147483646".to_string()),
+        (
+            "termination",
+            "t_crashed",
             "2147483646:2147483646".to_string(),
         ),
     ] {
@@ -1221,6 +1289,10 @@ fn stale_running_descriptor_recovers_dead_bootstrap_and_interrupt_claims() {
         fs::write(&candidate, &claim).expect("orphaned transition candidate");
         fs::hard_link(&candidate, root.join("transition-claim"))
             .expect("orphaned transition claim");
+        if claim_kind == "termination" {
+            fs::create_dir(root.join("terminal-claim")).expect("termination claim");
+            fs::write(root.join("terminal-claim/kind"), "terminated\n").expect("termination kind");
+        }
 
         let path = format!(
             "{}:{}",
@@ -1241,7 +1313,14 @@ fn stale_running_descriptor_recovers_dead_bootstrap_and_interrupt_claims() {
         );
         let recovered =
             parse_recovered_executions(&output.stdout).expect("parse reconciliation output");
-        assert_eq!(recovered[0].status, RecoveredExecutionStatus::RecoveryLost);
+        assert_eq!(
+            recovered[0].status,
+            if claim_kind == "termination" {
+                RecoveredExecutionStatus::Terminated
+            } else {
+                RecoveredExecutionStatus::RecoveryLost
+            }
+        );
         assert!(recovered[0].terminal_verified_dead);
         assert!(!root.join("transition-claim").exists());
         assert!(!candidate.exists());
@@ -2300,6 +2379,66 @@ fn acknowledgement_release_rejects_live_roots_and_unexpected_tombstone_contents(
 
 #[cfg(unix)]
 #[test]
+fn acknowledgement_accepts_only_regular_numeric_output_close_receipts() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let token = "0123456789abcdef-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    let (valid_home, valid_root, valid_path) = terminal_acknowledgement_fixture(token);
+    fs::write(valid_root.join("output-closed.7"), []).expect("numeric output receipt");
+    let valid = run_acknowledgement(
+        &valid_home,
+        &valid_path,
+        &terminal_acknowledgement(token.to_string()),
+    );
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert!(!valid_root.exists());
+
+    let (malformed_home, malformed_root, malformed_path) = terminal_acknowledgement_fixture(token);
+    fs::write(malformed_root.join("output-closed.not-a-generation"), [])
+        .expect("malformed output receipt");
+    let malformed = run_acknowledgement(
+        &malformed_home,
+        &malformed_path,
+        &terminal_acknowledgement(token.to_string()),
+    );
+    assert!(!malformed.status.success());
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr)
+            .contains("AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT")
+    );
+    assert!(
+        malformed_root
+            .join("output-closed.not-a-generation")
+            .exists()
+    );
+
+    let (symlink_home, symlink_root, symlink_path) = terminal_acknowledgement_fixture(token);
+    symlink(
+        symlink_root.join("output"),
+        symlink_root.join("output-closed.8"),
+    )
+    .expect("symlink output receipt");
+    let linked = run_acknowledgement(
+        &symlink_home,
+        &symlink_path,
+        &terminal_acknowledgement(token.to_string()),
+    );
+    assert!(!linked.status.success());
+    assert!(
+        String::from_utf8_lossy(&linked.stderr)
+            .contains("AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT")
+    );
+    assert!(symlink_root.join("output-closed.8").is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
 fn acknowledgement_rejects_conflicting_proof_without_consuming_stale_claim() {
     use std::fs;
 
@@ -2450,7 +2589,7 @@ fn acknowledgement_legacy_token_tombstone_is_bound_once_to_the_durable_terminal_
 }
 
 #[test]
-fn watchdog_classifies_expiry_without_destructive_takeover() {
+fn watchdog_classifies_expiry_and_only_retires_proven_terminal_pane_evidence() {
     let params = exec_params("process", "sleep 30");
     let descriptor = TmuxProcessDescriptor::new("agent", "1720000000000-controller", &params);
     let script = descriptor.watchdog_script();
@@ -2462,9 +2601,11 @@ fn watchdog_classifies_expiry_without_destructive_takeover() {
     assert!(script.contains("printf '%s:%s\\n' \"$observed_generation\" \"$observed_controller\""));
     assert!(!script.contains("kill -TERM"));
     assert!(!script.contains("kill -KILL"));
-    assert!(!script.contains("kill-window"));
+    assert!(script.contains("sleep 604800"));
+    assert!(script.contains("stored_window_id:$stored_pane_id:1"));
+    assert!(script.contains("kill-window -t \"$stored_window_id\""));
     assert!(!script.contains("status.tmp"));
-    assert!(!script.contains("terminal-claim"));
+    assert!(!script.contains("terminal-claim/kind.tmp"));
     assert!(!script.contains("release"));
     assert!(!script.contains("controller.tmp"));
     assert!(!script.contains("lease-generation"));
@@ -2480,7 +2621,8 @@ fn watchdog_never_competes_for_terminal_status() {
 
     assert!(process.contains("mkdir \"$root/terminal-claim\""));
     assert!(process.contains("printf 'completed"));
-    assert!(!watchdog.contains("terminal-claim"));
+    assert!(!watchdog.contains("mkdir \"$root/terminal-claim\""));
+    assert!(!watchdog.contains("terminal-claim/kind.tmp"));
     assert!(!watchdog.contains("printf '124"));
     assert!(!watchdog.contains("printf '143"));
 }
@@ -2639,11 +2781,15 @@ fn interrupt_command_rechecks_authority_before_its_only_signal_operation() {
         &exec_params("process", "sleep 30"),
     );
     let command = descriptor.interrupt_command();
-    assert_eq!(command.matches("tmux send-keys").count(), 1);
-    let send = command.find("tmux send-keys").expect("signal operation");
+    assert!(!command.contains("tmux send-keys"));
+    assert_eq!(command.matches("/bin/kill -INT").count(), 1);
+    let send = command.find("/bin/kill -INT").expect("signal operation");
     for required in [
+        "payload-ready",
+        "payload-identity",
         "rechecked_identity",
         "rechecked_pgid",
+        "rechecked_payload_pgid",
         "require_interrupt_claim",
         "AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH",
     ] {
@@ -2654,9 +2800,59 @@ fn interrupt_command_rechecks_authority_before_its_only_signal_operation() {
     }
 }
 
+#[test]
+fn termination_command_fences_controller_ownership_before_signaling() {
+    let descriptor = TmuxProcessDescriptor::new(
+        "agent",
+        "1720000000000-controller",
+        &exec_params("process", "sleep 30"),
+    );
+    let command = descriptor.termination_command();
+    let claim = command
+        .find("ln \"$transition_candidate\" \"$root/transition-claim\"")
+        .expect("termination transition claim");
+    let terminal_claim = command
+        .find("mkdir \"$root/terminal-claim\"")
+        .expect("terminal claim");
+    let signal = command
+        .find("/bin/kill -TERM -- \"-$payload_pgid\"")
+        .expect("first payload signal");
+
+    assert!(claim < terminal_claim);
+    assert!(terminal_claim < signal);
+    assert!(command[..signal].contains("require_termination_claim"));
+    assert!(command[..signal].contains("current_controller"));
+    assert!(command[..signal].contains("AGENTAPP_TMUX_OWNERSHIP_MISMATCH"));
+    assert!(command.contains("termination|t_"));
+    assert!(
+        descriptor
+            .adoption_command()
+            .contains("resume_stale_termination=1")
+    );
+}
+
+#[test]
+fn retained_dead_pane_cleanup_never_signals_recorded_numeric_process_ids() {
+    let descriptor = TmuxProcessDescriptor::new(
+        "agent",
+        "1720000000000-controller",
+        &exec_params("process", "sleep 30"),
+    );
+    let command = descriptor.confirmed_process_group_termination();
+    let dead_arm = command
+        .split("    1)\n")
+        .nth(1)
+        .and_then(|tail| tail.split("    *)").next())
+        .expect("retained dead pane branch");
+
+    assert!(!dead_arm.contains("agentapp_termination_stop_payload"));
+    assert!(!dead_arm.contains("/bin/kill"));
+    assert!(dead_arm.contains("AGENTAPP_TMUX_DEAD_PANE_IDENTITY_UNKNOWN"));
+}
+
 #[cfg(unix)]
 #[test]
-fn interrupt_second_identity_mismatch_is_rejected_before_signal_and_releases_claim() {
+fn interrupt_without_signal_safe_payload_is_rejected_before_delivery() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
@@ -2672,17 +2868,7 @@ fn interrupt_second_identity_mismatch_is_rejected_before_signal_and_releases_cla
             "#!/bin/sh\n",
             "case \"$1\" in\n",
             "  display-message)\n",
-            "    count=$(cat \"$HOME/tmux-display-count\" 2>/dev/null || printf 0)\n",
-            "    count=$((count + 1))\n",
-            "    printf '%s\\n' \"$count\" > \"$HOME/tmux-display-count\"\n",
-            "    if [ \"$count\" -eq 1 ]; then\n",
-            "      printf '%%fixture:%s\\n' \"$FAKE_PANE_PID\"\n",
-            "    else\n",
-            "      printf '%%changed:%s\\n' \"$FAKE_PANE_PID\"\n",
-            "    fi\n",
-            "    ;;\n",
-            "  send-keys)\n",
-            "    : > \"$HOME/tmux-send-keys-called\"\n",
+            "    printf '@1:%%fixture:%s:0\\n' \"$FAKE_PANE_PID\"\n",
             "    ;;\n",
             "  *) exit 64 ;;\n",
             "esac\n",
@@ -2747,7 +2933,6 @@ fn interrupt_second_identity_mismatch_is_rejected_before_signal_and_releases_cla
         String::from_utf8(output.stderr).expect("utf8 stderr"),
         "AGENTAPP_TMUX_INTERRUPT_OWNERSHIP_MISMATCH\n"
     );
-    assert!(!home.path().join("tmux-send-keys-called").exists());
     assert!(!root.join("transition-claim").exists());
     assert_eq!(
         fs::read_dir(&root)
@@ -2761,6 +2946,2049 @@ fn interrupt_second_identity_mismatch_is_rejected_before_signal_and_releases_cla
             })
             .count(),
         0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_interrupt_preserves_the_supervisor_terminal_record() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62489", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "interrupt-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+
+    let interrupt = fixture.run_shell(descriptor.interrupt_command());
+    assert!(
+        interrupt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interrupt.stderr)
+    );
+    assert!(
+        wait_for_file_value(&root.join("status"), "130\n"),
+        "supervisor did not persist the interrupted payload status; status={:?}; state={:?}; pane={}",
+        fs::read_to_string(root.join("status")),
+        fs::read_to_string(root.join("state")),
+        String::from_utf8_lossy(
+            &fixture
+                .tmux(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &descriptor.target(),
+                    "#{window_id}:#{pane_id}:#{pane_pid}:#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}",
+                ])
+                .stdout
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("terminal state"),
+        "completed\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("terminal-claim/kind")).expect("terminal claim"),
+        "completed\n"
+    );
+    assert!(
+        fixture.wait_for_dead_pane(&descriptor),
+        "completed supervisor pane did not reach retained-dead state"
+    );
+    let pane = fixture.tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        &descriptor.target(),
+        "#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}",
+    ]);
+    assert!(
+        pane.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pane.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&pane.stdout)
+            .trim()
+            .starts_with("1:"),
+        "remain-on-exit did not retain terminal pane evidence"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_dash_supervisor_preserves_the_interrupted_payload_status() {
+    if !std::path::Path::new("/bin/dash").is_file() {
+        return;
+    }
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let mut params = exec_params("62494", "sleep 30");
+    params.argv[0] = "/bin/dash".to_string();
+    let mut descriptor = TmuxProcessDescriptor::new(&fixture.agent_key, "dash-controller", &params);
+    fixture.bootstrap_with_shell(&mut descriptor, &params, "/bin/dash");
+    let root = fixture.descriptor_root(&descriptor);
+
+    let interrupt = fixture.run_shell(descriptor.interrupt_command());
+    assert!(
+        interrupt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interrupt.stderr)
+    );
+    assert!(
+        wait_for_file_value(&root.join("status"), "130\n"),
+        "dash supervisor did not persist interrupted payload status"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("state")).expect("terminal state"),
+        "completed\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_pre_go_interrupt_keeps_the_supervisor_alive_until_release() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62492", "sleep 30");
+    let descriptor = TmuxProcessDescriptor::new(&fixture.agent_key, "pre-go-controller", &params);
+    let root = fixture.descriptor_root(&descriptor);
+    fs::create_dir_all(&root).expect("descriptor root");
+    fs::write(
+        root.join("command.sh"),
+        format!(
+            "#!/bin/sh\nprintf 'survived\\n' > {}/pre-go-result\n",
+            shell_quote(&root.to_string_lossy())
+        ),
+    )
+    .expect("pre-go command");
+
+    let session = fixture.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        &descriptor.session_name,
+        "-n",
+        "__agentapp_keeper",
+        "sleep 30",
+    ]);
+    assert!(
+        session.status.success(),
+        "{}",
+        String::from_utf8_lossy(&session.stderr)
+    );
+    let window = fixture.tmux(&[
+        "new-window",
+        "-d",
+        "-t",
+        &format!("{}:", descriptor.session_name),
+        "-n",
+        &descriptor.window_name,
+        &descriptor.supervisor_start_command(),
+    ]);
+    assert!(
+        window.status.success(),
+        "{}",
+        String::from_utf8_lossy(&window.stderr)
+    );
+    let pane = fixture.tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        &descriptor.target(),
+        "#{pane_pid}",
+    ]);
+    assert!(pane.status.success());
+    let pane_pid = String::from_utf8(pane.stdout)
+        .expect("pane pid")
+        .trim()
+        .parse::<u32>()
+        .expect("numeric pane pid");
+    let pgid = fixture.run_shell(format!("ps -o pgid= -p {pane_pid} | tr -d ' '"));
+    assert!(pgid.status.success());
+    let pgid = String::from_utf8(pgid.stdout).expect("pane pgid");
+    let signaled = std::process::Command::new("/bin/kill")
+        .args(["-INT", "--", &format!("-{}", pgid.trim())])
+        .status()
+        .expect("signal supervisor group");
+    assert!(signaled.success());
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let pane_state = fixture.tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        &descriptor.target(),
+        "#{pane_dead}",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&pane_state.stdout).trim(), "0");
+
+    fs::write(root.join("go"), []).expect("release supervisor");
+    assert!(
+        wait_for_file_value(&root.join("pre-go-result"), "survived\n"),
+        "supervisor did not survive the pre-go interrupt"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_bootstrap_retry_cannot_leave_a_running_payload_gated() {
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62496", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "bootstrap-cut-controller", &params);
+    let cutpoint = "  [ -f \"$root/supervisor-ready\" ] || { echo AGENTAPP_TMUX_SUPERVISOR_START_TIMEOUT >&2; exit 80; }\n";
+    let held = descriptor.bootstrap_command(&params).replacen(
+        cutpoint,
+        concat!(
+            "  [ -f \"$root/supervisor-ready\" ] || { echo AGENTAPP_TMUX_SUPERVISOR_START_TIMEOUT >&2; exit 80; }\n",
+            "  : > \"$root/bootstrap-held\"\n",
+            "  while :; do sleep 1; done\n"
+        ),
+        1,
+    );
+    assert_ne!(held, descriptor.bootstrap_command(&params));
+    let mut bootstrap = Command::new("/bin/sh");
+    bootstrap
+        .arg("-c")
+        .arg(held)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut bootstrap = bootstrap.spawn().expect("spawn held bootstrap");
+    let root = fixture.descriptor_root(&descriptor);
+    assert!(
+        wait_for_file_value(&root.join("bootstrap-held"), ""),
+        "bootstrap did not reach its pre-commit cutpoint"
+    );
+    let bootstrap_group = bootstrap.id().to_string();
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{bootstrap_group}")])
+        .status()
+        .expect("kill bootstrap operation group");
+    assert!(killed.success());
+    let _ = bootstrap.wait();
+    assert!(root.join("transition-claim").exists());
+    assert!(!root.join("go").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("prepared state"),
+        "prepared\n"
+    );
+
+    fixture.bootstrap(&mut descriptor, &params);
+    assert!(root.join("payload-go").exists());
+    assert!(root.join("go").exists());
+    assert!(root.join("payload-ready").exists());
+    assert!(root.join("payload-identity").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("running state"),
+        "running\n"
+    );
+    assert!(!root.join("transition-claim").exists());
+
+    let termination = fixture.run_shell(descriptor.termination_command());
+    assert!(
+        termination.status.success(),
+        "{}",
+        String::from_utf8_lossy(&termination.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_bootstrap_retry_recovers_sigkill_immediately_after_claim() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62501", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "bootstrap-claim-controller", &params);
+    let cutpoint = "  release_transition_claim() {";
+    let held = descriptor.bootstrap_command(&params).replacen(
+        cutpoint,
+        concat!(
+            "  : > \"$root/bootstrap-claim-held\"\n",
+            "  while :; do sleep 1; done\n",
+            "  release_transition_claim() {"
+        ),
+        1,
+    );
+    assert_ne!(held, descriptor.bootstrap_command(&params));
+    let mut bootstrap = Command::new("/bin/sh");
+    bootstrap
+        .arg("-c")
+        .arg(held)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut bootstrap = bootstrap.spawn().expect("spawn held bootstrap");
+    let root = fixture.descriptor_root(&descriptor);
+    assert!(
+        wait_for_file_value(&root.join("bootstrap-claim-held"), ""),
+        "bootstrap did not reach the immediate post-claim cutpoint"
+    );
+    let bootstrap_group = bootstrap.id().to_string();
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{bootstrap_group}")])
+            .status()
+            .expect("kill bootstrap operation group")
+            .success()
+    );
+    let _ = bootstrap.wait();
+    assert!(root.join("transition-claim").exists());
+    assert!(!root.join("process-identity").exists());
+    assert!(!root.join("go").exists());
+
+    fixture.bootstrap(&mut descriptor, &params);
+    assert!(root.join("go").exists());
+    assert!(root.join("payload-ready").exists());
+    assert!(!root.join("transition-claim").exists());
+    let termination = fixture.run_shell(descriptor.termination_command());
+    assert!(
+        termination.status.success(),
+        "{}",
+        String::from_utf8_lossy(&termination.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_adoption_rolls_forward_a_sigkill_stale_bootstrap_claim() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62500", "sleep 30");
+    let descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "bootstrap-owner-controller", &params);
+    let cutpoint = "  [ -f \"$root/supervisor-ready\" ] || { echo AGENTAPP_TMUX_SUPERVISOR_START_TIMEOUT >&2; exit 80; }\n";
+    let held = descriptor.bootstrap_command(&params).replacen(
+        cutpoint,
+        concat!(
+            "  [ -f \"$root/supervisor-ready\" ] || { echo AGENTAPP_TMUX_SUPERVISOR_START_TIMEOUT >&2; exit 80; }\n",
+            "  : > \"$root/bootstrap-adoption-held\"\n",
+            "  while :; do sleep 1; done\n"
+        ),
+        1,
+    );
+    assert_ne!(held, descriptor.bootstrap_command(&params));
+    let mut bootstrap = Command::new("/bin/sh");
+    bootstrap
+        .arg("-c")
+        .arg(held)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut bootstrap = bootstrap.spawn().expect("spawn held bootstrap");
+    let root = fixture.descriptor_root(&descriptor);
+    assert!(
+        wait_for_file_value(&root.join("bootstrap-adoption-held"), ""),
+        "bootstrap did not reach its pre-commit cutpoint"
+    );
+    let bootstrap_group = bootstrap.id().to_string();
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{bootstrap_group}")])
+            .status()
+            .expect("kill bootstrap operation group")
+            .success()
+    );
+    let _ = bootstrap.wait();
+    assert!(root.join("transition-claim").exists());
+    assert!(!root.join("go").exists());
+
+    let adoption = AdoptionRequest {
+        identity: params.execution_identity.expect("execution identity"),
+        expected_command_digest: descriptor.command_digest,
+        original_session_id: Some(62500),
+        committed_output_cursor: 0,
+        tty: false,
+    };
+    let mut adopter = TmuxProcessDescriptor::from_adoption(
+        &fixture.agent_key,
+        "replacement-bootstrap-controller",
+        &adoption,
+    );
+    let adopted = fixture.run_shell(adopter.adoption_command());
+    assert!(
+        adopted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&adopted.stderr)
+    );
+    let stdout = String::from_utf8(adopted.stdout).expect("adoption output");
+    adopter.controller_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("AGENTAPP_TMUX_ADOPTED "))
+        .expect("adopted controller")
+        .to_string();
+    assert!(root.join("go").exists());
+    assert!(root.join("payload-go").exists());
+    assert!(root.join("payload-ready").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("state")).expect("running state"),
+        "running\n"
+    );
+    assert!(!root.join("transition-claim").exists());
+
+    let termination = fixture.run_shell(adopter.termination_command());
+    assert!(
+        termination.status.success(),
+        "{}",
+        String::from_utf8_lossy(&termination.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_tty_payload_is_foreground_and_can_read_input() {
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let mut params = exec_params("62493", "IFS= read -r line; printf 'tty:%s\\n' \"$line\"");
+    params.tty = true;
+    let mut descriptor = TmuxProcessDescriptor::new(&fixture.agent_key, "tty-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+
+    let text = fixture.tmux(&["send-keys", "-t", &descriptor.target(), "-l", "--", "hello"]);
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let enter = fixture.tmux(&["send-keys", "-t", &descriptor.target(), "Enter"]);
+    assert!(
+        enter.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enter.stderr)
+    );
+    assert!(
+        wait_for_file_value(&root.join("status"), "0\n"),
+        "TTY payload did not complete; state={:?}; output={:?}; pane={}; processes={}",
+        std::fs::read_to_string(root.join("state")),
+        std::fs::read_to_string(root.join("output")),
+        String::from_utf8_lossy(
+            &fixture
+                .tmux(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &descriptor.target(),
+                    "#{pane_dead}:#{pane_pid}:#{pane_current_command}",
+                ])
+                .stdout
+        ),
+        String::from_utf8_lossy(
+            &fixture
+                .run_shell(
+                    "ps -axo pid=,ppid=,pgid=,tpgid=,state=,command= | grep -E '62493|tty:%s|payload-go|read -r' | grep -v grep"
+                        .to_string()
+                )
+                .stdout
+        )
+    );
+    assert!(
+        wait_for_file_contains(&root.join("output"), "tty:hello"),
+        "TTY payload did not receive foreground input; output={:?}",
+        std::fs::read_to_string(root.join("output"))
+    );
+    let output_closed = current_output_closed_path(&root);
+    assert!(
+        wait_for_file_value(&output_closed, ""),
+        "TTY pipe did not publish its generation-bound durable close barrier"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_monitor_waits_for_delayed_tty_pipe_close_and_tail() {
+    use std::time::Instant;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let mut params = exec_params("62499", "printf 'late-tty-tail\\n'");
+    params.tty = true;
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "tty-drain-controller", &params);
+    let bootstrap = descriptor.bootstrap_command(&params).replacen(
+        "tmux pipe-pane -O -t \"$target\" \"if cat",
+        "tmux pipe-pane -O -t \"$target\" \"sleep 8; if cat",
+        1,
+    );
+    assert_ne!(bootstrap, descriptor.bootstrap_command(&params));
+    let started = fixture.run_shell(bootstrap);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let stdout = String::from_utf8(started.stdout).expect("bootstrap output");
+    descriptor.controller_id = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("AGENTAPP_TMUX_READY ")
+                .and_then(|payload| payload.split_whitespace().nth(1))
+        })
+        .expect("fenced bootstrap controller")
+        .to_string();
+    let root = fixture.descriptor_root(&descriptor);
+    let output_closed = current_output_closed_path(&root);
+    assert!(
+        !output_closed.exists(),
+        "delayed pipe unexpectedly closed before monitor attachment"
+    );
+
+    let attached = Instant::now();
+    let monitor = fixture.run_shell(descriptor.monitor_command(1));
+    assert_eq!(monitor.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&monitor.stdout).contains("late-tty-tail"),
+        "{}",
+        String::from_utf8_lossy(&monitor.stdout)
+    );
+    assert!(
+        attached.elapsed() >= std::time::Duration::from_secs(4),
+        "monitor crossed the terminal boundary before the delayed TTY pipe closed"
+    );
+    assert!(output_closed.exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("status")).expect("terminal status"),
+        "0\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_bootstrap_roll_forward_ignores_a_stale_tty_pipe_close_receipt() {
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let mut params = exec_params("62500", "printf 'generation-tail\\n'");
+    params.tty = true;
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "tty-generation-controller", &params);
+    let payload_release = "  if [ ! -f \"$root/payload-go\" ]; then";
+    let held = descriptor.bootstrap_command(&params).replacen(
+        payload_release,
+        concat!(
+            "  : > \"$root/tty-pipe-held\"\n",
+            "  while :; do sleep 1; done\n",
+            "  if [ ! -f \"$root/payload-go\" ]; then"
+        ),
+        1,
+    );
+    assert_ne!(held, descriptor.bootstrap_command(&params));
+    let mut bootstrap = Command::new("/bin/sh");
+    bootstrap
+        .arg("-c")
+        .arg(held)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut bootstrap = bootstrap.spawn().expect("spawn held TTY bootstrap");
+    let root = fixture.descriptor_root(&descriptor);
+    assert!(
+        wait_for_file_value(&root.join("tty-pipe-held"), ""),
+        "bootstrap did not reach its post-pipe pre-go cutpoint"
+    );
+    let first_generation =
+        fs::read_to_string(root.join("output-pipe-generation")).expect("first generation");
+    let first_generation = first_generation.trim().to_string();
+    let bootstrap_group = bootstrap.id().to_string();
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{bootstrap_group}")])
+        .status()
+        .expect("kill held TTY bootstrap");
+    assert!(killed.success());
+    let _ = bootstrap.wait();
+    assert!(root.join("transition-claim").exists());
+    assert!(!root.join("go").exists());
+
+    let retry = descriptor.bootstrap_command(&params).replacen(
+        "tmux pipe-pane -O -t \"$target\" \"if cat",
+        "tmux pipe-pane -O -t \"$target\" \"sleep 8; if cat",
+        1,
+    );
+    assert_ne!(retry, descriptor.bootstrap_command(&params));
+    let started = fixture.run_shell(retry);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let stdout = String::from_utf8(started.stdout).expect("retry bootstrap output");
+    descriptor.controller_id = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("AGENTAPP_TMUX_READY ")
+                .and_then(|payload| payload.split_whitespace().nth(1))
+        })
+        .expect("retry controller")
+        .to_string();
+    let current_generation =
+        fs::read_to_string(root.join("output-pipe-generation")).expect("current generation");
+    let current_generation = current_generation.trim().to_string();
+    assert_ne!(current_generation, first_generation);
+    assert!(
+        wait_for_file_value(&root.join(format!("output-closed.{first_generation}")), ""),
+        "replaced pipe did not publish its stale generation receipt"
+    );
+    let current_closed = root.join(format!("output-closed.{current_generation}"));
+    assert!(
+        !current_closed.exists(),
+        "stale receipt was mistaken for the current pipe generation"
+    );
+
+    let attached = Instant::now();
+    let monitor = fixture.run_shell(descriptor.monitor_command(1));
+    assert_eq!(monitor.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&monitor.stdout).contains("generation-tail"),
+        "{}",
+        String::from_utf8_lossy(&monitor.stdout)
+    );
+    assert!(
+        attached.elapsed() >= std::time::Duration::from_secs(4),
+        "monitor crossed the terminal boundary using a stale pipe receipt"
+    );
+    assert!(current_closed.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_pre_go_tty_pipe_generation_crash_reconciles_without_a_receipt() {
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let mut params = exec_params("62502", "printf 'must-not-run\\n'");
+    params.tty = true;
+    let descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "tty-pre-go-controller", &params);
+    let generation_cutpoint =
+        "mv \"$root/output-pipe-generation.tmp\" \"$root/output-pipe-generation\"\n";
+    let held = descriptor.bootstrap_command(&params).replacen(
+        generation_cutpoint,
+        concat!(
+            "mv \"$root/output-pipe-generation.tmp\" \"$root/output-pipe-generation\"\n",
+            ": > \"$root/tty-generation-held\"\n",
+            "while :; do sleep 1; done\n"
+        ),
+        1,
+    );
+    assert_ne!(held, descriptor.bootstrap_command(&params));
+    let mut bootstrap = Command::new("/bin/sh");
+    bootstrap
+        .arg("-c")
+        .arg(held)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut bootstrap = bootstrap.spawn().expect("spawn held pre-go TTY bootstrap");
+    let root = fixture.descriptor_root(&descriptor);
+    assert!(
+        wait_for_file_value(&root.join("tty-generation-held"), ""),
+        "bootstrap did not reach the generation-persisted pre-pipe cutpoint"
+    );
+    let generation =
+        fs::read_to_string(root.join("output-pipe-generation")).expect("pipe generation");
+    assert_eq!(generation, "1\n");
+    assert!(!root.join("output-closed.1").exists());
+    assert!(!root.join("go").exists());
+
+    let bootstrap_group = bootstrap.id().to_string();
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{bootstrap_group}")])
+            .status()
+            .expect("kill pre-go TTY bootstrap")
+            .success()
+    );
+    let _ = bootstrap.wait();
+
+    let reconciliation = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "62502".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some(descriptor.command_digest),
+            expected_session_id: Some(62502),
+            expected_tty: Some(true),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let reconciled = fixture.run_shell(exact_reconciliation_command(
+        &fixture.agent_key,
+        &reconciliation,
+    ));
+    assert!(
+        reconciled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reconciled.stderr)
+    );
+    let recovered =
+        parse_recovered_executions(&reconciled.stdout).expect("parse reconciliation output");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].status,
+        RecoveredExecutionStatus::LaunchInterrupted
+    );
+    assert!(recovered[0].terminal_verified_dead);
+    assert_eq!(
+        fs::read_to_string(root.join("status")).expect("launch-interrupted status"),
+        "125\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("launch-interrupted state"),
+        "launch-interrupted\n"
+    );
+    assert!(!root.join("output-closed.1").exists());
+    assert!(!root.join("go").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_reconciliation_waits_for_the_current_tty_pipe_tail() {
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let mut params = exec_params("62501", "printf 'reconciliation-tail\\n'; sleep 30");
+    params.tty = true;
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "tty-reconciliation-controller", &params);
+    let gated_pipe = descriptor.bootstrap_command(&params).replacen(
+        "tmux pipe-pane -O -t \"$target\" \"if cat",
+        "tmux pipe-pane -O -t \"$target\" \"while [ ! -f \\\"$root/pipe-release\\\" ]; do sleep 1; done; if cat",
+        1,
+    );
+    assert_ne!(gated_pipe, descriptor.bootstrap_command(&params));
+    let started = fixture.run_shell(gated_pipe);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let stdout = String::from_utf8(started.stdout).expect("bootstrap output");
+    descriptor.controller_id = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("AGENTAPP_TMUX_READY ")
+                .and_then(|payload| payload.split_whitespace().nth(1))
+        })
+        .expect("fenced bootstrap controller")
+        .to_string();
+    let root = fixture.descriptor_root(&descriptor);
+    let current_closed = current_output_closed_path(&root);
+    assert!(!current_closed.exists());
+
+    let kill_window = "if [ \"$window_exists\" -eq 1 ]; then tmux kill-window -t \"$current_window_id\" 2>/dev/null || true; fi\n";
+    let held_termination = descriptor.termination_command().replacen(
+        kill_window,
+        concat!(
+            "if [ \"$window_exists\" -eq 1 ]; then tmux kill-window -t \"$current_window_id\" 2>/dev/null || true; fi\n",
+            ": > \"$root/termination-after-window-removal\"\n",
+            "while :; do sleep 1; done\n"
+        ),
+        1,
+    );
+    assert_ne!(held_termination, descriptor.termination_command());
+    let mut terminator = Command::new("/bin/sh");
+    terminator
+        .arg("-c")
+        .arg(held_termination)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut terminator = terminator.spawn().expect("spawn held TTY termination");
+    assert!(
+        (0..4).any(|_| { wait_for_file_value(&root.join("termination-after-window-removal"), "") }),
+        "termination did not remove the TTY pane"
+    );
+    let termination_group = terminator.id().to_string();
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{termination_group}")])
+        .status()
+        .expect("kill TTY termination controller");
+    assert!(killed.success());
+    let _ = terminator.wait();
+    assert!(!root.join("status").exists());
+    assert!(!current_closed.exists());
+
+    let reconciliation = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "62501".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some(descriptor.command_digest),
+            expected_session_id: Some(62501),
+            expected_tty: Some(true),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let mut reconciliation_process = Command::new("/bin/sh");
+    reconciliation_process
+        .arg("-c")
+        .arg(exact_reconciliation_command(
+            &fixture.agent_key,
+            &reconciliation,
+        ))
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut reconciliation_process = reconciliation_process
+        .spawn()
+        .expect("spawn TTY reconciliation");
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert!(
+        reconciliation_process
+            .try_wait()
+            .expect("poll reconciliation")
+            .is_none(),
+        "reconciliation crossed the terminal cursor before the TTY pipe closed"
+    );
+    assert!(!root.join("status").exists());
+
+    fs::write(root.join("pipe-release"), []).expect("release delayed pipe");
+    let reconciled = reconciliation_process
+        .wait_with_output()
+        .expect("wait for reconciliation");
+    assert!(
+        reconciled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reconciled.stderr)
+    );
+    let recovered =
+        parse_recovered_executions(&reconciled.stdout).expect("parse recovered execution");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, RecoveredExecutionStatus::Terminated);
+    assert!(
+        String::from_utf8_lossy(&recovered[0].output).contains("reconciliation-tail"),
+        "{:?}",
+        recovered[0].output
+    );
+    assert!(current_closed.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_termination_blocks_adoption_and_rolls_forward_after_controller_loss() {
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62497", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "termination-race-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    let cutpoint = "claimed=0\n";
+    let held = descriptor.termination_command().replacen(
+        cutpoint,
+        concat!(
+            "  : > \"$root/termination-held\"\n",
+            "  while [ ! -f \"$root/termination-release\" ]; do sleep 1; done\n",
+            "claimed=0\n"
+        ),
+        1,
+    );
+    let mut terminator = Command::new("/bin/sh");
+    terminator
+        .arg("-c")
+        .arg(held)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut terminator = terminator.spawn().expect("spawn held termination");
+    assert!(
+        wait_for_file_value(&root.join("termination-held"), ""),
+        "termination did not reach its fenced cutpoint"
+    );
+
+    let identity = params
+        .execution_identity
+        .clone()
+        .expect("execution identity");
+    let adoption = AdoptionRequest {
+        identity,
+        expected_command_digest: descriptor.command_digest.clone(),
+        original_session_id: Some(62497),
+        committed_output_cursor: 0,
+        tty: false,
+    };
+    let adopter = TmuxProcessDescriptor::from_adoption(
+        &fixture.agent_key,
+        "replacement-controller",
+        &adoption,
+    );
+    let blocked = fixture.run_shell(adopter.adoption_command());
+    assert_eq!(blocked.status.code(), Some(79));
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("AGENTAPP_TMUX_ADOPT_BUSY"));
+
+    let operation_group = terminator.id().to_string();
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{operation_group}")])
+        .status()
+        .expect("kill obsolete termination controller");
+    assert!(killed.success());
+    let _ = terminator.wait();
+    assert!(root.join("transition-claim").exists());
+    assert!(!root.join("status").exists());
+
+    let takeover_cutpoint = "if [ \"$resume_stale_termination\" -eq 1 ]; then\n";
+    let held_takeover = adopter.adoption_command().replacen(
+        takeover_cutpoint,
+        concat!(
+            "if [ \"$resume_stale_termination\" -eq 1 ]; then\n",
+            "  : > \"$root/termination-takeover-held\"\n",
+            "  while :; do sleep 1; done\n"
+        ),
+        1,
+    );
+    assert_ne!(held_takeover, adopter.adoption_command());
+    let mut takeover = Command::new("/bin/sh");
+    takeover
+        .arg("-c")
+        .arg(held_takeover)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut takeover = takeover.spawn().expect("spawn held termination takeover");
+    assert!(
+        wait_for_file_value(&root.join("termination-takeover-held"), ""),
+        "adoption did not reach the stale-termination takeover cutpoint"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("terminal-claim/kind")).expect("terminal intent"),
+        "terminated\n"
+    );
+    assert!(
+        root.join("transition-claim").exists(),
+        "stale termination lost its transition claim before replacement"
+    );
+    let takeover_group = takeover.id().to_string();
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{takeover_group}")])
+        .status()
+        .expect("kill stale-termination takeover");
+    assert!(killed.success());
+    let _ = takeover.wait();
+    assert!(
+        root.join("transition-claim").exists(),
+        "SIGKILL at takeover cutpoint left terminal intent claimless"
+    );
+
+    let resumed = fixture.run_shell(adopter.adoption_command());
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&resumed.stdout).contains("AGENTAPP_TMUX_ADOPTED"),
+        "{}",
+        String::from_utf8_lossy(&resumed.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("terminal state"),
+        "terminated\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("status")).expect("terminal status"),
+        "143\n"
+    );
+    assert!(!root.join("transition-claim").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_caught_signal_preserves_normal_termination_ownership() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62505", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "signal-safe-terminator", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    let process_identity =
+        fs::read_to_string(root.join("process-identity")).expect("process identity");
+    let (_, payload_pgid) = process_identity
+        .trim()
+        .split_once(':')
+        .expect("supervisor pid and process group");
+
+    let terminal_intent_cutpoint =
+        "  mv \"$root/terminal-claim/kind.tmp\" \"$root/terminal-claim/kind\"\n";
+    let interrupted_termination = descriptor.termination_command().replacen(
+        terminal_intent_cutpoint,
+        concat!(
+            "  mv \"$root/terminal-claim/kind.tmp\" \"$root/terminal-claim/kind\"\n",
+            "  kill -TERM $$\n"
+        ),
+        1,
+    );
+    assert_ne!(interrupted_termination, descriptor.termination_command());
+
+    let terminated = fixture.run_shell(interrupted_termination);
+    assert!(
+        terminated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&terminated.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("terminal state"),
+        "terminated\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("status")).expect("terminal status"),
+        "143\n"
+    );
+    assert!(!root.join("transition-claim").exists());
+    assert!(
+        wait_for_process_group_death(payload_pgid),
+        "caught TERM abandoned the live payload group"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_caught_signal_preserves_stale_termination_takeover_ownership() {
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62506", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "signal-safe-takeover-owner", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    let process_identity =
+        fs::read_to_string(root.join("process-identity")).expect("process identity");
+    let (_, payload_pgid) = process_identity
+        .trim()
+        .split_once(':')
+        .expect("supervisor pid and process group");
+
+    let held_termination = descriptor.termination_command().replacen(
+        "claimed=0\n",
+        concat!(
+            ": > \"$root/signal-takeover-held\"\n",
+            "while :; do sleep 1; done\n",
+            "claimed=0\n"
+        ),
+        1,
+    );
+    let mut terminator = Command::new("/bin/sh");
+    terminator
+        .arg("-c")
+        .arg(held_termination)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut terminator = terminator.spawn().expect("spawn stale termination owner");
+    assert!(
+        wait_for_file_value(&root.join("signal-takeover-held"), ""),
+        "termination did not publish its stale-claim fixture"
+    );
+    let terminator_group = terminator.id().to_string();
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{terminator_group}")])
+            .status()
+            .expect("kill stale termination owner")
+            .success()
+    );
+    let _ = terminator.wait();
+    fs::create_dir_all(root.join("terminal-claim")).expect("terminal claim directory");
+    fs::write(root.join("terminal-claim/kind"), "terminated\n")
+        .expect("durable termination intent");
+
+    let adoption = AdoptionRequest {
+        identity: params
+            .execution_identity
+            .clone()
+            .expect("execution identity"),
+        expected_command_digest: descriptor.command_digest.clone(),
+        original_session_id: Some(62506),
+        committed_output_cursor: 0,
+        tty: false,
+    };
+    let adopter =
+        TmuxProcessDescriptor::from_adoption(&fixture.agent_key, "signal-safe-takeover", &adoption);
+    let replacement_cutpoint = "  mv \"$transition_publish\" \"$root/transition-claim\"\n";
+    let interrupted_takeover = adopter.adoption_command().replacen(
+        replacement_cutpoint,
+        concat!(
+            "  mv \"$transition_publish\" \"$root/transition-claim\"\n",
+            "  kill -TERM $$\n"
+        ),
+        1,
+    );
+    assert_ne!(interrupted_takeover, adopter.adoption_command());
+
+    let resumed = fixture.run_shell(interrupted_takeover);
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("terminal state"),
+        "terminated\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("status")).expect("terminal status"),
+        "143\n"
+    );
+    assert!(!root.join("transition-claim").exists());
+    assert!(
+        wait_for_process_group_death(payload_pgid),
+        "caught TERM abandoned the payload during takeover"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_stale_termination_takeover_has_exactly_one_adopter() {
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62503", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "termination-owner", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+
+    let held_termination = descriptor.termination_command().replacen(
+        "claimed=0\n",
+        concat!(
+            ": > \"$root/termination-race-held\"\n",
+            "while :; do sleep 1; done\n",
+            "claimed=0\n"
+        ),
+        1,
+    );
+    let mut terminator = Command::new("/bin/sh");
+    terminator
+        .arg("-c")
+        .arg(held_termination)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut terminator = terminator.spawn().expect("spawn held termination");
+    assert!(
+        wait_for_file_value(&root.join("termination-race-held"), ""),
+        "termination did not publish its stale-claim fixture"
+    );
+    let terminator_group = terminator.id().to_string();
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{terminator_group}")])
+            .status()
+            .expect("kill stale termination owner")
+            .success()
+    );
+    let _ = terminator.wait();
+    assert!(root.join("transition-claim").exists());
+    assert!(!root.join("status").exists());
+    fs::create_dir_all(root.join("terminal-claim")).expect("terminal claim directory");
+    fs::write(root.join("terminal-claim/kind"), "terminated\n")
+        .expect("durable termination intent");
+
+    let adoption = AdoptionRequest {
+        identity: params
+            .execution_identity
+            .clone()
+            .expect("execution identity"),
+        expected_command_digest: descriptor.command_digest.clone(),
+        original_session_id: Some(62503),
+        committed_output_cursor: 0,
+        tty: false,
+    };
+    let adopter_a =
+        TmuxProcessDescriptor::from_adoption(&fixture.agent_key, "takeover-a", &adoption);
+    let adopter_b =
+        TmuxProcessDescriptor::from_adoption(&fixture.agent_key, "takeover-b", &adoption);
+    let takeover_cutpoint = "  takeover_arbiter=\"$root/.transition-candidate.takeover.$claim_nonce.$claim_operation_pid\"\n";
+    let command_a = adopter_a.adoption_command().replacen(
+        takeover_cutpoint,
+        concat!(
+            "  : > \"$root/takeover-a-ready\"\n",
+            "  while [ ! -f \"$root/takeover-race-release\" ]; do sleep 1; done\n",
+            "  takeover_arbiter=\"$root/.transition-candidate.takeover.$claim_nonce.$claim_operation_pid\"\n"
+        ),
+        1,
+    );
+    let command_b = adopter_b.adoption_command().replacen(
+        takeover_cutpoint,
+        concat!(
+            "  : > \"$root/takeover-b-ready\"\n",
+            "  while [ ! -f \"$root/takeover-race-release\" ]; do sleep 1; done\n",
+            "  takeover_arbiter=\"$root/.transition-candidate.takeover.$claim_nonce.$claim_operation_pid\"\n"
+        ),
+        1,
+    );
+    assert_ne!(command_a, adopter_a.adoption_command());
+    assert_ne!(command_b, adopter_b.adoption_command());
+
+    let spawn_adopter = |command: String| {
+        let mut child = Command::new("/bin/sh");
+        child
+            .arg("-c")
+            .arg(command)
+            .env("HOME", fixture.home.path())
+            .env("PATH", &fixture.path)
+            .env_remove("TMUX")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        child.spawn().expect("spawn competing termination adopter")
+    };
+    let adopter_a_process = spawn_adopter(command_a);
+    let adopter_b_process = spawn_adopter(command_b);
+    assert!(
+        wait_for_file_value(&root.join("takeover-a-ready"), "")
+            && wait_for_file_value(&root.join("takeover-b-ready"), ""),
+        "both adopters did not reach the pre-publication barrier"
+    );
+    fs::write(root.join("takeover-race-release"), []).expect("release takeover race");
+
+    let output_a = adopter_a_process
+        .wait_with_output()
+        .expect("wait for adopter A");
+    let output_b = adopter_b_process
+        .wait_with_output()
+        .expect("wait for adopter B");
+    let successes = [output_a.status.success(), output_b.status.success()]
+        .into_iter()
+        .filter(|success| *success)
+        .count();
+    assert_eq!(
+        successes,
+        1,
+        "expected one takeover winner; A={:?} stderr={}; B={:?} stderr={}",
+        output_a.status.code(),
+        String::from_utf8_lossy(&output_a.stderr),
+        output_b.status.code(),
+        String::from_utf8_lossy(&output_b.stderr)
+    );
+    let loser = if output_a.status.success() {
+        &output_b
+    } else {
+        &output_a
+    };
+    assert_eq!(
+        loser.status.code(),
+        Some(79),
+        "{}",
+        String::from_utf8_lossy(&loser.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("terminal state"),
+        "terminated\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("status")).expect("terminal status"),
+        "143\n"
+    );
+    assert!(!root.join("transition-claim").exists());
+    assert_eq!(
+        fs::read_dir(&root)
+            .expect("descriptor entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".transition-candidate.takeover."))
+            })
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_stale_termination_takeover_serializes_dead_arbiter_reclamation() {
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62504", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "termination-chain-owner", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    let process_identity =
+        fs::read_to_string(root.join("process-identity")).expect("process identity");
+    let (_, payload_pgid) = process_identity
+        .trim()
+        .split_once(':')
+        .expect("supervisor pid and process group");
+
+    let held_termination = descriptor.termination_command().replacen(
+        "claimed=0\n",
+        concat!(
+            ": > \"$root/termination-chain-held\"\n",
+            "while :; do sleep 1; done\n",
+            "claimed=0\n"
+        ),
+        1,
+    );
+    let mut terminator = Command::new("/bin/sh");
+    terminator
+        .arg("-c")
+        .arg(held_termination)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut terminator = terminator.spawn().expect("spawn held termination");
+    assert!(
+        wait_for_file_value(&root.join("termination-chain-held"), ""),
+        "termination did not publish its stale-claim fixture"
+    );
+    let terminator_group = terminator.id().to_string();
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{terminator_group}")])
+            .status()
+            .expect("kill original termination owner")
+            .success()
+    );
+    let _ = terminator.wait();
+    fs::create_dir_all(root.join("terminal-claim")).expect("terminal claim directory");
+    fs::write(root.join("terminal-claim/kind"), "terminated\n")
+        .expect("durable termination intent");
+
+    let stale_claim =
+        fs::read_to_string(root.join("transition-claim")).expect("stale termination claim");
+    let stale_fields = stale_claim.trim().split('|').collect::<Vec<_>>();
+    assert_eq!(stale_fields.len(), 8, "{stale_claim:?}");
+    assert_eq!(stale_fields[0], "termination");
+    let stale_nonce = stale_fields[1];
+    let stale_operation_pid = stale_fields[3];
+    let current_controller = stale_fields[2];
+    let expected_window = stale_fields[5];
+    let pane_pid = stale_fields[6];
+    assert_eq!(stale_fields[7], payload_pgid);
+
+    let mut dead_takeover_owner = Command::new("/bin/sh");
+    dead_takeover_owner.arg("-c").arg("exit 0").process_group(0);
+    let mut dead_takeover_owner = dead_takeover_owner
+        .spawn()
+        .expect("spawn first takeover owner");
+    let dead_takeover_pid = dead_takeover_owner.id().to_string();
+    assert!(
+        dead_takeover_owner
+            .wait()
+            .expect("wait for first takeover owner")
+            .success()
+    );
+    assert!(
+        wait_for_process_group_death(&dead_takeover_pid),
+        "first takeover owner process group remained alive"
+    );
+    let dead_takeover_nonce = "ta_seed_dead";
+    let dead_takeover_claim = format!(
+        "termination|{dead_takeover_nonce}|{current_controller}|{dead_takeover_pid}|{dead_takeover_pid}|{expected_window}|{pane_pid}|{payload_pgid}\n"
+    );
+    let dead_takeover_candidate = root.join(format!(
+        ".transition-candidate.{dead_takeover_nonce}.{dead_takeover_pid}"
+    ));
+    let dead_takeover_arbiter = root.join(format!(
+        ".transition-candidate.takeover.{stale_nonce}.{stale_operation_pid}"
+    ));
+    fs::write(&dead_takeover_candidate, &dead_takeover_claim).expect("dead takeover candidate");
+    fs::hard_link(&dead_takeover_candidate, &dead_takeover_arbiter).expect("dead takeover arbiter");
+
+    let adoption = AdoptionRequest {
+        identity: params
+            .execution_identity
+            .clone()
+            .expect("execution identity"),
+        expected_command_digest: descriptor.command_digest.clone(),
+        original_session_id: Some(62504),
+        committed_output_cursor: 0,
+        tty: false,
+    };
+    let adopter_a =
+        TmuxProcessDescriptor::from_adoption(&fixture.agent_key, "chain-takeover-a", &adoption);
+    let adopter_b =
+        TmuxProcessDescriptor::from_adoption(&fixture.agent_key, "chain-takeover-b", &adoption);
+    let publication_cutpoint =
+        "  ln \"$transition_candidate\" \"$takeover_arbiter\" 2>/dev/null ||";
+    let command_a = adopter_a.adoption_command().replacen(
+        publication_cutpoint,
+        concat!(
+            "  : > \"$root/chain-takeover-a-ready\"\n",
+            "  while [ ! -f \"$root/chain-takeover-release\" ]; do sleep 1; done\n",
+            "  ln \"$transition_candidate\" \"$takeover_arbiter\" 2>/dev/null ||"
+        ),
+        1,
+    );
+    let command_b = adopter_b.adoption_command().replacen(
+        publication_cutpoint,
+        concat!(
+            "  : > \"$root/chain-takeover-b-ready\"\n",
+            "  while [ ! -f \"$root/chain-takeover-release\" ]; do sleep 1; done\n",
+            "  ln \"$transition_candidate\" \"$takeover_arbiter\" 2>/dev/null ||"
+        ),
+        1,
+    );
+    assert_ne!(command_a, adopter_a.adoption_command());
+    assert_ne!(command_b, adopter_b.adoption_command());
+
+    let spawn_adopter = |command: String| {
+        let mut child = Command::new("/bin/sh");
+        child
+            .arg("-c")
+            .arg(command)
+            .env("HOME", fixture.home.path())
+            .env("PATH", &fixture.path)
+            .env_remove("TMUX")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        child.spawn().expect("spawn chained termination adopter")
+    };
+    let adopter_a_process = spawn_adopter(command_a);
+    let adopter_b_process = spawn_adopter(command_b);
+    assert!(
+        wait_for_file_value(&root.join("chain-takeover-a-ready"), "")
+            && wait_for_file_value(&root.join("chain-takeover-b-ready"), ""),
+        "both adopters did not validate the dead owner chain"
+    );
+    fs::write(root.join("chain-takeover-release"), []).expect("release chained takeover race");
+
+    let output_a = adopter_a_process
+        .wait_with_output()
+        .expect("wait for chained adopter A");
+    let output_b = adopter_b_process
+        .wait_with_output()
+        .expect("wait for chained adopter B");
+    let successes = [output_a.status.success(), output_b.status.success()]
+        .into_iter()
+        .filter(|success| *success)
+        .count();
+    assert_eq!(
+        successes,
+        1,
+        "expected one chained takeover winner; A={:?} stderr={}; B={:?} stderr={}",
+        output_a.status.code(),
+        String::from_utf8_lossy(&output_a.stderr),
+        output_b.status.code(),
+        String::from_utf8_lossy(&output_b.stderr)
+    );
+    let loser = if output_a.status.success() {
+        &output_b
+    } else {
+        &output_a
+    };
+    assert_eq!(
+        loser.status.code(),
+        Some(79),
+        "{}",
+        String::from_utf8_lossy(&loser.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("terminal state"),
+        "terminated\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("status")).expect("terminal status"),
+        "143\n"
+    );
+    assert!(!root.join("transition-claim").exists());
+    assert!(
+        dead_takeover_candidate.exists() && dead_takeover_arbiter.exists(),
+        "immutable dead-owner evidence was removed"
+    );
+    assert!(
+        wait_for_process_group_death(payload_pgid),
+        "the winning takeover did not terminate the payload group"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_natural_completion_reaps_same_group_background_descendants() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62494", "sleep 30 & printf 'background-launched\\n'");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "descendant-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    let process_identity =
+        fs::read_to_string(root.join("process-identity")).expect("process identity");
+    let (_, pgid) = process_identity
+        .trim()
+        .split_once(':')
+        .expect("supervisor pid and pgid");
+
+    assert!(
+        wait_for_file_value(&root.join("status"), "0\n"),
+        "natural completion did not publish status; state={:?}; output={:?}",
+        fs::read_to_string(root.join("state")),
+        fs::read_to_string(root.join("output"))
+    );
+    assert!(
+        wait_for_file_contains(&root.join("output"), "background-launched"),
+        "payload output was not retained"
+    );
+    assert!(
+        fixture.wait_for_dead_pane(&descriptor),
+        "completed supervisor pane was not retained"
+    );
+    assert!(
+        wait_for_process_group_death(pgid),
+        "background descendant kept process group {pgid} alive"
+    );
+
+    let cleanup = fixture.run_shell(format!(
+        "root=\"{}\"; {}",
+        descriptor.remote_directory(),
+        descriptor.confirmed_process_group_termination()
+    ));
+    assert!(
+        cleanup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_sentinel_reaps_payload_when_the_supervisor_dies_independently() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62495", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "sentinel-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    let process_identity =
+        fs::read_to_string(root.join("process-identity")).expect("process identity");
+    let (supervisor_pid, pgid) = process_identity
+        .trim()
+        .split_once(':')
+        .expect("supervisor pid and pgid");
+    assert!(root.join("sentinel-ready").exists());
+
+    let killed = std::process::Command::new("/bin/kill")
+        .args(["-KILL", supervisor_pid])
+        .status()
+        .expect("kill only the supervisor");
+    assert!(killed.success());
+    assert!(
+        fixture.wait_for_dead_pane(&descriptor),
+        "remain-on-exit did not preserve the dead supervisor pane"
+    );
+    assert!(
+        wait_for_process_group_death(pgid),
+        "sentinel did not reap process group {pgid}"
+    );
+    assert!(!root.join("status").exists());
+
+    let recovered = fixture.run_shell(descriptor.recover_dead_execution_command());
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&recovered.stdout), "terminal 125\n");
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("recovery state"),
+        "recovery-lost\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_sentinel_stays_armed_through_residual_descendant_cleanup() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params(
+        "62498",
+        "trap '' TERM; while :; do sleep 1; done & printf 'payload-finished\\n'",
+    );
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "sentinel-cleanup-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    let process_identity =
+        fs::read_to_string(root.join("process-identity")).expect("process identity");
+    let (supervisor_pid, pgid) = process_identity
+        .trim()
+        .split_once(':')
+        .expect("supervisor pid and pgid");
+    assert!(
+        wait_for_file_contains(&root.join("output"), "payload-finished"),
+        "payload did not reach the residual-cleanup cutpoint"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert!(
+        !root.join("sentinel-release").exists(),
+        "sentinel was disarmed before residual cleanup completed"
+    );
+    assert!(
+        !root.join("status").exists(),
+        "supervisor unexpectedly terminalized a live residual group"
+    );
+
+    let killed = std::process::Command::new("/bin/kill")
+        .args(["-KILL", supervisor_pid])
+        .status()
+        .expect("kill supervisor during residual cleanup");
+    assert!(killed.success());
+    assert!(
+        wait_for_process_group_death(pgid),
+        "armed sentinel did not reap residual group {pgid}"
+    );
+    assert!(
+        fixture.wait_for_dead_pane(&descriptor),
+        "remain-on-exit did not retain the cleanup-cutpoint pane"
+    );
+    assert!(!root.join("status").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_termination_stops_the_payload_group_before_removing_the_pane() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62491", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "termination-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    let payload_identity =
+        fs::read_to_string(root.join("payload-identity")).expect("payload identity");
+    let (_, payload_pgid) = payload_identity
+        .trim()
+        .split_once(':')
+        .expect("payload pid and pgid");
+
+    let termination = fixture.run_shell(format!(
+        "root=\"{}\"; {}",
+        descriptor.remote_directory(),
+        descriptor.confirmed_process_group_termination()
+    ));
+    assert!(
+        termination.status.success(),
+        "{}",
+        String::from_utf8_lossy(&termination.stderr)
+    );
+    let payload_probe = std::process::Command::new("/bin/kill")
+        .args(["-0", "--", &format!("-{payload_pgid}")])
+        .status()
+        .expect("probe payload process group");
+    assert!(!payload_probe.success(), "payload process group survived");
+    let windows = fixture.tmux(&[
+        "list-windows",
+        "-t",
+        &format!("{}:", descriptor.session_name),
+        "-F",
+        "#{window_name}",
+    ]);
+    assert!(windows.status.success());
+    let windows = String::from_utf8_lossy(&windows.stdout);
+    assert!(!windows.lines().any(|name| name == descriptor.window_name));
+    assert!(
+        !windows
+            .lines()
+            .any(|name| name == descriptor.watchdog_window_name)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_start_of_turn_recovery_persists_pane_evidence_before_removal() {
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62504", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "reconciliation-evidence", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    let process_identity =
+        fs::read_to_string(root.join("process-identity")).expect("process identity");
+    let (_, pgid) = process_identity
+        .trim()
+        .split_once(':')
+        .expect("pid and pgid");
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{pgid}")])
+            .status()
+            .expect("kill isolated tmux process group")
+            .success()
+    );
+    assert!(
+        fixture.wait_for_dead_pane(&descriptor),
+        "remain-on-exit did not preserve the killed pane"
+    );
+    assert!(!root.join("status").exists());
+
+    let reconciliation = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "62504".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some(descriptor.command_digest.clone()),
+            expected_session_id: Some(62504),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let command = exact_reconciliation_command(&fixture.agent_key, &reconciliation);
+    let removal_cutpoint =
+        "        tmux kill-window -t \"$stale_command_window_id\" 2>/dev/null || true\n";
+    let held = command.replacen(
+        removal_cutpoint,
+        concat!(
+            "        : > \"$root/reconciliation-evidence-held\"\n",
+            "        while :; do sleep 1; done\n",
+            "        tmux kill-window -t \"$stale_command_window_id\" 2>/dev/null || true\n"
+        ),
+        1,
+    );
+    assert_ne!(held, command);
+    let mut recovery = Command::new("/bin/sh");
+    recovery
+        .arg("-c")
+        .arg(held)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut recovery = recovery.spawn().expect("spawn held start-of-turn recovery");
+    assert!(
+        wait_for_file_value(&root.join("reconciliation-evidence-held"), ""),
+        "reconciliation did not reach the evidence-before-removal cutpoint"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("pane-death-status")).expect("pane death telemetry"),
+        "signal:kill\n"
+    );
+    assert!(
+        fixture.wait_for_dead_pane(&descriptor),
+        "reconciliation removed the pane before the evidence cutpoint"
+    );
+    assert!(root.join("transition-claim").exists());
+    assert!(!root.join("status").exists());
+
+    let recovery_group = recovery.id().to_string();
+    assert!(
+        Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{recovery_group}")])
+            .status()
+            .expect("kill held start-of-turn recovery")
+            .success()
+    );
+    let _ = recovery.wait();
+
+    let resumed = fixture.run_shell(exact_reconciliation_command(
+        &fixture.agent_key,
+        &reconciliation,
+    ));
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let recovered =
+        parse_recovered_executions(&resumed.stdout).expect("parse reconciliation output");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, RecoveredExecutionStatus::RecoveryLost);
+    assert!(recovered[0].terminal_verified_dead);
+    assert_eq!(
+        fs::read_to_string(root.join("pane-death-status")).expect("retained pane death telemetry"),
+        "signal:kill\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("status")).expect("recovery status"),
+        "125\n"
+    );
+    assert!(!root.join("transition-claim").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_statusless_pane_death_converges_to_start_of_turn_recovery_loss() {
+    use std::fs;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62490", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "recovery-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    let process_identity =
+        fs::read_to_string(root.join("process-identity")).expect("process identity");
+    let (_, pgid) = process_identity
+        .trim()
+        .split_once(':')
+        .expect("pid and pgid");
+    let killed = std::process::Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{pgid}")])
+        .status()
+        .expect("kill isolated tmux process group");
+    assert!(killed.success());
+    assert!(
+        fixture.wait_for_dead_pane(&descriptor),
+        "remain-on-exit did not preserve the killed pane"
+    );
+    assert!(!root.join("status").exists());
+    fs::write(root.join("output"), b"final-output-tail\n").expect("seed final output tail");
+
+    let monitor = fixture.run_shell(descriptor.monitor_command(1));
+    assert_eq!(monitor.status.code(), Some(125));
+    assert_eq!(monitor.stdout, b"final-output-tail\n");
+
+    let recovery_cutpoint = "[ -e \"$root/output\" ] || : > \"$root/output\"\n";
+    let held_recovery = descriptor.recover_dead_execution_command().replacen(
+        recovery_cutpoint,
+        concat!(
+            ": > \"$root/recovery-held\"\n",
+            "while :; do sleep 1; done\n",
+            "[ -e \"$root/output\" ] || : > \"$root/output\"\n"
+        ),
+        1,
+    );
+    assert_ne!(held_recovery, descriptor.recover_dead_execution_command());
+    let mut recovery = Command::new("/bin/sh");
+    recovery
+        .arg("-c")
+        .arg(held_recovery)
+        .env("HOME", fixture.home.path())
+        .env("PATH", &fixture.path)
+        .env_remove("TMUX")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut recovery = recovery.spawn().expect("spawn held live recovery");
+    assert!(
+        wait_for_file_value(&root.join("recovery-held"), ""),
+        "live recovery did not reach the post-pane-removal cutpoint"
+    );
+    assert!(root.join("transition-claim").exists());
+    assert!(!root.join("status").exists());
+    let recovery_group = recovery.id().to_string();
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{recovery_group}")])
+        .status()
+        .expect("kill live recovery operation group");
+    assert!(killed.success());
+    let _ = recovery.wait();
+
+    let recovered_live = fixture.run_shell(descriptor.recover_dead_execution_command());
+    assert!(
+        recovered_live.status.success(),
+        "{}; pane={}",
+        String::from_utf8_lossy(&recovered_live.stderr),
+        String::from_utf8_lossy(
+            &fixture
+                .tmux(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &descriptor.target(),
+                    "#{window_id}:#{pane_id}:#{pane_pid}:#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}",
+                ])
+                .stdout
+        )
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recovered_live.stdout),
+        "terminal 125\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("recovery state"),
+        "recovery-lost\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("status")).expect("recovery status"),
+        "125\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("pane-death-status")).expect("pane death telemetry"),
+        "signal:kill\n"
+    );
+    assert!(!root.join("transition-claim").exists());
+    assert_eq!(
+        fs::read_dir(&root)
+            .expect("descriptor entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".transition-candidate."))
+            })
+            .count(),
+        0
+    );
+
+    let reconciliation = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "62490".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some(descriptor.command_digest.clone()),
+            expected_session_id: Some(62490),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let output = fixture.run_shell(exact_reconciliation_command(
+        &fixture.agent_key,
+        &reconciliation,
+    ));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let recovered = parse_recovered_executions(&output.stdout).expect("recovered execution");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, RecoveredExecutionStatus::RecoveryLost);
+    assert!(recovered[0].terminal_verified_dead);
+    let windows = fixture.tmux(&[
+        "list-windows",
+        "-t",
+        &format!("{}:", descriptor.session_name),
+        "-F",
+        "#{window_name}",
+    ]);
+    assert!(
+        !String::from_utf8_lossy(&windows.stdout)
+            .lines()
+            .any(|window| window == descriptor.window_name)
     );
 }
 
@@ -2789,11 +5017,16 @@ fn generated_remote_shell_is_syntactically_valid() {
     };
     for command in [
         descriptor.bootstrap_command(&params),
+        descriptor.supervisor_start_command(),
         descriptor.adoption_command(),
         descriptor.process_script(&params),
+        descriptor.payload_script(&params),
+        descriptor.group_sentinel_script(),
         descriptor.watchdog_script(),
         descriptor.monitor_command(1),
+        descriptor.recover_dead_execution_command(),
         descriptor.interrupt_command(),
+        descriptor.termination_command(),
         descriptor.ownership_guard(),
         exact_reconciliation_command("agent", &reconciliation),
         acknowledgement_command("agent", &acknowledgement),
@@ -3000,6 +5233,209 @@ fn run_durable_write_command(
         .write_all(input)
         .expect("send durable stdin bytes");
     child.wait_with_output().expect("wait for durable stdin")
+}
+
+#[cfg(unix)]
+struct RealTmuxFixture {
+    home: tempfile::TempDir,
+    path: String,
+    tmux_wrapper: std::path::PathBuf,
+    agent_key: String,
+}
+
+#[cfg(unix)]
+impl RealTmuxFixture {
+    fn new() -> Option<Self> {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let discovered = Command::new("/bin/sh")
+            .args(["-c", "command -v tmux"])
+            .env_remove("TMUX")
+            .output()
+            .ok()?;
+        if !discovered.status.success() {
+            return None;
+        }
+        let real_tmux = String::from_utf8(discovered.stdout).ok()?;
+        let real_tmux = real_tmux.trim();
+        if real_tmux.is_empty() {
+            return None;
+        }
+
+        let home = tempfile::tempdir().expect("real tmux fixture home");
+        let bin = home.path().join("bin");
+        fs::create_dir(&bin).expect("real tmux fixture bin");
+        let tmux_wrapper = bin.join("tmux");
+        let fixture_id = uuid::Uuid::new_v4().simple().to_string();
+        let socket_name = format!("agentapp-test-{fixture_id}");
+        fs::write(
+            &tmux_wrapper,
+            format!(
+                "#!/bin/sh\nexec {} -L {} \"$@\"\n",
+                shell_quote(real_tmux),
+                shell_quote(&socket_name)
+            ),
+        )
+        .expect("real tmux wrapper");
+        fs::set_permissions(&tmux_wrapper, fs::Permissions::from_mode(0o755))
+            .expect("real tmux wrapper mode");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Some(Self {
+            home,
+            path,
+            tmux_wrapper,
+            agent_key: format!("real-tmux-{fixture_id}"),
+        })
+    }
+
+    fn run_shell(&self, command: String) -> std::process::Output {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .env("HOME", self.home.path())
+            .env("PATH", &self.path)
+            .env_remove("TMUX")
+            .output()
+            .expect("run real tmux shell")
+    }
+
+    fn tmux(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new(&self.tmux_wrapper)
+            .args(args)
+            .env("HOME", self.home.path())
+            .env("PATH", &self.path)
+            .env_remove("TMUX")
+            .output()
+            .expect("run isolated tmux")
+    }
+
+    fn bootstrap(&self, descriptor: &mut TmuxProcessDescriptor, params: &ExecParams) {
+        self.bootstrap_with_shell(descriptor, params, "/bin/sh");
+    }
+
+    fn bootstrap_with_shell(
+        &self,
+        descriptor: &mut TmuxProcessDescriptor,
+        params: &ExecParams,
+        shell: &str,
+    ) {
+        let command = descriptor.bootstrap_command(params);
+        let command = if shell == "/bin/sh" {
+            command
+        } else {
+            command.replace("/bin/sh", shell)
+        };
+        let output = self.run_shell(command);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("bootstrap output");
+        let controller = stdout
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("AGENTAPP_TMUX_READY ")
+                    .and_then(|payload| payload.split_whitespace().nth(1))
+            })
+            .expect("fenced bootstrap controller");
+        descriptor.controller_id = controller.to_string();
+    }
+
+    fn descriptor_root(&self, descriptor: &TmuxProcessDescriptor) -> std::path::PathBuf {
+        self.home
+            .path()
+            .join(".agentapp/tmux")
+            .join(&descriptor.agent_id)
+            .join(&descriptor.process_id)
+    }
+
+    fn wait_for_dead_pane(&self, descriptor: &TmuxProcessDescriptor) -> bool {
+        for _ in 0..50 {
+            let output = self.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &descriptor.target(),
+                "#{pane_dead}",
+            ]);
+            if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1" {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RealTmuxFixture {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(&self.tmux_wrapper)
+            .args(["kill-server"])
+            .env("HOME", self.home.path())
+            .env("PATH", &self.path)
+            .env_remove("TMUX")
+            .status();
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_file_value(path: &std::path::Path, expected: &str) -> bool {
+    for _ in 0..50 {
+        if std::fs::read_to_string(path).is_ok_and(|value| value == expected) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+fn current_output_closed_path(root: &std::path::Path) -> std::path::PathBuf {
+    let generation = std::fs::read_to_string(root.join("output-pipe-generation"))
+        .expect("output pipe generation");
+    let generation = generation.trim();
+    assert!(
+        !generation.is_empty()
+            && generation
+                .chars()
+                .all(|character| character.is_ascii_digit()),
+        "invalid output pipe generation: {generation:?}"
+    );
+    root.join(format!("output-closed.{generation}"))
+}
+
+#[cfg(unix)]
+fn wait_for_file_contains(path: &std::path::Path, expected: &str) -> bool {
+    for _ in 0..50 {
+        if std::fs::read_to_string(path).is_ok_and(|value| value.contains(expected)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_death(pgid: &str) -> bool {
+    for _ in 0..80 {
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-0", "--", &format!("-{}", pgid.trim())])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("probe process group");
+        if !status.success() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
 }
 
 #[cfg(unix)]
