@@ -338,7 +338,11 @@ fn bootstrap_compare_and_attach_is_exact_and_generation_fenced() {
     assert!(command.contains("watchdog.sh"));
     assert!(command.contains("printf '%s\\n' \"$session\" > \"$staging/session\""));
     assert!(command.contains("AGENTAPP_TMUX_RESOURCE_EXHAUSTED"));
+    assert!(command.contains("fork failed: Device not configured"));
     assert!(command.contains("ulimit -S -n \"$desired\""));
+    assert!(command.contains("deadline=$(( $(date +%s) + 120 ))"));
+    assert!(!command.contains("sleep 604800"));
+    assert!(!command.contains("tmux respawn-pane -k"));
     assert!(
         command.find("tmux new-window -d -t \"$session:\" -n \"$watchdog_window\"")
             < command.find("tmux new-window -d -t \"$session:\" -n \"$window\"")
@@ -347,10 +351,14 @@ fn bootstrap_compare_and_attach_is_exact_and_generation_fenced() {
     let command_release = command
         .find("mv \"$root/go.tmp\" \"$root/go\"")
         .expect("command release");
+    let keeper_release = command
+        .find("mv \"$root/keeper-release.tmp\" \"$root/keeper-release\"")
+        .expect("keeper release");
     let keeper_retirement = command
         .find("tmux kill-window -t \"$session:__agentapp_keeper\"")
         .expect("keeper retirement");
-    assert!(command_release < keeper_retirement);
+    assert!(command_release < keeper_release);
+    assert!(keeper_release < keeper_retirement);
 }
 
 #[test]
@@ -3216,6 +3224,82 @@ fn real_tmux_terminal_cleanup_retires_only_its_execution_session() {
 
 #[cfg(unix)]
 #[test]
+fn real_tmux_bootstrap_keeper_is_bounded_and_explicitly_releasable() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+
+    let expiry_params = exec_params("keeper-expiry", "printf unused");
+    let expiry =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "expiry-controller", &expiry_params);
+    let expiry_root = fixture.descriptor_root(&expiry);
+    fs::create_dir_all(&expiry_root).expect("expiry descriptor root");
+    let expiry_keeper = expiry.bootstrap_keeper_command(1);
+    let created = fixture.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        &expiry.session_name,
+        "-n",
+        "__agentapp_keeper",
+        &expiry_keeper,
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let expiry_pid = fixture.pane_pid(&format!("{}:__agentapp_keeper.0", expiry.session_name));
+    assert!(
+        fixture.wait_for_session_exit(&expiry.session_name),
+        "bootstrap keeper session survived its deadline"
+    );
+    assert!(
+        fixture.wait_for_process_exit(expiry_pid),
+        "expired bootstrap keeper left pane process {expiry_pid} alive"
+    );
+
+    let release_params = exec_params("keeper-release", "printf unused");
+    let release =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "release-controller", &release_params);
+    let release_root = fixture.descriptor_root(&release);
+    fs::create_dir_all(&release_root).expect("release descriptor root");
+    let release_keeper = release.bootstrap_keeper_command(30);
+    let created = fixture.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        &release.session_name,
+        "-n",
+        "__agentapp_keeper",
+        &release_keeper,
+    ]);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let release_pid = fixture.pane_pid(&format!("{}:__agentapp_keeper.0", release.session_name));
+    fs::write(release_root.join("keeper-release.tmp"), b"").expect("stage keeper release marker");
+    fs::rename(
+        release_root.join("keeper-release.tmp"),
+        release_root.join("keeper-release"),
+    )
+    .expect("publish keeper release marker");
+    assert!(
+        fixture.wait_for_session_exit(&release.session_name),
+        "bootstrap keeper ignored its release marker"
+    );
+    assert!(
+        fixture.wait_for_process_exit(release_pid),
+        "released bootstrap keeper left pane process {release_pid} alive"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn real_tmux_dash_supervisor_preserves_the_interrupted_payload_status() {
     if !std::path::Path::new("/bin/dash").is_file() {
         return;
@@ -5509,6 +5593,45 @@ impl RealTmuxFixture {
                 "#{pane_dead}",
             ]);
             if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1" {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    fn pane_pid(&self, target: &str) -> u32 {
+        let pane = self.tmux(&["display-message", "-p", "-t", target, "#{pane_pid}"]);
+        assert!(
+            pane.status.success(),
+            "{}",
+            String::from_utf8_lossy(&pane.stderr)
+        );
+        String::from_utf8(pane.stdout)
+            .expect("pane pid")
+            .trim()
+            .parse()
+            .expect("numeric pane pid")
+    }
+
+    fn wait_for_session_exit(&self, session: &str) -> bool {
+        for _ in 0..50 {
+            if !self.tmux(&["has-session", "-t", session]).status.success() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    fn wait_for_process_exit(&self, pid: u32) -> bool {
+        let pid = pid.to_string();
+        for _ in 0..50 {
+            if !std::process::Command::new("/bin/kill")
+                .args(["-0", &pid])
+                .status()
+                .is_ok_and(|status| status.success())
+            {
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));

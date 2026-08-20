@@ -51,7 +51,7 @@ use super::with_remote_path;
 const MONITOR_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 const TMUX_BOOTSTRAP_ATTEMPTS: usize = 4;
 const TMUX_TERMINATE_ATTEMPTS: usize = 3;
-const AGENT_SESSION_RETENTION_SECONDS: u64 = 7 * 24 * 60 * 60;
+const BOOTSTRAP_KEEPER_MAX_SECONDS: u64 = 2 * 60;
 // A controller normally refreshes the remote lease every five seconds. Fifteen
 // minutes exceeds the bounded reconnect schedule and gives transient mobile
 // suspension ample recovery time, while still bounding crash-orphan lifetime.
@@ -1027,6 +1027,13 @@ impl TmuxProcessDescriptor {
         format!("$HOME/.agentapp/tmux/{}/{}", self.agent_id, self.process_id)
     }
 
+    fn bootstrap_keeper_command(&self, max_seconds: u64) -> String {
+        let root = self.remote_directory();
+        format!(
+            "root=\"{root}\"\ndeadline=$(( $(date +%s) + {max_seconds} ))\nwhile [ ! -f \"$root/keeper-release\" ]; do\n  now=$(date +%s)\n  [ \"$now\" -lt \"$deadline\" ] || exit 0\n  sleep 1\ndone\n"
+        )
+    }
+
     fn target(&self) -> String {
         format!("{}:{}.0", self.session_name, self.window_name)
     }
@@ -1191,7 +1198,7 @@ impl TmuxProcessDescriptor {
                 "}}\n",
                 "agentapp_tmux_create() {{\n",
                 "  if tmux_error=$(\"$@\" 2>&1); then return 0; fi\n",
-                "  case \"$tmux_error\" in *\"Too many open files\"*) echo AGENTAPP_TMUX_RESOURCE_EXHAUSTED >&2; printf '%s\\n' \"$tmux_error\" >&2; return 73 ;; esac\n",
+                "  case \"$tmux_error\" in *\"Too many open files\"*|*\"fork failed: Device not configured\"*) echo AGENTAPP_TMUX_RESOURCE_EXHAUSTED >&2; printf '%s\\n' \"$tmux_error\" >&2; return 73 ;; esac\n",
                 "  printf '%s\\n' \"$tmux_error\" >&2\n",
                 "  return 80\n",
                 "}}\n",
@@ -1211,9 +1218,9 @@ impl TmuxProcessDescriptor {
                 "candidate_controller=\"$controller\"\n",
                 "if ! tmux has-session -t \"$session\" 2>/dev/null; then\n",
                 "  agentapp_raise_nofile_limit\n",
+                "  rm -f \"$root/keeper-release\" \"$root/keeper-release.tmp\"\n",
                 "  if agentapp_tmux_create tmux new-session -d -s \"$session\" -n __agentapp_keeper {keeper}; then :; else create_status=$?; tmux has-session -t \"$session\" 2>/dev/null || exit \"$create_status\"; fi\n",
                 "fi\n",
-                "tmux respawn-pane -k -t \"$session:__agentapp_keeper.0\" {keeper} >/dev/null 2>&1 || true\n",
                 "window_exists=0\n",
                 "if tmux list-windows -t \"$session\" -F '#{{window_name}}' | grep -Fqx \"$window\"; then window_exists=1; fi\n",
                 "watchdog_exists=0\n",
@@ -1419,6 +1426,8 @@ impl TmuxProcessDescriptor {
                 "  fi\n",
                 "fi\n",
                 "[ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$active\" ] || {{ echo AGENTAPP_TMUX_STALE_CONTROLLER >&2; exit 75; }}\n",
+                ": > \"$root/keeper-release.tmp\"\n",
+                "mv \"$root/keeper-release.tmp\" \"$root/keeper-release\"\n",
                 "tmux kill-window -t \"$session:__agentapp_keeper\" 2>/dev/null || true\n",
                 "printf 'AGENTAPP_TMUX_READY %s %s\\n' \"$target\" \"$active\"\n",
                 "if [ \"$release_start\" -eq 1 ]; then release_transition_claim; trap - EXIT; fi\n",
@@ -1447,7 +1456,7 @@ impl TmuxProcessDescriptor {
             ),
             tty = shell_quote(if self.tty { "1" } else { "0" }),
             acknowledgement_token = shell_quote(&self.acknowledgement_token),
-            keeper = shell_quote(&format!("sleep {AGENT_SESSION_RETENTION_SECONDS}")),
+            keeper = shell_quote(&self.bootstrap_keeper_command(BOOTSTRAP_KEEPER_MAX_SECONDS)),
             script = shell_quote(&script),
             watchdog_script = shell_quote(&watchdog_script),
             start = shell_quote(&start_command),
