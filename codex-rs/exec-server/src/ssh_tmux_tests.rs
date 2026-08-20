@@ -55,6 +55,48 @@ fn exec_params(process_id: &str, command: &str) -> ExecParams {
     }
 }
 
+fn apply_ready_protocol(descriptor: &mut TmuxProcessDescriptor, output: &[u8]) {
+    let output = std::str::from_utf8(output).expect("utf8 bootstrap output");
+    let (target, controller) = output
+        .lines()
+        .find_map(|line| {
+            let mut fields = line
+                .strip_prefix("AGENTAPP_TMUX_READY ")?
+                .split_whitespace();
+            let target = fields.next()?;
+            let controller = fields.next()?;
+            fields.next().is_none().then_some((target, controller))
+        })
+        .expect("fenced bootstrap result");
+    let target_suffix = format!(":{}.0", descriptor.window_name);
+    let session = target
+        .strip_suffix(&target_suffix)
+        .expect("bootstrap target session");
+    descriptor
+        .apply_reported_session(session)
+        .expect("compatible bootstrap session");
+    descriptor.controller_id = controller.to_string();
+}
+
+fn apply_adopted_protocol(descriptor: &mut TmuxProcessDescriptor, output: &[u8]) {
+    let output = std::str::from_utf8(output).expect("utf8 adoption output");
+    let (controller, session) = output
+        .lines()
+        .find_map(|line| {
+            let mut fields = line
+                .strip_prefix("AGENTAPP_TMUX_ADOPTED ")?
+                .split_whitespace();
+            let controller = fields.next()?;
+            let session = fields.next()?;
+            fields.next().is_none().then_some((controller, session))
+        })
+        .expect("fenced adoption result");
+    descriptor
+        .apply_reported_session(session)
+        .expect("compatible adoption session");
+    descriptor.controller_id = controller.to_string();
+}
+
 #[test]
 fn identifiers_are_stable_and_separate_agents() {
     assert_eq!(stable_identifier("agent-a"), "9c3f6a8a5ba885b0");
@@ -83,6 +125,17 @@ fn descriptor_uses_tmux_safe_names() {
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
     );
+    assert_eq!(
+        descriptor.session_name,
+        format!("agentapp_{}_{}", descriptor.agent_id, descriptor.process_id)
+    );
+
+    let other = TmuxProcessDescriptor::new(
+        "conversation:connection with spaces",
+        "1720000000000-controller",
+        &exec_params("different-process", "printf hello"),
+    );
+    assert_ne!(descriptor.session_name, other.session_name);
 }
 
 #[test]
@@ -238,6 +291,7 @@ fn bootstrap_compare_and_attach_is_exact_and_generation_fenced() {
     assert!(command.contains("controller-$candidate_controller"));
     assert!(command.contains("agentapp-tmux-v2"));
     assert!(command.contains("watchdog.sh"));
+    assert!(command.contains("printf '%s\\n' \"$session\" > \"$staging/session\""));
     assert!(command.contains("AGENTAPP_TMUX_RESOURCE_EXHAUSTED"));
     assert!(command.contains("ulimit -S -n \"$desired\""));
     assert!(
@@ -245,6 +299,13 @@ fn bootstrap_compare_and_attach_is_exact_and_generation_fenced() {
             < command.find("tmux new-window -d -t \"$session:\" -n \"$window\"")
     );
     assert!(!command.contains("tmux kill-session"));
+    let command_release = command
+        .find("mv \"$root/go.tmp\" \"$root/go\"")
+        .expect("command release");
+    let keeper_retirement = command
+        .find("tmux kill-window -t \"$session:__agentapp_keeper\"")
+        .expect("keeper retirement");
+    assert!(command_release < keeper_retirement);
 }
 
 #[test]
@@ -405,6 +466,7 @@ fn bootstrap_interruption_before_publication_leaves_retryable_descriptor_path() 
             "identity",
             "output",
             "owner",
+            "session",
             "session-id",
             "state",
             "thread-id",
@@ -3022,6 +3084,93 @@ fn real_tmux_interrupt_preserves_the_supervisor_terminal_record() {
 
 #[cfg(unix)]
 #[test]
+fn real_tmux_terminal_cleanup_retires_only_its_execution_session() {
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let first_params = exec_params("ephemeral-first", "sleep 1; printf 'first-finished\\n'");
+    let second_params = exec_params("ephemeral-second", "sleep 30");
+    let mut first =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "first-controller", &first_params);
+    let mut second =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "second-controller", &second_params);
+
+    fixture.bootstrap(&mut first, &first_params);
+    fixture.bootstrap(&mut second, &second_params);
+    assert_ne!(first.session_name, second.session_name);
+    assert!(
+        fixture
+            .tmux(&["has-session", "-t", &first.session_name])
+            .status
+            .success()
+    );
+    assert!(
+        fixture
+            .tmux(&["has-session", "-t", &second.session_name])
+            .status
+            .success()
+    );
+
+    let first_root = fixture.descriptor_root(&first);
+    assert!(
+        wait_for_file_value(&first_root.join("status"), "0\n"),
+        "first execution did not finish"
+    );
+    assert!(fixture.wait_for_dead_pane(&first));
+    let cleanup = fixture.run_shell(first.cleanup_command());
+    assert!(
+        cleanup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert!(
+        !fixture
+            .tmux(&["has-session", "-t", &first.session_name])
+            .status
+            .success(),
+        "terminal execution session survived cleanup"
+    );
+    assert!(
+        fixture
+            .tmux(&["has-session", "-t", &second.session_name])
+            .status
+            .success(),
+        "retiring one execution disturbed its concurrent sibling"
+    );
+    assert_eq!(
+        std::fs::read_to_string(first_root.join("status")).expect("durable terminal status"),
+        "0\n"
+    );
+    assert!(
+        std::fs::read_to_string(first_root.join("output"))
+            .expect("durable terminal output")
+            .contains("first-finished")
+    );
+
+    let termination = fixture.run_shell(second.termination_command());
+    assert!(
+        termination.status.success(),
+        "{}",
+        String::from_utf8_lossy(&termination.stderr)
+    );
+    assert!(
+        !fixture
+            .tmux(&["has-session", "-t", &second.session_name])
+            .status
+            .success(),
+        "last terminal execution left an idle tmux session"
+    );
+    assert!(
+        !fixture
+            .tmux(&["has-session", "-t", &format!("agentapp_{}", first.agent_id)])
+            .status
+            .success(),
+        "new executions unexpectedly created a legacy agent-lifetime session"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn real_tmux_dash_supervisor_preserves_the_interrupted_payload_status() {
     if !std::path::Path::new("/bin/dash").is_file() {
         return;
@@ -3347,12 +3496,7 @@ fn real_tmux_adoption_rolls_forward_a_sigkill_stale_bootstrap_claim() {
         "{}",
         String::from_utf8_lossy(&adopted.stderr)
     );
-    let stdout = String::from_utf8(adopted.stdout).expect("adoption output");
-    adopter.controller_id = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("AGENTAPP_TMUX_ADOPTED "))
-        .expect("adopted controller")
-        .to_string();
+    apply_adopted_protocol(&mut adopter, &adopted.stdout);
     assert!(root.join("go").exists());
     assert!(root.join("payload-go").exists());
     assert!(root.join("payload-ready").exists());
@@ -3455,15 +3599,7 @@ fn real_tmux_monitor_waits_for_delayed_tty_pipe_close_and_tail() {
         "{}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let stdout = String::from_utf8(started.stdout).expect("bootstrap output");
-    descriptor.controller_id = stdout
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("AGENTAPP_TMUX_READY ")
-                .and_then(|payload| payload.split_whitespace().nth(1))
-        })
-        .expect("fenced bootstrap controller")
-        .to_string();
+    apply_ready_protocol(&mut descriptor, &started.stdout);
     let root = fixture.descriptor_root(&descriptor);
     let output_closed = current_output_closed_path(&root);
     assert!(
@@ -3558,15 +3694,7 @@ fn real_tmux_bootstrap_roll_forward_ignores_a_stale_tty_pipe_close_receipt() {
         "{}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let stdout = String::from_utf8(started.stdout).expect("retry bootstrap output");
-    descriptor.controller_id = stdout
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("AGENTAPP_TMUX_READY ")
-                .and_then(|payload| payload.split_whitespace().nth(1))
-        })
-        .expect("retry controller")
-        .to_string();
+    apply_ready_protocol(&mut descriptor, &started.stdout);
     let current_generation =
         fs::read_to_string(root.join("output-pipe-generation")).expect("current generation");
     let current_generation = current_generation.trim().to_string();
@@ -3724,15 +3852,7 @@ fn real_tmux_reconciliation_waits_for_the_current_tty_pipe_tail() {
         "{}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let stdout = String::from_utf8(started.stdout).expect("bootstrap output");
-    descriptor.controller_id = stdout
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("AGENTAPP_TMUX_READY ")
-                .and_then(|payload| payload.split_whitespace().nth(1))
-        })
-        .expect("fenced bootstrap controller")
-        .to_string();
+    apply_ready_protocol(&mut descriptor, &started.stdout);
     let root = fixture.descriptor_root(&descriptor);
     let current_closed = current_output_closed_path(&root);
     assert!(!current_closed.exists());
@@ -4545,11 +4665,7 @@ fn real_tmux_natural_completion_reaps_same_group_background_descendants() {
         "background descendant kept process group {pgid} alive"
     );
 
-    let cleanup = fixture.run_shell(format!(
-        "root=\"{}\"; {}",
-        descriptor.remote_directory(),
-        descriptor.confirmed_process_group_termination()
-    ));
+    let cleanup = fixture.run_shell(descriptor.cleanup_command());
     assert!(
         cleanup.status.success(),
         "{}",
@@ -4678,11 +4794,7 @@ fn real_tmux_termination_stops_the_payload_group_before_removing_the_pane() {
         .split_once(':')
         .expect("payload pid and pgid");
 
-    let termination = fixture.run_shell(format!(
-        "root=\"{}\"; {}",
-        descriptor.remote_directory(),
-        descriptor.confirmed_process_group_termination()
-    ));
+    let termination = fixture.run_shell(descriptor.cleanup_command());
     assert!(
         termination.status.success(),
         "{}",
@@ -4693,20 +4805,12 @@ fn real_tmux_termination_stops_the_payload_group_before_removing_the_pane() {
         .status()
         .expect("probe payload process group");
     assert!(!payload_probe.success(), "payload process group survived");
-    let windows = fixture.tmux(&[
-        "list-windows",
-        "-t",
-        &format!("{}:", descriptor.session_name),
-        "-F",
-        "#{window_name}",
-    ]);
-    assert!(windows.status.success());
-    let windows = String::from_utf8_lossy(&windows.stdout);
-    assert!(!windows.lines().any(|name| name == descriptor.window_name));
     assert!(
-        !windows
-            .lines()
-            .any(|name| name == descriptor.watchdog_window_name)
+        !fixture
+            .tmux(&["has-session", "-t", &descriptor.session_name])
+            .status
+            .success(),
+        "terminated payload left its execution session alive"
     );
 }
 
@@ -5339,15 +5443,7 @@ impl RealTmuxFixture {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let stdout = String::from_utf8(output.stdout).expect("bootstrap output");
-        let controller = stdout
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("AGENTAPP_TMUX_READY ")
-                    .and_then(|payload| payload.split_whitespace().nth(1))
-            })
-            .expect("fenced bootstrap controller");
-        descriptor.controller_id = controller.to_string();
+        apply_ready_protocol(descriptor, &output.stdout);
     }
 
     fn descriptor_root(&self, descriptor: &TmuxProcessDescriptor) -> std::path::PathBuf {

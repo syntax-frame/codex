@@ -1,9 +1,10 @@
 //! tmux-backed process continuity for SSH server-mode agents.
 //!
-//! Every agent owns one tmux session and every running tool process owns a
-//! window in that session. Live output is mirrored to a remote log. If the SSH
-//! transport drops, the monitor reconnects at the last delivered byte while
-//! the command continues inside tmux.
+//! Every running tool process owns one tmux session. Durable execution state
+//! lives outside tmux, so a terminal process can release all runtime resources
+//! while its output and acknowledgement proof remain recoverable. Live output
+//! is mirrored to a remote log. If the SSH transport drops, the monitor
+//! reconnects at the last delivered byte while the command continues in tmux.
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -201,15 +202,26 @@ pub(super) async fn start_prepared(
         let error = match backend.transport().exec_control(&bootstrap, None).await {
             Ok(result) if result.exit_code == 0 => {
                 let output = String::from_utf8_lossy(&result.output);
-                let controller = output.lines().find_map(|line| {
-                    line.strip_prefix("AGENTAPP_TMUX_READY ")
-                        .and_then(|payload| payload.split_whitespace().nth(1))
+                let ready = output.lines().find_map(|line| {
+                    let mut fields = line
+                        .strip_prefix("AGENTAPP_TMUX_READY ")?
+                        .split_whitespace();
+                    let target = fields.next()?;
+                    let controller = fields.next()?;
+                    fields.next().is_none().then_some((target, controller))
                 });
-                let Some(controller) = controller else {
+                let Some((target, controller)) = ready else {
                     return Err(ExecServerError::Protocol(
                         "ssh tmux bootstrap omitted fenced controller identity".to_string(),
                     ));
                 };
+                let target_suffix = format!(":{}.0", descriptor.window_name);
+                let session = target.strip_suffix(&target_suffix).ok_or_else(|| {
+                    ExecServerError::Protocol(
+                        "ssh tmux bootstrap reported an incompatible target".to_string(),
+                    )
+                })?;
+                descriptor.apply_reported_session(session)?;
                 descriptor.controller_id = controller.to_string();
                 break;
             }
@@ -302,15 +314,23 @@ pub(super) async fn adopt_execution(
         )));
     }
     let output = String::from_utf8_lossy(&result.output);
-    let controller = output
+    let adopted = output
         .lines()
-        .find_map(|line| line.strip_prefix("AGENTAPP_TMUX_ADOPTED "))
+        .find_map(|line| {
+            let mut fields = line
+                .strip_prefix("AGENTAPP_TMUX_ADOPTED ")?
+                .split_whitespace();
+            let controller = fields.next()?;
+            let session = fields.next()?;
+            fields.next().is_none().then_some((controller, session))
+        })
         .ok_or_else(|| {
             ExecServerError::Protocol(
                 "ssh tmux adoption omitted fenced controller identity".to_string(),
             )
         })?;
-    descriptor.controller_id = controller.to_string();
+    descriptor.apply_reported_session(adopted.1)?;
+    descriptor.controller_id = adopted.0.to_string();
 
     let events = ExecProcessEventLog::new(
         PROCESS_EVENT_CHANNEL_CAPACITY,
@@ -644,7 +664,7 @@ impl TmuxProcessDescriptor {
             )
         );
         Self {
-            session_name: format!("agentapp_{agent_id}"),
+            session_name: execution_session_name(&agent_id, &process_id),
             window_name: format!("p_{process_id}"),
             watchdog_window_name: format!("w_{process_id}"),
             agent_id,
@@ -680,7 +700,7 @@ impl TmuxProcessDescriptor {
             )
         );
         Self {
-            session_name: format!("agentapp_{agent_id}"),
+            session_name: execution_session_name(&agent_id, &process_id),
             window_name: format!("p_{process_id}"),
             watchdog_window_name: format!("w_{process_id}"),
             agent_id,
@@ -695,6 +715,17 @@ impl TmuxProcessDescriptor {
             session_id: request.original_session_id,
             acknowledgement_token,
         }
+    }
+
+    fn apply_reported_session(&mut self, reported_session: &str) -> Result<(), ExecServerError> {
+        let legacy_session = legacy_session_name(&self.agent_id);
+        if reported_session != self.session_name && reported_session != legacy_session {
+            return Err(ExecServerError::Protocol(
+                "ssh tmux reported an incompatible execution session".to_string(),
+            ));
+        }
+        self.session_name = reported_session.to_string();
+        Ok(())
     }
 
     fn adoption_command(&self) -> String {
@@ -712,8 +743,14 @@ impl TmuxProcessDescriptor {
             concat!(
                 "set -eu\n",
                 "root=\"{root}\"\n",
-                "expected_session={session}\n",
+                "default_session={session}\n",
+                "legacy_session={legacy_session}\n",
+                "stored_session=$(cat \"$root/session\" 2>/dev/null || true)\n",
+                "if [ -z \"$stored_session\" ]; then expected_session=$legacy_session; elif [ \"$stored_session\" = \"$default_session\" ] || [ \"$stored_session\" = \"$legacy_session\" ]; then expected_session=$stored_session; else echo AGENTAPP_TMUX_ADOPT_SESSION_MISMATCH >&2; exit 77; fi\n",
                 "expected_window={window}\n",
+                "session=$expected_session\n",
+                "window=$expected_window\n",
+                "watchdog_window={watchdog_window}\n",
                 "candidate_controller={candidate}\n",
                 "{output_drain_function}",
                 "agentapp_adopt_probe_process_group() {{\n",
@@ -895,7 +932,7 @@ impl TmuxProcessDescriptor {
                 "  printf 'terminated\\n' > \"$root/state.tmp\"\n",
                 "  mv \"$root/state.tmp\" \"$root/state\"\n",
                 "  rm -f \"$root/recovery-required\"\n",
-                "  printf 'AGENTAPP_TMUX_ADOPTED %s\\n' \"$current_controller\"\n",
+                "  printf 'AGENTAPP_TMUX_ADOPTED %s %s\\n' \"$current_controller\" \"$expected_session\"\n",
                 "  release_termination_claim\n",
                 "  trap - HUP INT TERM\n",
                 "  exit 0\n",
@@ -949,11 +986,13 @@ impl TmuxProcessDescriptor {
                 "fi\n",
                 "date +%s > \"$root/lease.tmp\"\n",
                 "mv \"$root/lease.tmp\" \"$root/lease\"\n",
-                "printf 'AGENTAPP_TMUX_ADOPTED %s\\n' \"$next\"\n"
+                "printf 'AGENTAPP_TMUX_ADOPTED %s %s\\n' \"$next\" \"$expected_session\"\n"
             ),
             root = root,
             session = shell_quote(&self.session_name),
+            legacy_session = shell_quote(&legacy_session_name(&self.agent_id)),
             window = shell_quote(&self.window_name),
+            watchdog_window = shell_quote(&self.watchdog_window_name),
             owner = shell_quote(OWNERSHIP_MARKER),
             identity = shell_quote(&self.process_id),
             thread_id = shell_quote(&self.thread_id_base64),
@@ -986,10 +1025,6 @@ impl TmuxProcessDescriptor {
 
     fn target(&self) -> String {
         format!("{}:{}.0", self.session_name, self.window_name)
-    }
-
-    fn watchdog_target(&self) -> String {
-        format!("{}:{}.0", self.session_name, self.watchdog_window_name)
     }
 
     fn process_script(&self, params: &ExecParams) -> String {
@@ -1158,7 +1193,10 @@ impl TmuxProcessDescriptor {
                 "}}\n",
                 "agent_root=\"{agent_root}\"\n",
                 "root=\"{root}\"\n",
-                "session={session}\n",
+                "default_session={session}\n",
+                "legacy_session={legacy_session}\n",
+                "session=$default_session\n",
+                "if [ -d \"$root\" ]; then stored_session=$(cat \"$root/session\" 2>/dev/null || true); if [ -z \"$stored_session\" ]; then session=$legacy_session; elif [ \"$stored_session\" = \"$default_session\" ] || [ \"$stored_session\" = \"$legacy_session\" ]; then session=$stored_session; else echo AGENTAPP_TMUX_SESSION_MISMATCH >&2; exit 76; fi; fi\n",
                 "window={window}\n",
                 "watchdog_window={watchdog_window}\n",
                 "controller={controller}\n",
@@ -1198,7 +1236,7 @@ impl TmuxProcessDescriptor {
                 "  cleanup_descriptor_staging_path() {{\n",
                 "    descriptor_staging_path=$1\n",
                 "    [ \"$owns_staging\" -eq 1 ] && [ -d \"$descriptor_staging_path\" ] || return 0\n",
-                "    rm -f \"$descriptor_staging_path/output\" \"$descriptor_staging_path/owner\" \"$descriptor_staging_path/identity\" \"$descriptor_staging_path/thread-id\" \"$descriptor_staging_path/turn-id\" \"$descriptor_staging_path/call-id\" \"$descriptor_staging_path/attempt-generation\" \"$descriptor_staging_path/session-id\" \"$descriptor_staging_path/tty\" \"$descriptor_staging_path/acknowledgement-token\" \"$descriptor_staging_path/digest\" \"$descriptor_staging_path/window\" \"$descriptor_staging_path/state\"\n",
+                "    rm -f \"$descriptor_staging_path/output\" \"$descriptor_staging_path/owner\" \"$descriptor_staging_path/identity\" \"$descriptor_staging_path/thread-id\" \"$descriptor_staging_path/turn-id\" \"$descriptor_staging_path/call-id\" \"$descriptor_staging_path/attempt-generation\" \"$descriptor_staging_path/session-id\" \"$descriptor_staging_path/session\" \"$descriptor_staging_path/tty\" \"$descriptor_staging_path/acknowledgement-token\" \"$descriptor_staging_path/digest\" \"$descriptor_staging_path/window\" \"$descriptor_staging_path/state\"\n",
                 "    rmdir \"$descriptor_staging_path\" 2>/dev/null || true\n",
                 "    return 0\n",
                 "  }}\n",
@@ -1222,6 +1260,7 @@ impl TmuxProcessDescriptor {
                 "  printf '%s\\n' {call_id} > \"$staging/call-id\" || descriptor_publish_failed\n",
                 "  printf '%s\\n' {attempt_generation} > \"$staging/attempt-generation\" || descriptor_publish_failed\n",
                 "  printf '%s\\n' {session_id} > \"$staging/session-id\" || descriptor_publish_failed\n",
+                "  printf '%s\\n' \"$session\" > \"$staging/session\" || descriptor_publish_failed\n",
                 "  printf '%s\\n' {tty} > \"$staging/tty\" || descriptor_publish_failed\n",
                 "  printf '%s\\n' {acknowledgement_token} > \"$staging/acknowledgement-token\" || descriptor_publish_failed\n",
                 "  printf '%s\\n' \"$digest\" > \"$staging/digest\" || descriptor_publish_failed\n",
@@ -1376,12 +1415,14 @@ impl TmuxProcessDescriptor {
                 "  fi\n",
                 "fi\n",
                 "[ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$active\" ] || {{ echo AGENTAPP_TMUX_STALE_CONTROLLER >&2; exit 75; }}\n",
+                "tmux kill-window -t \"$session:__agentapp_keeper\" 2>/dev/null || true\n",
                 "printf 'AGENTAPP_TMUX_READY %s %s\\n' \"$target\" \"$active\"\n",
                 "if [ \"$release_start\" -eq 1 ]; then release_transition_claim; trap - EXIT; fi\n",
             ),
             agent_root = agent_root,
             root = root,
             session = shell_quote(&self.session_name),
+            legacy_session = shell_quote(&legacy_session_name(&self.agent_id)),
             window = shell_quote(&self.window_name),
             watchdog_window = shell_quote(&self.watchdog_window_name),
             controller = shell_quote(&self.controller_id),
@@ -1514,6 +1555,7 @@ impl TmuxProcessDescriptor {
                 "root=\"{root}\"\n",
                 "session={session}\n",
                 "window={window}\n",
+                "watchdog_window={watchdog_window}\n",
                 "{output_drain_function}",
                 "{ownership}\n",
                 "if [ -f \"$root/status\" ]; then\n",
@@ -1632,6 +1674,7 @@ impl TmuxProcessDescriptor {
             root = root,
             session = shell_quote(&self.session_name),
             window = shell_quote(&self.window_name),
+            watchdog_window = shell_quote(&self.watchdog_window_name),
             ownership = self.ownership_guard(),
             recovery_key = recovery_key,
             termination = self.confirmed_process_group_termination(),
@@ -1910,7 +1953,9 @@ impl TmuxProcessDescriptor {
             concat!(
                 "set -eu\n",
                 "root=\"{root}\"\n",
+                "session={session}\n",
                 "window={window}\n",
+                "watchdog_window={watchdog_window}\n",
                 "{output_drain_function}",
                 "{ownership}\n",
                 "process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true)\n",
@@ -2001,9 +2046,11 @@ impl TmuxProcessDescriptor {
                 "trap - HUP INT TERM\n"
             ),
             root = root,
+            session = shell_quote(&self.session_name),
             ownership = self.ownership_guard(),
             termination_key = termination_key,
             window = shell_quote(&self.window_name),
+            watchdog_window = shell_quote(&self.watchdog_window_name),
             termination = self.confirmed_process_group_termination(),
             output_drain_function = output_drain_function_fragment(),
         )
@@ -2013,98 +2060,99 @@ impl TmuxProcessDescriptor {
         &self,
         transport: &crate::ssh_transport::SshTransport,
     ) -> Result<(), ExecServerError> {
+        self.run_control(transport, &self.cleanup_command(), "cleanup")
+            .await
+    }
+
+    fn cleanup_command(&self) -> String {
         let root = self.remote_directory();
-        let command = format!(
-            "root=\"{root}\"; if {}; then {}; fi",
+        format!(
+            "root=\"{root}\"; session={session}; window={window}; watchdog_window={watchdog_window}; if {}; then {}; fi",
             self.ownership_check(),
-            self.confirmed_process_group_termination()
-        );
-        self.run_control(transport, &command, "cleanup").await
+            self.confirmed_process_group_termination(),
+            session = shell_quote(&self.session_name),
+            window = shell_quote(&self.window_name),
+            watchdog_window = shell_quote(&self.watchdog_window_name),
+        )
     }
 
     fn confirmed_process_group_termination(&self) -> String {
-        format!(
-            concat!(
-                "process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true)\n",
-                "pane_pid=${{process_identity%%:*}}\n",
-                "pgid=${{process_identity#*:}}\n",
-                "case \"$pane_pid:$pgid\" in :|:*|*:|*[!0-9:]*) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac\n",
-                "stored_window_id=$(cat \"$root/window-id\" 2>/dev/null || true)\n",
-                "stored_pane_id=$(cat \"$root/pane-id\" 2>/dev/null || true)\n",
-                "{{ [ -n \"$stored_window_id\" ] && [ -n \"$stored_pane_id\" ]; }} || {{ [ -z \"$stored_window_id\" ] && [ -z \"$stored_pane_id\" ]; }} || {{ echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }}\n",
-                "payload_identity=$(cat \"$root/payload-identity\" 2>/dev/null || true)\n",
-                "has_payload=0\n",
-                "payload_pid=\n",
-                "payload_pgid=\n",
-                "if [ -n \"$payload_identity\" ] || [ -f \"$root/payload-ready\" ]; then\n",
-                "  payload_pid=${{payload_identity%%:*}}\n",
-                "  payload_pgid=${{payload_identity#*:}}\n",
-                "  case \"$payload_pid:$payload_pgid\" in :|:*|*:|*[!0-9:]*) echo AGENTAPP_TMUX_PAYLOAD_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
-                "  [ \"$payload_pid\" != \"$pane_pid\" ] && [ \"$payload_pgid\" = \"$pgid\" ] || {{ echo AGENTAPP_TMUX_PAYLOAD_GROUP_MISMATCH >&2; exit 80; }}\n",
-                "  has_payload=1\n",
-                "fi\n",
-                "agentapp_termination_probe_group() {{\n",
-                "  agentapp_termination_group_state=unknown\n",
-                "  termination_group=$1\n",
-                "  [ -x /bin/kill ] || return\n",
-                "  if /bin/kill -0 -- \"-$termination_group\" 2>/dev/null; then agentapp_termination_group_state=alive; return; fi\n",
-                "  if agentapp_kill_error=$(LC_ALL=C /bin/kill -0 -- \"-$termination_group\" 2>&1); then agentapp_termination_group_state=alive; return; fi\n",
-                "  case \"$agentapp_kill_error\" in *\"No such process\"*) agentapp_termination_group_state=dead ;; esac\n",
-                "}}\n",
-                "agentapp_termination_stop_payload() {{\n",
-                "  [ \"$has_payload\" -eq 1 ] || return 0\n",
-                "  live_payload_pgid=$(command -p ps -o pgid= -p \"$payload_pid\" 2>/dev/null | tr -d ' ')\n",
-                "  if [ \"$live_payload_pgid\" = \"$payload_pgid\" ]; then\n",
-                "    /bin/kill -TERM -- \"-$payload_pgid\" 2>/dev/null || true\n",
-                "    i=0\n",
-                "    while [ \"$i\" -lt 10 ]; do current_payload_pgid=$(command -p ps -o pgid= -p \"$payload_pid\" 2>/dev/null | tr -d ' '); [ \"$current_payload_pgid\" = \"$payload_pgid\" ] || break; sleep 1; i=$((i + 1)); done\n",
-                "    current_payload_pgid=$(command -p ps -o pgid= -p \"$payload_pid\" 2>/dev/null | tr -d ' ')\n",
-                "    if [ \"$current_payload_pgid\" = \"$payload_pgid\" ]; then /bin/kill -KILL -- \"-$payload_pgid\" 2>/dev/null || true; i=0; while [ \"$i\" -lt 5 ]; do current_payload_pgid=$(command -p ps -o pgid= -p \"$payload_pid\" 2>/dev/null | tr -d ' '); [ \"$current_payload_pgid\" = \"$payload_pgid\" ] || break; sleep 1; i=$((i + 1)); done; fi\n",
-                "  elif [ -n \"$live_payload_pgid\" ]; then\n",
-                "    echo AGENTAPP_TMUX_PAYLOAD_IDENTITY_MISMATCH >&2\n",
-                "    exit 80\n",
-                "  fi\n",
-                "}}\n",
-                "window_exists=0\n",
-                "current_window_id=\n",
-                "if tmux list-windows -t {session} -F '#{{window_name}}' 2>/dev/null | grep -Fqx {window}; then window_exists=1; fi\n",
-                "if [ \"$window_exists\" -eq 1 ]; then\n",
-                "  [ \"$(tmux list-panes -t {window_target} -F '#{{pane_id}}' 2>/dev/null | wc -l | tr -d ' ')\" = 1 ] || {{ echo AGENTAPP_TMUX_PANE_COUNT_MISMATCH >&2; exit 80; }}\n",
-                "  pane_observation=$(tmux display-message -p -t {target} '#{{window_id}}:#{{pane_id}}:#{{pane_pid}}:#{{pane_dead}}' 2>/dev/null || true)\n",
-                "  old_ifs=$IFS; IFS=:; set -- $pane_observation; IFS=$old_ifs\n",
-                "  [ \"$#\" -eq 4 ] || {{ echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }}\n",
-                "  current_window_id=$1; current_pane_id=$2; current_pane=$3; current_pane_dead=$4\n",
-                "  [ \"$current_pane\" = \"$pane_pid\" ] || {{ echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }}\n",
-                "  if [ -n \"$stored_window_id\" ]; then [ \"$stored_window_id:$stored_pane_id\" = \"$current_window_id:$current_pane_id\" ] || {{ echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }}; fi\n",
-                "  case \"$current_pane_dead\" in\n",
-                "    0)\n",
-                "      current_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' ')\n",
-                "      [ \"$current_pgid\" = \"$pgid\" ] || {{ echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }}\n",
-                "      agentapp_termination_stop_payload\n",
-                "      if kill -0 \"-$pgid\" 2>/dev/null; then kill -TERM \"-$pgid\" 2>/dev/null || true; i=0; while kill -0 \"-$pgid\" 2>/dev/null && [ \"$i\" -lt 10 ]; do sleep 1; i=$((i + 1)); done; fi\n",
-                "      if kill -0 \"-$pgid\" 2>/dev/null; then kill -KILL \"-$pgid\" 2>/dev/null || true; i=0; while kill -0 \"-$pgid\" 2>/dev/null && [ \"$i\" -lt 5 ]; do sleep 1; i=$((i + 1)); done; fi\n",
-                "      ;;\n",
-                "    1)\n",
-                "      [ -n \"$stored_window_id\" ] || {{ echo AGENTAPP_TMUX_DEAD_PANE_IDENTITY_UNKNOWN >&2; exit 80; }}\n",
-                "      ;;\n",
-                "    *) echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80 ;;\n",
-                "  esac\n",
-                "elif kill -0 \"-$pgid\" 2>/dev/null; then\n",
-                "  echo AGENTAPP_TMUX_PROCESS_IDENTITY_UNKNOWN >&2\n",
-                "  exit 80\n",
-                "fi\n",
-                "agentapp_termination_probe_group \"$pgid\"\n",
-                "case \"$agentapp_termination_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_PROCESS_GROUP_ALIVE >&2; exit 81 ;; *) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac\n",
-                "if [ \"$window_exists\" -eq 1 ]; then tmux kill-window -t \"$current_window_id\" 2>/dev/null || true; fi\n",
-                "if tmux list-windows -t {session} -F '#{{window_name}}' 2>/dev/null | grep -Fqx {window}; then echo AGENTAPP_TMUX_TERMINATION_UNCONFIRMED >&2; exit 78; fi\n",
-                "tmux kill-window -t {watchdog} 2>/dev/null || true"
-            ),
-            session = shell_quote(&self.session_name),
-            window = shell_quote(&self.window_name),
-            window_target = shell_quote(&format!("{}:{}", self.session_name, self.window_name)),
-            target = shell_quote(&self.target()),
-            watchdog = shell_quote(&self.watchdog_target()),
-        )
+        concat!(
+            "process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true)\n",
+            "pane_pid=${process_identity%%:*}\n",
+            "pgid=${process_identity#*:}\n",
+            "case \"$pane_pid:$pgid\" in :|:*|*:|*[!0-9:]*) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac\n",
+            "stored_window_id=$(cat \"$root/window-id\" 2>/dev/null || true)\n",
+            "stored_pane_id=$(cat \"$root/pane-id\" 2>/dev/null || true)\n",
+            "{ [ -n \"$stored_window_id\" ] && [ -n \"$stored_pane_id\" ]; } || { [ -z \"$stored_window_id\" ] && [ -z \"$stored_pane_id\" ]; } || { echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }\n",
+            "payload_identity=$(cat \"$root/payload-identity\" 2>/dev/null || true)\n",
+            "has_payload=0\n",
+            "payload_pid=\n",
+            "payload_pgid=\n",
+            "if [ -n \"$payload_identity\" ] || [ -f \"$root/payload-ready\" ]; then\n",
+            "  payload_pid=${payload_identity%%:*}\n",
+            "  payload_pgid=${payload_identity#*:}\n",
+            "  case \"$payload_pid:$payload_pgid\" in :|:*|*:|*[!0-9:]*) echo AGENTAPP_TMUX_PAYLOAD_IDENTITY_UNKNOWN >&2; exit 80 ;; esac\n",
+            "  [ \"$payload_pid\" != \"$pane_pid\" ] && [ \"$payload_pgid\" = \"$pgid\" ] || { echo AGENTAPP_TMUX_PAYLOAD_GROUP_MISMATCH >&2; exit 80; }\n",
+            "  has_payload=1\n",
+            "fi\n",
+            "agentapp_termination_probe_group() {\n",
+            "  agentapp_termination_group_state=unknown\n",
+            "  termination_group=$1\n",
+            "  [ -x /bin/kill ] || return\n",
+            "  if /bin/kill -0 -- \"-$termination_group\" 2>/dev/null; then agentapp_termination_group_state=alive; return; fi\n",
+            "  if agentapp_kill_error=$(LC_ALL=C /bin/kill -0 -- \"-$termination_group\" 2>&1); then agentapp_termination_group_state=alive; return; fi\n",
+            "  case \"$agentapp_kill_error\" in *\"No such process\"*) agentapp_termination_group_state=dead ;; esac\n",
+            "}\n",
+            "agentapp_termination_stop_payload() {\n",
+            "  [ \"$has_payload\" -eq 1 ] || return 0\n",
+            "  live_payload_pgid=$(command -p ps -o pgid= -p \"$payload_pid\" 2>/dev/null | tr -d ' ')\n",
+            "  if [ \"$live_payload_pgid\" = \"$payload_pgid\" ]; then\n",
+            "    /bin/kill -TERM -- \"-$payload_pgid\" 2>/dev/null || true\n",
+            "    i=0\n",
+            "    while [ \"$i\" -lt 10 ]; do current_payload_pgid=$(command -p ps -o pgid= -p \"$payload_pid\" 2>/dev/null | tr -d ' '); [ \"$current_payload_pgid\" = \"$payload_pgid\" ] || break; sleep 1; i=$((i + 1)); done\n",
+            "    current_payload_pgid=$(command -p ps -o pgid= -p \"$payload_pid\" 2>/dev/null | tr -d ' ')\n",
+            "    if [ \"$current_payload_pgid\" = \"$payload_pgid\" ]; then /bin/kill -KILL -- \"-$payload_pgid\" 2>/dev/null || true; i=0; while [ \"$i\" -lt 5 ]; do current_payload_pgid=$(command -p ps -o pgid= -p \"$payload_pid\" 2>/dev/null | tr -d ' '); [ \"$current_payload_pgid\" = \"$payload_pgid\" ] || break; sleep 1; i=$((i + 1)); done; fi\n",
+            "  elif [ -n \"$live_payload_pgid\" ]; then\n",
+            "    echo AGENTAPP_TMUX_PAYLOAD_IDENTITY_MISMATCH >&2\n",
+            "    exit 80\n",
+            "  fi\n",
+            "}\n",
+            "window_exists=0\n",
+            "current_window_id=\n",
+            "if tmux list-windows -t \"$session\" -F '#{window_name}' 2>/dev/null | grep -Fqx \"$window\"; then window_exists=1; fi\n",
+            "if [ \"$window_exists\" -eq 1 ]; then\n",
+            "  [ \"$(tmux list-panes -t \"$session:$window\" -F '#{pane_id}' 2>/dev/null | wc -l | tr -d ' ')\" = 1 ] || { echo AGENTAPP_TMUX_PANE_COUNT_MISMATCH >&2; exit 80; }\n",
+            "  pane_observation=$(tmux display-message -p -t \"$session:$window.0\" '#{window_id}:#{pane_id}:#{pane_pid}:#{pane_dead}' 2>/dev/null || true)\n",
+            "  old_ifs=$IFS; IFS=:; set -- $pane_observation; IFS=$old_ifs\n",
+            "  [ \"$#\" -eq 4 ] || { echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }\n",
+            "  current_window_id=$1; current_pane_id=$2; current_pane=$3; current_pane_dead=$4\n",
+            "  [ \"$current_pane\" = \"$pane_pid\" ] || { echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }\n",
+            "  if [ -n \"$stored_window_id\" ]; then [ \"$stored_window_id:$stored_pane_id\" = \"$current_window_id:$current_pane_id\" ] || { echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }; fi\n",
+            "  case \"$current_pane_dead\" in\n",
+            "    0)\n",
+            "      current_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' ')\n",
+            "      [ \"$current_pgid\" = \"$pgid\" ] || { echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; }\n",
+            "      agentapp_termination_stop_payload\n",
+            "      if kill -0 \"-$pgid\" 2>/dev/null; then kill -TERM \"-$pgid\" 2>/dev/null || true; i=0; while kill -0 \"-$pgid\" 2>/dev/null && [ \"$i\" -lt 10 ]; do sleep 1; i=$((i + 1)); done; fi\n",
+            "      if kill -0 \"-$pgid\" 2>/dev/null; then kill -KILL \"-$pgid\" 2>/dev/null || true; i=0; while kill -0 \"-$pgid\" 2>/dev/null && [ \"$i\" -lt 5 ]; do sleep 1; i=$((i + 1)); done; fi\n",
+            "      ;;\n",
+            "    1)\n",
+            "      [ -n \"$stored_window_id\" ] || { echo AGENTAPP_TMUX_DEAD_PANE_IDENTITY_UNKNOWN >&2; exit 80; }\n",
+            "      ;;\n",
+            "    *) echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80 ;;\n",
+            "  esac\n",
+            "elif kill -0 \"-$pgid\" 2>/dev/null; then\n",
+            "  echo AGENTAPP_TMUX_PROCESS_IDENTITY_UNKNOWN >&2\n",
+            "  exit 80\n",
+            "fi\n",
+            "agentapp_termination_probe_group \"$pgid\"\n",
+            "case \"$agentapp_termination_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_PROCESS_GROUP_ALIVE >&2; exit 81 ;; *) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac\n",
+            "if [ \"$window_exists\" -eq 1 ]; then tmux kill-window -t \"$current_window_id\" 2>/dev/null || true; fi\n",
+            "if tmux list-windows -t \"$session\" -F '#{window_name}' 2>/dev/null | grep -Fqx \"$window\"; then echo AGENTAPP_TMUX_TERMINATION_UNCONFIRMED >&2; exit 78; fi\n",
+            "tmux kill-window -t \"$session:$watchdog_window\" 2>/dev/null || true\n",
+            "tmux kill-window -t \"$session:__agentapp_keeper\" 2>/dev/null || true"
+        ).to_string()
     }
 
     fn ownership_check(&self) -> String {
@@ -2162,7 +2210,6 @@ fn prepared_rollback_fragment(agent_id: &str, process_id: &str) -> String {
             "    state=launch-interrupted\n",
             "  fi\n",
             "  if {{ [ \"$state\" = prepared ] || [ \"$state\" = running ]; }} && [ ! -e \"$root/go\" ]; then\n",
-            "    expected_session=agentapp_{agent_id}\n",
             "    expected_window=p_{process_id}\n",
             "    watchdog_window=w_{process_id}\n",
             "    agentapp_window_exists() {{\n",
@@ -2297,6 +2344,7 @@ fn prepared_rollback_fragment(agent_id: &str, process_id: &str) -> String {
             "    if [ \"$exact_window_exists\" -eq 1 ]; then tmux kill-window -t \"$expected_session:$watchdog_window\" 2>/dev/null || true; fi\n",
             "    agentapp_window_exists \"$watchdog_window\"\n",
             "    [ \"$exact_window_exists\" -eq 0 ] || {{ echo AGENTAPP_TMUX_RECONCILE_WATCHDOG_PRESENT >&2; exit 78; }}\n",
+            "    tmux kill-window -t \"$expected_session:__agentapp_keeper\" 2>/dev/null || true\n",
             "    state=$(cat \"$root/state\" 2>/dev/null || true)\n",
             "    [ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$next\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_CHANGED >&2; exit 79; }}\n",
             "    {{ [ \"$state\" = prepared ] || [ \"$state\" = running ]; }} && [ ! -e \"$root/go\" ] || {{ echo AGENTAPP_TMUX_TRANSITION_STATE_CHANGED >&2; exit 79; }}\n",
@@ -2319,7 +2367,6 @@ fn prepared_rollback_fragment(agent_id: &str, process_id: &str) -> String {
             "    state=launch-interrupted\n",
             "  fi\n"
         ),
-        agent_id = agent_id,
         process_id = process_id,
         recovery_key = recovery_key,
     )
@@ -2340,7 +2387,6 @@ fn stale_running_recovery_loss_fragment(agent_id: &str, process_id: &str) -> Str
         concat!(
             "  stale_terminal_kind=$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\n",
             "  if [ \"$state\" = running ] && [ -e \"$root/go\" ]; then\n",
-            "    expected_session=agentapp_{agent_id}\n",
             "    expected_window=p_{process_id}\n",
             "    watchdog_window=w_{process_id}\n",
             "    stored_window=$(cat \"$root/window\" 2>/dev/null || true)\n",
@@ -2480,6 +2526,7 @@ fn stale_running_recovery_loss_fragment(agent_id: &str, process_id: &str) -> Str
             "      if [ \"$stale_window_exists\" -eq 1 ]; then tmux kill-window -t \"$expected_session:$watchdog_window\" 2>/dev/null || true; fi\n",
             "      agentapp_stale_window_exists \"$watchdog_window\"\n",
             "      [ \"$stale_window_exists\" -eq 0 ] || {{ echo AGENTAPP_TMUX_RECONCILE_WATCHDOG_PRESENT >&2; exit 78; }}\n",
+            "      tmux kill-window -t \"$expected_session:__agentapp_keeper\" 2>/dev/null || true\n",
             "      agentapp_require_stale_claim\n",
             "      stale_terminal_kind=$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\n",
             "      stale_terminal_status=$(cat \"$root/status\" 2>/dev/null || true)\n",
@@ -2525,7 +2572,6 @@ fn stale_running_recovery_loss_fragment(agent_id: &str, process_id: &str) -> Str
             "    fi\n",
             "  fi\n"
         ),
-        agent_id = agent_id,
         process_id = process_id,
         recovery_key = recovery_key,
     )
@@ -2587,15 +2633,16 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
                 "root=\"{root}\"\n",
                 "if [ ! -e \"$root\" ]; then\n",
                 "  expected_window=p_{process_id}\n",
-                "  expected_session=agentapp_{agent_id}\n",
-                "  if session_probe=$(LC_ALL=C tmux has-session -t \"$expected_session\" 2>&1 >/dev/null); then\n",
-                "    windows=$(LC_ALL=C tmux list-windows -t \"$expected_session:\" -F '#{{window_name}}' 2>&1) || {{ echo AGENTAPP_TMUX_RECONCILE_WINDOW_QUERY_FAILED >&2; exit 77; }}\n",
-                "    if printf '%s\\n' \"$windows\" | grep -Fqx \"$expected_window\"; then echo AGENTAPP_TMUX_RECONCILE_ORPHAN_WINDOW >&2; exit 77; fi\n",
-                "  else\n",
-                "    session_status=$?\n",
-                "    [ \"$session_status\" -eq 1 ] || {{ echo AGENTAPP_TMUX_RECONCILE_SESSION_QUERY_FAILED >&2; exit 77; }}\n",
-                "    case \"$session_probe\" in *\"can't find session:\"*|*\"no server running on \"*|*\"failed to connect to server: No such file or directory\"*|*\"failed to connect to server: Connection refused\"*) ;; *) echo AGENTAPP_TMUX_RECONCILE_SESSION_QUERY_FAILED >&2; exit 77 ;; esac\n",
-                "  fi\n",
+                "  for expected_session in agentapp_{agent_id}_{process_id} agentapp_{agent_id}; do\n",
+                "    if session_probe=$(LC_ALL=C tmux has-session -t \"$expected_session\" 2>&1 >/dev/null); then\n",
+                "      windows=$(LC_ALL=C tmux list-windows -t \"$expected_session:\" -F '#{{window_name}}' 2>&1) || {{ echo AGENTAPP_TMUX_RECONCILE_WINDOW_QUERY_FAILED >&2; exit 77; }}\n",
+                "      if printf '%s\\n' \"$windows\" | grep -Fqx \"$expected_window\"; then echo AGENTAPP_TMUX_RECONCILE_ORPHAN_WINDOW >&2; exit 77; fi\n",
+                "    else\n",
+                "      session_status=$?\n",
+                "      [ \"$session_status\" -eq 1 ] || {{ echo AGENTAPP_TMUX_RECONCILE_SESSION_QUERY_FAILED >&2; exit 77; }}\n",
+                "      case \"$session_probe\" in *\"can't find session:\"*|*\"no server running on \"*|*\"failed to connect to server: No such file or directory\"*|*\"failed to connect to server: Connection refused\"*) ;; *) echo AGENTAPP_TMUX_RECONCILE_SESSION_QUERY_FAILED >&2; exit 77 ;; esac\n",
+                "    fi\n",
+                "  done\n",
                 "  printf 'AGENTAPP_RECOVERED %s %s %s %s missing - - 0 0 1 - - -\\n' {thread} {turn} {call} {attempt}\n",
                 "else\n",
                 "  [ -d \"$root\" ] || {{ echo AGENTAPP_TMUX_RECONCILE_UNKNOWN >&2; exit 77; }}\n",
@@ -2614,6 +2661,10 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
                 "  session_id=$(cat \"$root/session-id\" 2>/dev/null || printf '-')\n",
                 "  [ \"$session_id\" = {expected_session_id} ] || {{ echo AGENTAPP_TMUX_RECONCILE_SESSION_CONFLICT >&2; exit 77; }}\n",
                 "  [ \"$(cat \"$root/tty\" 2>/dev/null || true)\" = {expected_tty} ] || {{ echo AGENTAPP_TMUX_RECONCILE_STREAM_MODE_CONFLICT >&2; exit 77; }}\n",
+                "  default_session=agentapp_{agent_id}_{process_id}\n",
+                "  legacy_session=agentapp_{agent_id}\n",
+                "  stored_session=$(cat \"$root/session\" 2>/dev/null || true)\n",
+                "  if [ -z \"$stored_session\" ]; then expected_session=$legacy_session; elif [ \"$stored_session\" = \"$default_session\" ] || [ \"$stored_session\" = \"$legacy_session\" ]; then expected_session=$stored_session; else echo AGENTAPP_TMUX_RECONCILE_SESSION_NAME_CONFLICT >&2; exit 77; fi\n",
                 "  state=$(cat \"$root/state\" 2>/dev/null || true)\n",
                 "{prepared_rollback}",
                 "{stale_running_recovery_loss}",
@@ -2650,17 +2701,17 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
                 "      case \"$agentapp_process_group_state\" in dead) process_dead=1 ;; alive) ;; *) identity_valid=0 ;; esac\n",
                 "    fi\n",
                 "    window_absent=0\n",
-                "    if terminal_windows=$(LC_ALL=C tmux list-windows -t agentapp_{agent_id}: -F '#{{window_name}}' 2>&1); then\n",
+                "    if terminal_windows=$(LC_ALL=C tmux list-windows -t \"$expected_session:\" -F '#{{window_name}}' 2>&1); then\n",
                 "      if ! printf '%s\\n' \"$terminal_windows\" | grep -Fqx \"$expected_window\"; then\n",
                 "        window_absent=1\n",
                 "      elif [ \"$process_dead\" -eq 1 ]; then\n",
                 "        stored_window_id=$(cat \"$root/window-id\" 2>/dev/null || true)\n",
                 "        stored_pane_id=$(cat \"$root/pane-id\" 2>/dev/null || true)\n",
-                "        if [ -n \"$stored_window_id\" ] && [ -n \"$stored_pane_id\" ] && [ \"$(tmux list-panes -t agentapp_{agent_id}:$expected_window -F '#{{pane_id}}' 2>/dev/null | wc -l | tr -d ' ')\" = 1 ]; then\n",
-                "          terminal_pane=$(tmux display-message -p -t agentapp_{agent_id}:$expected_window.0 '#{{window_id}}:#{{pane_id}}:#{{pane_pid}}:#{{pane_dead}}' 2>/dev/null || true)\n",
+                "        if [ -n \"$stored_window_id\" ] && [ -n \"$stored_pane_id\" ] && [ \"$(tmux list-panes -t \"$expected_session:$expected_window\" -F '#{{pane_id}}' 2>/dev/null | wc -l | tr -d ' ')\" = 1 ]; then\n",
+                "          terminal_pane=$(tmux display-message -p -t \"$expected_session:$expected_window.0\" '#{{window_id}}:#{{pane_id}}:#{{pane_pid}}:#{{pane_dead}}' 2>/dev/null || true)\n",
                 "          if [ \"$terminal_pane\" = \"$stored_window_id:$stored_pane_id:$pane_pid:1\" ]; then\n",
                 "            tmux kill-window -t \"$stored_window_id\" 2>/dev/null || true\n",
-                "            if terminal_windows=$(LC_ALL=C tmux list-windows -t agentapp_{agent_id}: -F '#{{window_name}}' 2>&1); then\n",
+                "            if terminal_windows=$(LC_ALL=C tmux list-windows -t \"$expected_session:\" -F '#{{window_name}}' 2>&1); then\n",
                 "              if ! printf '%s\\n' \"$terminal_windows\" | grep -Fqx \"$expected_window\"; then window_absent=1; fi\n",
                 "            else\n",
                 "              case \"$terminal_windows\" in *\"can't find session:\"*|*\"no server running on \"*|*\"failed to connect to server: No such file or directory\"*|*\"failed to connect to server: Connection refused\"*) window_absent=1 ;; *) identity_valid=0 ;; esac\n",
@@ -2671,7 +2722,11 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
                 "    else\n",
                 "      case \"$terminal_windows\" in *\"can't find session:\"*|*\"no server running on \"*|*\"failed to connect to server: No such file or directory\"*|*\"failed to connect to server: Connection refused\"*) window_absent=1 ;; *) identity_valid=0 ;; esac\n",
                 "    fi\n",
-                "    if [ \"$identity_valid\" -eq 1 ] && [ \"$process_dead\" -eq 1 ] && [ \"$window_absent\" -eq 1 ]; then terminal_verified_dead=1; fi\n",
+                "    if [ \"$identity_valid\" -eq 1 ] && [ \"$process_dead\" -eq 1 ] && [ \"$window_absent\" -eq 1 ]; then\n",
+                "      tmux kill-window -t \"$expected_session:w_{process_id}\" 2>/dev/null || true\n",
+                "      tmux kill-window -t \"$expected_session:__agentapp_keeper\" 2>/dev/null || true\n",
+                "      terminal_verified_dead=1\n",
+                "    fi\n",
                 "  fi\n",
                 "  [ -f \"$root/recovery-required\" ] && recovered=unknown\n",
                 "  [ -r \"$root/output\" ] || {{ echo AGENTAPP_TMUX_RECONCILE_OUTPUT_UNREADABLE >&2; exit 77; }}\n",
@@ -2828,7 +2883,10 @@ fn acknowledgement_command(
             "[ \"$token\" = \"$process_id-$token_proof\" ] && [ \"${{#token_proof}}\" -eq 64 ] || {{ echo AGENTAPP_TMUX_ACK_BAD_TOKEN >&2; exit 78; }}\n",
             "case \"$token_proof\" in *[!0-9a-f]*) echo AGENTAPP_TMUX_ACK_BAD_TOKEN >&2; exit 78 ;; esac\n",
             "root=\"$base/$process_id\"\n",
-            "session=agentapp_{agent_id}\n",
+            "default_session=\"agentapp_{agent_id}_$process_id\"\n",
+            "legacy_session=agentapp_{agent_id}\n",
+            "stored_session=$(cat \"$root/session\" 2>/dev/null || true)\n",
+            "if [ -z \"$stored_session\" ]; then session=$legacy_session; elif [ \"$stored_session\" = \"$default_session\" ] || [ \"$stored_session\" = \"$legacy_session\" ]; then session=$stored_session; else echo AGENTAPP_TMUX_ACK_SESSION_MISMATCH >&2; exit 78; fi\n",
             "expected_window=\"p_$process_id\"\n",
             "watchdog_window=\"w_$process_id\"\n",
             "tombstone=\"$base/.acknowledged-$process_id-{acknowledgement_key}\"\n",
@@ -2844,7 +2902,7 @@ fn acknowledgement_command(
             "  for entry in \"$root\"/* \"$root\"/.[!.]* \"$root\"/..?*; do\n",
             "    {{ [ -e \"$entry\" ] || [ -L \"$entry\" ]; }} || continue\n",
             "    name=${{entry##*/}}\n",
-            "    case \"$name\" in output-closed) [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78; }} ;; output-closed.*) output_receipt_generation=${{name#output-closed.}}; case \"$output_receipt_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78 ;; esac; [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78; }} ;; command.sh|payload.sh|sentinel.sh|watchdog.sh|output|output-pipe-generation|output-pipe-generation.tmp|stdin|go|go.tmp|supervisor-ready|supervisor-ready.tmp|payload-go|payload-go.tmp|payload-ready|payload-ready.tmp|payload-identity|payload-identity.tmp|sentinel-release|sentinel-release.tmp|sentinel-ready|sentinel-ready.tmp|sentinel-identity|sentinel-identity.tmp|release|status|status.tmp|state|state.tmp|owner|identity|thread-id|turn-id|call-id|attempt-generation|session-id|tty|acknowledgement-token|digest|window|window-id|window-id.tmp|pane-id|pane-id.tmp|pane-death-status|pane-death-status.tmp|process-identity|process-identity.tmp|controller|controller.tmp|lease|lease.tmp|lease-generation|lease-generation.tmp|recovery-required|recovery-required.tmp|transition-claim|terminal-claim|.transition-candidate.*|transition-claim.quarantine.*) ;; stdin-write-*.claim|stdin-write-*.result|.stdin-write-*) [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_STDIN_ENTRY >&2; exit 78; }} ;; proof-key|.proof-candidate.*) [ \"$root\" = \"$legacy_tombstone\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78; }} ;; *) echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78 ;; esac\n",
+            "    case \"$name\" in output-closed) [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78; }} ;; output-closed.*) output_receipt_generation=${{name#output-closed.}}; case \"$output_receipt_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78 ;; esac; [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78; }} ;; command.sh|payload.sh|sentinel.sh|watchdog.sh|output|output-pipe-generation|output-pipe-generation.tmp|stdin|go|go.tmp|supervisor-ready|supervisor-ready.tmp|payload-go|payload-go.tmp|payload-ready|payload-ready.tmp|payload-identity|payload-identity.tmp|sentinel-release|sentinel-release.tmp|sentinel-ready|sentinel-ready.tmp|sentinel-identity|sentinel-identity.tmp|release|status|status.tmp|state|state.tmp|owner|identity|thread-id|turn-id|call-id|attempt-generation|session-id|session|tty|acknowledgement-token|digest|window|window-id|window-id.tmp|pane-id|pane-id.tmp|pane-death-status|pane-death-status.tmp|process-identity|process-identity.tmp|controller|controller.tmp|lease|lease.tmp|lease-generation|lease-generation.tmp|recovery-required|recovery-required.tmp|transition-claim|terminal-claim|.transition-candidate.*|transition-claim.quarantine.*) ;; stdin-write-*.claim|stdin-write-*.result|.stdin-write-*) [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_STDIN_ENTRY >&2; exit 78; }} ;; proof-key|.proof-candidate.*) [ \"$root\" = \"$legacy_tombstone\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78; }} ;; *) echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78 ;; esac\n",
             "  done\n",
             "  if [ -d \"$root/terminal-claim\" ]; then\n",
             "    for terminal_entry in \"$root/terminal-claim\"/* \"$root/terminal-claim\"/.[!.]* \"$root/terminal-claim\"/..?*; do\n",
@@ -2861,6 +2919,7 @@ fn acknowledgement_command(
             "agentapp_cleanup_ack_tombstone() {{\n",
             "  agentapp_ack_preflight_root\n",
             "  rm -f \"$root/command.sh\" \"$root/payload.sh\" \"$root/sentinel.sh\" \"$root/watchdog.sh\" \"$root/output\" \"$root/output-closed\" \"$root/output-pipe-generation\" \"$root/output-pipe-generation.tmp\" \"$root/stdin\" \"$root/go\" \"$root/go.tmp\" \"$root/supervisor-ready\" \"$root/supervisor-ready.tmp\" \"$root/payload-go\" \"$root/payload-go.tmp\" \"$root/payload-ready\" \"$root/payload-ready.tmp\" \"$root/payload-identity\" \"$root/payload-identity.tmp\" \"$root/sentinel-release\" \"$root/sentinel-release.tmp\" \"$root/sentinel-ready\" \"$root/sentinel-ready.tmp\" \"$root/sentinel-identity\" \"$root/sentinel-identity.tmp\" \"$root/release\" \"$root/status\" \"$root/status.tmp\" \"$root/state\" \"$root/state.tmp\" \"$root/owner\" \"$root/identity\" \"$root/thread-id\" \"$root/turn-id\" \"$root/call-id\" \"$root/attempt-generation\" \"$root/session-id\" \"$root/tty\" \"$root/acknowledgement-token\" \"$root/digest\" \"$root/window\" \"$root/window-id\" \"$root/window-id.tmp\" \"$root/pane-id\" \"$root/pane-id.tmp\" \"$root/pane-death-status\" \"$root/pane-death-status.tmp\" \"$root/process-identity\" \"$root/process-identity.tmp\" \"$root/controller\" \"$root/controller.tmp\" \"$root/lease\" \"$root/lease.tmp\" \"$root/lease-generation\" \"$root/lease-generation.tmp\" \"$root/recovery-required\" \"$root/recovery-required.tmp\" \"$root/terminal-claim/kind\"\n",
+            "  rm -f \"$root/session\"\n",
             "  for output_receipt in \"$root\"/output-closed.*; do\n",
             "    {{ [ -e \"$output_receipt\" ] || [ -L \"$output_receipt\" ]; }} || continue\n",
             "    output_receipt_name=${{output_receipt##*/}}\n",
@@ -2979,6 +3038,7 @@ fn acknowledgement_command(
             "fi\n",
             "agentapp_ack_terminal_proof\n",
             "if [ \"$watchdog_window_present\" -eq 1 ]; then tmux kill-window -t \"$session:$watchdog_window\" 2>/dev/null || true; fi\n",
+            "tmux kill-window -t \"$session:__agentapp_keeper\" 2>/dev/null || true\n",
             "for stdin_claim in \"$root\"/stdin-write-*.claim; do\n",
             "  [ -e \"$stdin_claim\" ] || continue\n",
             "  stdin_name=${{stdin_claim##*/}}\n",
@@ -3246,6 +3306,14 @@ fn stable_identifier(value: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn legacy_session_name(agent_id: &str) -> String {
+    format!("agentapp_{agent_id}")
+}
+
+fn execution_session_name(agent_id: &str, process_id: &str) -> String {
+    format!("{}_{process_id}", legacy_session_name(agent_id))
 }
 
 #[cfg(test)]
