@@ -27,7 +27,11 @@ use codex_protocol::items::UserMessageItem;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::ItemStartedEvent;
+use codex_protocol::protocol::RateLimitReachedType;
+use codex_protocol::protocol::RateLimitSnapshot;
 
 use super::AGENTAPP_BROWSER_TOOL_NAMES;
 use super::CONTEXT_LOCK_FILE;
@@ -36,6 +40,7 @@ use super::KIND_CONTEXT_COMPACTION_STARTED;
 use super::KIND_DONE;
 use super::KIND_ERROR;
 use super::KIND_ITEM_STARTED;
+use super::KIND_STRUCTURED_ERROR;
 use super::KIND_TURN_READY;
 use super::KIND_TURN_STARTING;
 use super::PersistedThreadPointer;
@@ -61,6 +66,7 @@ use super::finish_host_detach_cleanup;
 use super::finish_turn_after_cleanup;
 use super::finish_turn_with_cleanup;
 use super::interrupted_model_turn_cleanup_error;
+use super::ios_error_payload;
 use super::model_context_resume_error_class;
 use super::model_context_resume_error_reason;
 use super::parse_agentapp_dynamic_tools_json;
@@ -108,6 +114,80 @@ fn effort(effort: ReasoningEffort) -> ReasoningEffortPreset {
         effort,
         description: String::new(),
     }
+}
+
+#[test]
+fn structured_error_payload_preserves_usage_limit_classification() {
+    let error = ErrorEvent {
+        message: "Usage limit reached".to_string(),
+        codex_error_info: Some(CodexErrorInfo::UsageLimitExceeded),
+    };
+    let rate_limits = RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: Some("Codex".to_string()),
+        primary: None,
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        spend_control_reached: Some(false),
+        plan_type: None,
+        rate_limit_reached_type: Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted),
+    };
+
+    let payload = ios_error_payload(&error, Some(&rate_limits)).expect("serialize error envelope");
+    let payload: serde_json::Value = serde_json::from_str(&payload).expect("parse error envelope");
+
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "contract_version": 1,
+            "code": "usage_limit_exceeded",
+            "message": "Usage limit reached",
+            "rate_limits": {
+                "limit_id": "codex",
+                "limit_name": "Codex",
+                "primary": null,
+                "secondary": null,
+                "credits": null,
+                "individual_limit": null,
+                "spend_control_reached": false,
+                "plan_type": null,
+                "rate_limit_reached_type": "workspace_member_credits_depleted"
+            }
+        })
+    );
+    assert_eq!(KIND_STRUCTURED_ERROR, 18);
+}
+
+#[test]
+fn structured_unauthorized_error_does_not_attach_unrelated_rate_limits() {
+    let error = ErrorEvent {
+        message: "Sign in again".to_string(),
+        codex_error_info: Some(CodexErrorInfo::Unauthorized),
+    };
+    let rate_limits = RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
+        primary: None,
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        spend_control_reached: None,
+        plan_type: None,
+        rate_limit_reached_type: Some(RateLimitReachedType::RateLimitReached),
+    };
+
+    let payload = ios_error_payload(&error, Some(&rate_limits)).expect("serialize error envelope");
+    let payload: serde_json::Value = serde_json::from_str(&payload).expect("parse error envelope");
+
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "contract_version": 1,
+            "code": "unauthorized",
+            "message": "Sign in again"
+        })
+    );
 }
 
 #[test]
@@ -600,17 +680,23 @@ fn failed_protected_first_turn_leaves_a_resumable_rollout() {
         .expect("ready event");
     let error_index = first_kinds
         .iter()
-        .position(|kind| *kind == KIND_ERROR)
+        .position(|kind| *kind == KIND_STRUCTURED_ERROR)
         .expect("protected error");
     assert!(starting_index < ready_index);
     assert!(ready_index < error_index);
     assert_eq!(
         first
             .iter()
-            .filter(|(kind, _)| *kind == KIND_ERROR)
-            .map(|(_, message)| message.as_str())
+            .filter(|(kind, _)| *kind == KIND_STRUCTURED_ERROR)
+            .map(|(_, payload)| {
+                serde_json::from_str::<serde_json::Value>(payload)
+                    .expect("structured error payload")["message"]
+                    .as_str()
+                    .expect("structured error message")
+                    .to_string()
+            })
             .collect::<Vec<_>>(),
-        vec!["A protected turn failed."]
+        vec!["A protected turn failed.".to_string()]
     );
     assert!(!first.iter().any(|(kind, _)| *kind == KIND_DONE));
 
@@ -629,11 +715,14 @@ fn failed_protected_first_turn_leaves_a_resumable_rollout() {
     );
 
     let second = run_apikey_turn_against(home.path(), &server.base_url);
-    assert!(
-        second.iter().any(|(kind, message)| {
-            *kind == KIND_ERROR && message == "A protected turn failed."
-        })
-    );
+    assert!(second.iter().any(|(kind, payload)| {
+        *kind == KIND_STRUCTURED_ERROR
+            && serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|value| value["message"].as_str().map(str::to_string))
+                .as_deref()
+                == Some("A protected turn failed.")
+    }));
     assert!(
         !second
             .iter()

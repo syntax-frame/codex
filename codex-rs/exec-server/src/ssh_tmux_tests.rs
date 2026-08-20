@@ -238,6 +238,8 @@ fn bootstrap_compare_and_attach_is_exact_and_generation_fenced() {
     assert!(command.contains("controller-$candidate_controller"));
     assert!(command.contains("agentapp-tmux-v2"));
     assert!(command.contains("watchdog.sh"));
+    assert!(command.contains("AGENTAPP_TMUX_RESOURCE_EXHAUSTED"));
+    assert!(command.contains("ulimit -S -n \"$desired\""));
     assert!(
         command.find("tmux new-window -d -t \"$session:\" -n \"$watchdog_window\"")
             < command.find("tmux new-window -d -t \"$session:\" -n \"$window\"")
@@ -296,9 +298,9 @@ fn bootstrap_protects_the_supervisor_and_pins_native_dead_pane_evidence_before_g
     assert!(sentinel.contains("/bin/kill -KILL -- \"-$expected_pgid\""));
     assert!(bootstrap.contains("payload-ready"));
     assert!(bootstrap.contains("AGENTAPP_TMUX_PAYLOAD_RELEASE_MISSING"));
-    assert!(watchdog.contains("pane_dead"));
-    assert!(watchdog.contains("stored_window_id:$stored_pane_id:1"));
-    assert!(watchdog.contains("tmux kill-window -t \"$stored_window_id\""));
+    assert!(!watchdog.contains("pane_dead"));
+    assert!(!watchdog.contains("stored_window_id"));
+    assert!(!watchdog.contains("kill-window"));
     assert!(!process.contains("COMPLETED_WINDOW_RETENTION_SECONDS"));
 }
 
@@ -2589,7 +2591,7 @@ fn acknowledgement_legacy_token_tombstone_is_bound_once_to_the_durable_terminal_
 }
 
 #[test]
-fn watchdog_classifies_expiry_and_only_retires_proven_terminal_pane_evidence() {
+fn watchdog_classifies_expiry_and_exits_when_terminal_status_is_published() {
     let params = exec_params("process", "sleep 30");
     let descriptor = TmuxProcessDescriptor::new("agent", "1720000000000-controller", &params);
     let script = descriptor.watchdog_script();
@@ -2601,9 +2603,9 @@ fn watchdog_classifies_expiry_and_only_retires_proven_terminal_pane_evidence() {
     assert!(script.contains("printf '%s:%s\\n' \"$observed_generation\" \"$observed_controller\""));
     assert!(!script.contains("kill -TERM"));
     assert!(!script.contains("kill -KILL"));
-    assert!(script.contains("sleep 604800"));
-    assert!(script.contains("stored_window_id:$stored_pane_id:1"));
-    assert!(script.contains("kill-window -t \"$stored_window_id\""));
+    assert!(!script.contains("sleep 604800"));
+    assert!(!script.contains("stored_window_id"));
+    assert!(!script.contains("kill-window"));
     assert!(!script.contains("status.tmp"));
     assert!(!script.contains("terminal-claim/kind.tmp"));
     assert!(!script.contains("release"));

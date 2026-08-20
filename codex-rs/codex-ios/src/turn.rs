@@ -69,10 +69,13 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
@@ -300,8 +303,12 @@ const KIND_TURN_ABORTED: c_int = 16;
 /// Announces a startup-only control handle. The client may use it to record an
 /// interrupt, but must not expose same-turn steering until KIND_TURN_READY.
 const KIND_TURN_STARTING: c_int = 17;
+/// Versioned structured provider/Core error envelope. Legacy bridge-local
+/// failures continue to use KIND_ERROR so older app builds remain compatible.
+const KIND_STRUCTURED_ERROR: c_int = 18;
 const TOOL_DISCOVERY_CONTRACT_VERSION: u32 = 1;
 const KIND_ERROR: c_int = 3;
+const ERROR_ENVELOPE_CONTRACT_VERSION: u32 = 1;
 const IOS_APIKEY_PROVIDER_ID: &str = "ios-apikey";
 const CONTEXT_POINTER_FILE: &str = "agentapp-thread.json";
 const ERROR_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -707,6 +714,80 @@ fn emit(callback: EventCallback, ctx: *mut c_void, kind: c_int, text: &str) {
     let sanitized: String = text.chars().filter(|&c| c != '\0').collect();
     if let Ok(cstr) = CString::new(sanitized) {
         callback(ctx, kind, cstr.as_ptr());
+    }
+}
+
+#[derive(Serialize)]
+struct IosErrorEnvelope<'a> {
+    contract_version: u32,
+    code: &'static str,
+    message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limits: Option<&'a RateLimitSnapshot>,
+}
+
+fn ios_error_identity(error: Option<&CodexErrorInfo>) -> (&'static str, Option<u16>) {
+    match error {
+        Some(CodexErrorInfo::ContextWindowExceeded) => ("context_window_exceeded", None),
+        Some(CodexErrorInfo::SessionBudgetExceeded) => ("session_budget_exceeded", None),
+        Some(CodexErrorInfo::UsageLimitExceeded) => ("usage_limit_exceeded", None),
+        Some(CodexErrorInfo::ServerOverloaded) => ("server_overloaded", None),
+        Some(CodexErrorInfo::CyberPolicy) => ("cyber_policy", None),
+        Some(CodexErrorInfo::HttpConnectionFailed { http_status_code }) => {
+            ("http_connection_failed", *http_status_code)
+        }
+        Some(CodexErrorInfo::ResponseStreamConnectionFailed { http_status_code }) => {
+            ("response_stream_connection_failed", *http_status_code)
+        }
+        Some(CodexErrorInfo::InternalServerError) => ("internal_server_error", None),
+        Some(CodexErrorInfo::Unauthorized) => ("unauthorized", None),
+        Some(CodexErrorInfo::BadRequest) => ("bad_request", None),
+        Some(CodexErrorInfo::SandboxError) => ("sandbox_error", None),
+        Some(CodexErrorInfo::ResponseStreamDisconnected { http_status_code }) => {
+            ("response_stream_disconnected", *http_status_code)
+        }
+        Some(CodexErrorInfo::ResponseTooManyFailedAttempts { http_status_code }) => {
+            ("response_too_many_failed_attempts", *http_status_code)
+        }
+        Some(CodexErrorInfo::ActiveTurnNotSteerable { .. }) => ("active_turn_not_steerable", None),
+        Some(CodexErrorInfo::ThreadRollbackFailed) => ("thread_rollback_failed", None),
+        Some(CodexErrorInfo::Other) | None => ("other", None),
+    }
+}
+
+fn ios_error_payload(
+    error: &ErrorEvent,
+    latest_rate_limits: Option<&RateLimitSnapshot>,
+) -> Result<String, serde_json::Error> {
+    let (code, http_status_code) = ios_error_identity(error.codex_error_info.as_ref());
+    let rate_limits = if matches!(
+        error.codex_error_info,
+        Some(CodexErrorInfo::UsageLimitExceeded)
+    ) {
+        latest_rate_limits
+    } else {
+        None
+    };
+    serde_json::to_string(&IosErrorEnvelope {
+        contract_version: ERROR_ENVELOPE_CONTRACT_VERSION,
+        code,
+        message: &error.message,
+        http_status_code,
+        rate_limits,
+    })
+}
+
+fn emit_structured_error(
+    callback: EventCallback,
+    ctx: *mut c_void,
+    error: &ErrorEvent,
+    latest_rate_limits: Option<&RateLimitSnapshot>,
+) {
+    match ios_error_payload(error, latest_rate_limits) {
+        Ok(payload) => emit(callback, ctx, KIND_STRUCTURED_ERROR, &payload),
+        Err(_) => emit(callback, ctx, KIND_ERROR, &error.message),
     }
 }
 
@@ -1778,6 +1859,7 @@ pub(crate) async fn run_turn_async(
     // persists it. Responses streams deltas, so this stays true → no double-emit.
     let mut saw_message_delta = false;
     let mut latest_agent_message: Option<String> = None;
+    let mut latest_rate_limits: Option<RateLimitSnapshot> = None;
     // A dynamic tool may return images back into the model. If the provider
     // wedges after accepting that output, the app otherwise waits forever with
     // no additional stream event. Keep the timeout scoped to image outputs so
@@ -1957,6 +2039,7 @@ pub(crate) async fn run_turn_async(
                 emit(callback, ctx, KIND_CONTEXT_COMPACTED, "{}");
             }
             EventMsg::TokenCount(ev) => {
+                latest_rate_limits = ev.rate_limits.clone();
                 if let Ok(json) = serde_json::to_string(&ev) {
                     emit(callback, ctx, KIND_TOKEN_COUNT, &json);
                 }
@@ -2004,7 +2087,12 @@ pub(crate) async fn run_turn_async(
                                 }
                                 EventMsg::Error(error) => {
                                     if !protected_error_emitted {
-                                        emit(callback, ctx, KIND_ERROR, &error.message);
+                                        emit_structured_error(
+                                            callback,
+                                            ctx,
+                                            &error,
+                                            latest_rate_limits.as_ref(),
+                                        );
                                         protected_error_emitted = true;
                                         terminal_error_deadline = Some(
                                             tokio::time::Instant::now()
@@ -2080,7 +2168,12 @@ pub(crate) async fn run_turn_async(
             }
             EventMsg::Error(ev) => {
                 if !protected_error_emitted {
-                    emit(callback, ctx, KIND_ERROR, &ev.message);
+                    emit_structured_error(
+                        callback,
+                        ctx,
+                        &ev,
+                        latest_rate_limits.as_ref(),
+                    );
                     protected_error_emitted = true;
                     terminal_error_deadline = Some(
                         tokio::time::Instant::now() + ERROR_TERMINAL_DRAIN_TIMEOUT,

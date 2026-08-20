@@ -50,7 +50,6 @@ use super::with_remote_path;
 const MONITOR_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 const TMUX_BOOTSTRAP_ATTEMPTS: usize = 4;
 const TMUX_TERMINATE_ATTEMPTS: usize = 3;
-const TERMINAL_PANE_EVIDENCE_RETENTION_SECONDS: u64 = 7 * 24 * 60 * 60;
 const AGENT_SESSION_RETENTION_SECONDS: u64 = 7 * 24 * 60 * 60;
 // A controller normally refreshes the remote lease every five seconds. Fifteen
 // minutes exceeds the bounded reconnect schedule and gives transient mobile
@@ -1123,9 +1122,7 @@ impl TmuxProcessDescriptor {
     fn watchdog_script(&self) -> String {
         let root = self.remote_directory();
         format!(
-            "#!/bin/sh\nroot=\"{root}\"\nsession={session}\nwindow={window}\nwhile [ ! -f \"$root/status\" ]; do\n  now=$(date +%s)\n  lease=$(cat \"$root/lease\" 2>/dev/null || printf '0')\n  case \"$lease\" in ''|*[!0-9]*) lease=0 ;; esac\n  if [ $((now - lease)) -ge {CONTROLLER_LEASE_SECONDS} ] && [ ! -f \"$root/recovery-required\" ]; then\n    observed=$(cat \"$root/controller\" 2>/dev/null || true)\n    observed_generation=${{observed%%:*}}\n    observed_controller=${{observed#*:}}\n    case \"$observed_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_CONTROLLER_GENERATION_UNKNOWN >&2; exit 80 ;; esac\n    if [ -z \"$observed_controller\" ] || [ \"$observed_controller\" = \"$observed\" ]; then echo AGENTAPP_TMUX_CONTROLLER_UNKNOWN >&2; exit 80; fi\n    printf '%s:%s\\n' \"$observed_generation\" \"$observed_controller\" > \"$root/recovery-required.tmp\"\n    mv \"$root/recovery-required.tmp\" \"$root/recovery-required\"\n  fi\n  sleep {CONTROLLER_HEARTBEAT_SECONDS}\ndone\nsleep {TERMINAL_PANE_EVIDENCE_RETENTION_SECONDS}\n[ -f \"$root/status\" ] && [ -f \"$root/terminal-claim/kind\" ] || exit 0\nstored_window_id=$(cat \"$root/window-id\" 2>/dev/null || true)\nstored_pane_id=$(cat \"$root/pane-id\" 2>/dev/null || true)\n[ -n \"$stored_window_id\" ] && [ -n \"$stored_pane_id\" ] || exit 0\nif tmux list-windows -t \"$session:\" -F '#{{window_name}}' 2>/dev/null | grep -Fqx \"$window\"; then\n  [ \"$(tmux list-panes -t \"$session:$window\" -F '#{{pane_id}}' 2>/dev/null | wc -l | tr -d ' ')\" = 1 ] || exit 0\n  retained_identity=$(tmux display-message -p -t \"$session:$window.0\" '#{{window_id}}:#{{pane_id}}:#{{pane_dead}}' 2>/dev/null || true)\n  [ \"$retained_identity\" = \"$stored_window_id:$stored_pane_id:1\" ] || exit 0\n  tmux kill-window -t \"$stored_window_id\" 2>/dev/null || true\nfi\n",
-            session = shell_quote(&self.session_name),
-            window = shell_quote(&self.window_name),
+            "#!/bin/sh\nroot=\"{root}\"\nwhile [ ! -f \"$root/status\" ]; do\n  now=$(date +%s)\n  lease=$(cat \"$root/lease\" 2>/dev/null || printf '0')\n  case \"$lease\" in ''|*[!0-9]*) lease=0 ;; esac\n  if [ $((now - lease)) -ge {CONTROLLER_LEASE_SECONDS} ] && [ ! -f \"$root/recovery-required\" ]; then\n    observed=$(cat \"$root/controller\" 2>/dev/null || true)\n    observed_generation=${{observed%%:*}}\n    observed_controller=${{observed#*:}}\n    case \"$observed_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_CONTROLLER_GENERATION_UNKNOWN >&2; exit 80 ;; esac\n    if [ -z \"$observed_controller\" ] || [ \"$observed_controller\" = \"$observed\" ]; then echo AGENTAPP_TMUX_CONTROLLER_UNKNOWN >&2; exit 80; fi\n    printf '%s:%s\\n' \"$observed_generation\" \"$observed_controller\" > \"$root/recovery-required.tmp\"\n    mv \"$root/recovery-required.tmp\" \"$root/recovery-required\"\n  fi\n  sleep {CONTROLLER_HEARTBEAT_SECONDS}\ndone\n",
         )
     }
 
@@ -1146,6 +1143,19 @@ impl TmuxProcessDescriptor {
             concat!(
                 "set -eu\n",
                 "if ! command -v tmux >/dev/null 2>&1; then echo AGENTAPP_TMUX_MISSING >&2; exit 127; fi\n",
+                "agentapp_raise_nofile_limit() {{\n",
+                "  hard=$(ulimit -H -n 2>/dev/null || true)\n",
+                "  soft=$(ulimit -S -n 2>/dev/null || true)\n",
+                "  case \"$hard\" in unlimited) desired=4096 ;; ''|*[!0-9]*) return 0 ;; *) desired=$hard; [ \"$desired\" -le 4096 ] || desired=4096 ;; esac\n",
+                "  case \"$soft\" in ''|*[!0-9]*) return 0 ;; esac\n",
+                "  [ \"$soft\" -ge \"$desired\" ] || ulimit -S -n \"$desired\" 2>/dev/null || true\n",
+                "}}\n",
+                "agentapp_tmux_create() {{\n",
+                "  if tmux_error=$(\"$@\" 2>&1); then return 0; fi\n",
+                "  case \"$tmux_error\" in *\"Too many open files\"*) echo AGENTAPP_TMUX_RESOURCE_EXHAUSTED >&2; printf '%s\\n' \"$tmux_error\" >&2; return 73 ;; esac\n",
+                "  printf '%s\\n' \"$tmux_error\" >&2\n",
+                "  return 80\n",
+                "}}\n",
                 "agent_root=\"{agent_root}\"\n",
                 "root=\"{root}\"\n",
                 "session={session}\n",
@@ -1158,7 +1168,8 @@ impl TmuxProcessDescriptor {
                 "mkdir -p \"$agent_root\"\n",
                 "candidate_controller=\"$controller\"\n",
                 "if ! tmux has-session -t \"$session\" 2>/dev/null; then\n",
-                "  tmux new-session -d -s \"$session\" -n __agentapp_keeper {keeper} || tmux has-session -t \"$session\"\n",
+                "  agentapp_raise_nofile_limit\n",
+                "  if agentapp_tmux_create tmux new-session -d -s \"$session\" -n __agentapp_keeper {keeper}; then :; else create_status=$?; tmux has-session -t \"$session\" 2>/dev/null || exit \"$create_status\"; fi\n",
                 "fi\n",
                 "tmux respawn-pane -k -t \"$session:__agentapp_keeper.0\" {keeper} >/dev/null 2>&1 || true\n",
                 "window_exists=0\n",
@@ -1297,13 +1308,13 @@ impl TmuxProcessDescriptor {
                 "if [ \"$create_watchdog\" -eq 1 ]; then\n",
                 "  printf '%s' {watchdog_script} > \"$root/watchdog.sh\"\n",
                 "  chmod 700 \"$root/watchdog.sh\"\n",
-                "  tmux new-window -d -t \"$session:\" -n \"$watchdog_window\" {watchdog_start}\n",
+                "  agentapp_tmux_create tmux new-window -d -t \"$session:\" -n \"$watchdog_window\" {watchdog_start}\n",
                 "fi\n",
                 "if [ \"$create_window\" -eq 1 ]; then\n",
                 "  date +%s > \"$root/lease\"\n",
                 "  printf '%s' {script} > \"$root/command.sh\"\n",
                 "  chmod 700 \"$root/command.sh\"\n",
-                "  tmux new-window -d -t \"$session:\" -n \"$window\" {start}\n",
+                "  if agentapp_tmux_create tmux new-window -d -t \"$session:\" -n \"$window\" {start}; then :; else create_status=$?; if [ \"$create_watchdog\" -eq 1 ]; then tmux kill-window -t \"$session:$watchdog_window\" 2>/dev/null || true; fi; exit \"$create_status\"; fi\n",
                 "  pane_pid=$(tmux display-message -p -t \"$session:$window.0\" '#{{pane_pid}}')\n",
                 "  case \"$pane_pid\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80 ;; esac\n",
                 "  pane_pgid=$(ps -o pgid= -p \"$pane_pid\" 2>/dev/null | tr -d ' ')\n",

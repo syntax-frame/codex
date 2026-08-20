@@ -83,6 +83,13 @@ void codex_free_string(char *s);
  *                   event kind 2 (done) for the same turn.
  *              17 = turn starting. `text` is an interrupt-only handle; the
  *                   same handle becomes steerable only if kind 8 follows.
+ *              18 = structured error JSON. Payload contract version 1 is
+ *                   {"contract_version":1,"code":<stable string>,
+ *                    "message":<string>,"http_status_code":<number|null>,
+ *                    "rate_limits":<RateLimitSnapshot|null>}.
+ *                   Optional fields are omitted when unavailable. Usage-limit
+ *                   errors include the latest matching rate-limit snapshot;
+ *                   all other errors omit it. Older libraries emit kind 3.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */
