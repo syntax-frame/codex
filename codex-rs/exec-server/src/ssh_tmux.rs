@@ -57,6 +57,10 @@ const AGENT_SESSION_RETENTION_SECONDS: u64 = 7 * 24 * 60 * 60;
 // suspension ample recovery time, while still bounding crash-orphan lifetime.
 const CONTROLLER_LEASE_SECONDS: u64 = 15 * 60;
 const CONTROLLER_HEARTBEAT_SECONDS: u64 = 5;
+// A remote monitor is only a transport attachment; the tmux execution owns
+// continuity. Periodic reattachment bounds orphaned SSH exec processes when a
+// client disappears without closing its channel cleanly.
+const MONITOR_ATTACHMENT_SECONDS: u64 = 5 * 60;
 const OWNERSHIP_MARKER: &str = "agentapp-tmux-v2";
 
 fn tty_pipe_setup_command(target: &str) -> String {
@@ -1464,6 +1468,8 @@ impl TmuxProcessDescriptor {
                 "tty={tty}\n",
                 "offset={first_byte}\n",
                 "stable=0\n",
+                "attached_at=$(date +%s)\n",
+                "attachment_seconds={attachment_seconds}\n",
                 "agentapp_monitor_group_dead() {{\n",
                 "  monitor_group_state=unknown\n",
                 "  [ -x /bin/kill ] || return\n",
@@ -1507,6 +1513,8 @@ impl TmuxProcessDescriptor {
                 "}}\n",
                 "while :; do\n",
                 "  if [ \"$(cat \"$root/controller\" 2>/dev/null || true)\" != \"$controller\" ] || [ \"$(cat \"$root/digest\" 2>/dev/null || true)\" != \"$digest\" ]; then exit 125; fi\n",
+                "  now=$(date +%s)\n",
+                "  if [ $((now - attached_at)) -ge \"$attachment_seconds\" ]; then exit 124; fi\n",
                 "  agentapp_monitor_detect_dead_execution\n",
                 "  agentapp_monitor_output_closed\n",
                 "  date +%s > \"$root/lease.tmp\" && mv \"$root/lease.tmp\" \"$root/lease\"\n",
@@ -1538,6 +1546,7 @@ impl TmuxProcessDescriptor {
             session = shell_quote(&self.session_name),
             window = shell_quote(&self.window_name),
             tty = if self.tty { "1" } else { "0" },
+            attachment_seconds = MONITOR_ATTACHMENT_SECONDS,
             root = root,
             first_byte = first_byte,
         )

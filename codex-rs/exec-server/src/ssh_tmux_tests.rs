@@ -226,8 +226,53 @@ fn reconnect_monitor_starts_after_delivered_bytes() {
     assert!(command.contains("offset=4097"));
     assert!(command.contains("count=$((bytes - offset + 1))"));
     assert!(command.contains("lease.tmp"));
+    assert!(command.contains("attachment_seconds=300"));
+    assert!(command.contains("now - attached_at"));
     assert!(command.contains(&descriptor.controller_id));
     assert!(command.contains(&descriptor.command_digest));
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_monitor_attachment_expires_without_stopping_execution() {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62505", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "monitor-slice-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+
+    let bounded_monitor =
+        descriptor
+            .monitor_command(1)
+            .replacen("attachment_seconds=300", "attachment_seconds=2", 1);
+    assert_ne!(bounded_monitor, descriptor.monitor_command(1));
+    let started = Instant::now();
+    let monitor = fixture.run_shell(bounded_monitor);
+    assert_eq!(monitor.status.code(), Some(124));
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    let pane = fixture.tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        &descriptor.target(),
+        "#{pane_dead}",
+    ]);
+    assert!(pane.status.success());
+    assert_eq!(String::from_utf8_lossy(&pane.stdout).trim(), "0");
+
+    let terminated = fixture.run_shell(descriptor.termination_command());
+    assert!(
+        terminated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&terminated.stderr)
+    );
 }
 
 #[test]
