@@ -54,6 +54,8 @@ pub struct DynamicToolFunctionSpec {
     pub description: String,
     pub input_schema: JsonValue,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub defer_loading: bool,
     #[serde(
         default,
@@ -341,6 +343,7 @@ struct LegacyDynamicToolSpec {
     name: String,
     description: String,
     input_schema: JsonValue,
+    strict: Option<bool>,
     defer_loading: Option<bool>,
     expose_to_context: Option<bool>,
     argument_handling: Option<DynamicToolArgumentHandling>,
@@ -380,6 +383,7 @@ pub fn normalize_dynamic_tool_specs(
                 name: tool.name,
                 description: tool.description,
                 input_schema: tool.input_schema,
+                strict: tool.strict.unwrap_or(false),
                 defer_loading: tool.defer_loading.unwrap_or_else(|| {
                     tool.expose_to_context
                         .map(|visible| !visible)
@@ -581,6 +585,7 @@ mod tests {
                 name: "agentapp_browser_act".to_string(),
                 description: "Act without accepting secrets.".to_string(),
                 input_schema: json!({"type": "object"}),
+                strict: false,
                 defer_loading: false,
                 argument_handling: DynamicToolArgumentHandling::Transient,
             }),

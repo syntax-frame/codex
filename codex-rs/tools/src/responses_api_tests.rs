@@ -49,7 +49,7 @@ fn tool_definition_to_responses_api_tool_omits_false_defer_loading() {
 }
 
 #[test]
-fn dynamic_tool_to_responses_api_tool_preserves_defer_loading() {
+fn dynamic_tool_to_responses_api_tool_preserves_strict_and_defer_loading() {
     let tool = DynamicToolFunctionSpec {
         name: "lookup_order".to_string(),
         description: "Look up an order".to_string(),
@@ -61,6 +61,7 @@ fn dynamic_tool_to_responses_api_tool_preserves_defer_loading() {
             "required": ["order_id"],
             "additionalProperties": false,
         }),
+        strict: true,
         defer_loading: true,
         argument_handling: Default::default(),
     };
@@ -70,7 +71,7 @@ fn dynamic_tool_to_responses_api_tool_preserves_defer_loading() {
         ResponsesApiTool {
             name: "lookup_order".to_string(),
             description: "Look up an order".to_string(),
-            strict: false,
+            strict: true,
             defer_loading: Some(true),
             parameters: JsonSchema::object(
                 BTreeMap::from([(

@@ -90,6 +90,7 @@ fn protected_browser_dynamic_tools(tool_name: &str) -> Vec<DynamicToolSpec> {
                 "additionalProperties": false,
             }),
             defer_loading: false,
+            strict: false,
             argument_handling: DynamicToolArgumentHandling::Transient,
         }),
         DynamicToolSpec::ArgumentPolicy(
@@ -191,6 +192,7 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
                 description: tool_description.to_string(),
                 input_schema: input_schema.clone(),
                 defer_loading: false,
+                strict: false,
                 argument_handling: Default::default(),
             },
         )],

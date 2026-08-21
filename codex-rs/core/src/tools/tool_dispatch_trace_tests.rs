@@ -246,6 +246,7 @@ async fn transient_dispatch_trace_preserves_provenance_without_argument_bytes() 
             description: "Test browser tool.".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             defer_loading: false,
+            strict: false,
             argument_handling: DynamicToolArgumentHandling::Transient,
         }),
         DynamicToolSpec::ArgumentPolicy(

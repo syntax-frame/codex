@@ -160,6 +160,7 @@ mod thread_processor_behavior_tests {
             description: "test".to_string(),
             input_schema,
             defer_loading,
+            strict: false,
             argument_handling: Default::default(),
         };
         match namespace {
@@ -313,6 +314,7 @@ mod thread_processor_behavior_tests {
                 "additionalProperties": false
             }),
             defer_loading: true,
+            strict: false,
             argument_handling: Default::default(),
         };
         let tools = vec![DynamicToolSpec::Namespace(

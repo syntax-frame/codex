@@ -200,6 +200,7 @@ async fn thread_start_rejects_hidden_dynamic_tools_without_namespace() -> Result
             "additionalProperties": false,
         }),
         defer_loading: true,
+        strict: false,
         argument_handling: Default::default(),
     });
 
@@ -406,6 +407,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
                 description: "Demo dynamic tool".to_string(),
                 input_schema: input_schema.clone(),
                 defer_loading: false,
+                strict: false,
                 argument_handling: Default::default(),
             }),
             DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
@@ -413,6 +415,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
                 description: "Look up ticket status".to_string(),
                 input_schema: status_schema.clone(),
                 defer_loading: false,
+                strict: false,
                 argument_handling: Default::default(),
             }),
         ],
@@ -629,6 +632,7 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
             "additionalProperties": false,
         }),
         defer_loading: false,
+        strict: false,
         argument_handling: Default::default(),
     });
 

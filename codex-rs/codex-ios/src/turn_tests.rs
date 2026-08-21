@@ -1285,6 +1285,7 @@ fn bridge_marks_exact_browser_functions_transient_and_leaves_other_tools_persist
                 "name": name,
                 "description": "browser",
                 "inputSchema": {"type": "object", "properties": {}},
+                "strict": true,
                 "deferLoading": false
             })
         })
@@ -1294,6 +1295,7 @@ fn bridge_marks_exact_browser_functions_transient_and_leaves_other_tools_persist
         "name": "ordinary_tool",
         "description": "ordinary",
         "inputSchema": {"type": "object", "properties": {}},
+        "strict": false,
         "deferLoading": false
     }));
     let tools =
@@ -1311,8 +1313,10 @@ fn bridge_marks_exact_browser_functions_transient_and_leaves_other_tools_persist
     for function in functions {
         if AGENTAPP_BROWSER_TOOL_NAMES.contains(&function.name.as_str()) {
             assert!(function.argument_handling.redacts_arguments());
+            assert!(function.strict);
         } else {
             assert!(function.argument_handling.is_persistent());
+            assert!(!function.strict);
         }
     }
 }

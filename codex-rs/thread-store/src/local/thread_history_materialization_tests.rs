@@ -918,6 +918,7 @@ async fn fresh_resume_policy_redacts_legacy_browser_arguments_before_sqlite_mate
             description: "Act on a managed browser tab.".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             defer_loading: false,
+            strict: false,
             argument_handling: DynamicToolArgumentHandling::Transient,
         }),
         DynamicToolSpec::ArgumentPolicy(

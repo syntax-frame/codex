@@ -69,9 +69,9 @@ pub enum ResponsesApiNamespaceTool {
 pub fn dynamic_tool_to_responses_api_tool(
     tool: &DynamicToolFunctionSpec,
 ) -> Result<ResponsesApiTool, serde_json::Error> {
-    Ok(tool_definition_to_responses_api_tool(parse_dynamic_tool(
-        tool,
-    )?))
+    let mut output = tool_definition_to_responses_api_tool(parse_dynamic_tool(tool)?);
+    output.strict = tool.strict;
+    Ok(output)
 }
 
 pub fn coalesce_loadable_tool_specs(

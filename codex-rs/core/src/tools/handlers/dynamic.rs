@@ -183,6 +183,25 @@ async fn request_dynamic_tool(
 ) -> Option<DynamicToolResponse> {
     let namespace = tool_name.namespace;
     let tool = tool_name.name;
+    let argument_shape = match &arguments {
+        Value::Object(_) => "object",
+        Value::Array(_) => "array",
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "boolean",
+        Value::Null => "null",
+    };
+    let argument_key_count = arguments.as_object().map_or(0, serde_json::Map::len);
+    let argument_byte_count = serde_json::to_vec(&arguments).map_or(0, |value| value.len());
+    tracing::info!(
+        target: "codex_core::dynamic_tool",
+        tool,
+        namespace = namespace.as_deref().unwrap_or(""),
+        argument_shape,
+        argument_key_count,
+        argument_byte_count,
+        "received dynamic tool arguments from provider"
+    );
     let argument_handling =
         DynamicToolArgumentPolicy::from_dynamic_tools(&turn_context.dynamic_tools)
             .handling_for(namespace.as_deref(), &tool);

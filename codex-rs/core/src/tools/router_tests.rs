@@ -304,6 +304,7 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
                     "additionalProperties": false,
                 }),
                 defer_loading: true,
+                strict: false,
                 argument_handling: Default::default(),
             }),
             DynamicToolNamespaceTool::Function(DynamicToolFunctionSpec {
@@ -315,6 +316,7 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
                     "additionalProperties": false,
                 }),
                 defer_loading: false,
+                strict: false,
                 argument_handling: Default::default(),
             }),
         ],

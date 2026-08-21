@@ -9257,6 +9257,9 @@
               "name": {
                 "type": "string"
               },
+              "strict": {
+                "type": "boolean"
+              },
               "type": {
                 "enum": [
                   "function"
@@ -9289,6 +9292,9 @@
               "inputSchema": true,
               "name": {
                 "type": "string"
+              },
+              "strict": {
+                "type": "boolean"
               },
               "type": {
                 "enum": [

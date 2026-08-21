@@ -2114,6 +2114,28 @@ pub(crate) async fn run_turn_async(
             // `codex_respond_dynamic_tool`, which delivers `(call_id, response)`
             // here; we submit it and resume draining events.
             EventMsg::DynamicToolCallRequest(req) => {
+                let argument_shape = match &req.arguments {
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Null => "null",
+                };
+                let argument_key_count = req
+                    .arguments
+                    .as_object()
+                    .map_or(0, serde_json::Map::len);
+                let argument_byte_count =
+                    serde_json::to_vec(&req.arguments).map_or(0, |value| value.len());
+                tracing::info!(
+                    target: "codex_ios::dynamic_tool",
+                    tool = req.tool,
+                    argument_shape,
+                    argument_key_count,
+                    argument_byte_count,
+                    "delivering dynamic tool arguments to AgentApp"
+                );
                 let payload = serde_json::json!({
                     "turn_handle": turn_handle,
                     "call_id": req.call_id,
