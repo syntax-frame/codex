@@ -235,6 +235,20 @@ impl CodexThread {
         Ok(())
     }
 
+    /// Flushes a completed turn's durable state while retaining the live
+    /// thread and any attached restart-safe executions for another turn in the
+    /// same host process.
+    pub async fn prepare_for_host_reuse(&self) -> CodexResult<()> {
+        self.session.ensure_rollout_persistence_succeeded().await?;
+        if let Some(live_thread) = self.session.live_thread() {
+            live_thread
+                .flush()
+                .await
+                .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+        }
+        self.session.ensure_rollout_persistence_succeeded().await
+    }
+
     /// Wait until the underlying session loop has terminated.
     pub async fn wait_until_terminated(&self) {
         let _ = self.io.session_loop_termination.clone().await;

@@ -90,6 +90,9 @@ void codex_free_string(char *s);
  *                   Optional fields are omitted when unavailable. Usage-limit
  *                   errors include the latest matching rate-limit snapshot;
  *                   all other errors omit it. Older libraries emit kind 3.
+ *              19 = content-free native startup stage for latency diagnostics.
+ *                   Text is a stable stage identifier and never contains
+ *                   prompts, tool arguments, credentials, or model output.
  *   text        NUL-terminated UTF-8, valid ONLY for the duration of the call;
  *               copy it if it must outlive the callback.
  */

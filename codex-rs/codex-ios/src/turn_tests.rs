@@ -40,10 +40,12 @@ use super::KIND_CONTEXT_COMPACTION_STARTED;
 use super::KIND_DONE;
 use super::KIND_ERROR;
 use super::KIND_ITEM_STARTED;
+use super::KIND_STARTUP_STAGE;
 use super::KIND_STRUCTURED_ERROR;
 use super::KIND_TURN_READY;
 use super::KIND_TURN_STARTING;
 use super::PersistedThreadPointer;
+use super::ProviderAuthConfig;
 use super::ServerFileUpload;
 use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
 use super::TurnBridge;
@@ -60,6 +62,7 @@ use super::codex_steer_turn;
 use super::codex_steer_turn_with_uploads;
 use super::disable_upstream_multi_agent;
 use super::emit;
+use super::emit_debug_stage;
 use super::emit_item_started_events;
 use super::emit_turn_result;
 use super::finish_host_detach_cleanup;
@@ -85,6 +88,7 @@ use super::startup_interrupt_requested;
 use super::steering_user_input;
 use super::tool_discovery_event_json;
 use super::validate_relative_rollout_path;
+use super::warm_thread_fingerprint;
 use super::write_thread_pointer;
 
 fn oauth_preset(model: &str, is_default: bool) -> ModelPreset {
@@ -319,6 +323,86 @@ extern "C" fn capture_event(ctx: *mut c_void, kind: c_int, text: *const c_char) 
         .to_string_lossy()
         .into_owned();
     events.push((kind, text));
+}
+
+fn non_diagnostic_events(events: &[(c_int, String)]) -> Vec<&(c_int, String)> {
+    events
+        .iter()
+        .filter(|(kind, _)| *kind != KIND_STARTUP_STAGE)
+        .collect()
+}
+
+#[test]
+fn startup_stage_uses_a_dedicated_event_kind() {
+    let mut events = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+
+    emit_debug_stage(capture_event, ctx, "thread_reused");
+
+    assert_eq!(
+        events,
+        vec![(KIND_STARTUP_STAGE, "thread_reused".to_string())]
+    );
+}
+
+#[test]
+fn warm_thread_fingerprint_tracks_turn_configuration() {
+    let provider = ProviderAuthConfig::ChatgptOAuth {
+        access_token: "access-a".to_string(),
+        id_token: "id-a".to_string(),
+        account_id: "account-a".to_string(),
+    };
+    let same = warm_thread_fingerprint(
+        &provider,
+        "gpt-test",
+        "medium",
+        "default",
+        "/workspace",
+        "[]",
+        None,
+    );
+    assert_eq!(
+        same,
+        warm_thread_fingerprint(
+            &provider,
+            "gpt-test",
+            "medium",
+            "default",
+            "/workspace",
+            "[]",
+            None,
+        )
+    );
+
+    let refreshed_provider = ProviderAuthConfig::ChatgptOAuth {
+        access_token: "access-b".to_string(),
+        id_token: "id-a".to_string(),
+        account_id: "account-a".to_string(),
+    };
+    assert_ne!(
+        same,
+        warm_thread_fingerprint(
+            &refreshed_provider,
+            "gpt-test",
+            "medium",
+            "default",
+            "/workspace",
+            "[]",
+            None,
+        )
+    );
+    assert_ne!(
+        same,
+        warm_thread_fingerprint(
+            &provider,
+            "gpt-test",
+            "medium",
+            "default",
+            "/workspace",
+            r#"[{"name":"new_tool"}]"#,
+            None,
+        )
+    );
 }
 
 #[test]
@@ -1411,12 +1495,20 @@ fn malformed_model_context_pointer_surfaces_error_without_replacement() {
     std::fs::write(&pointer_path, pointer_bytes).expect("malformed pointer");
 
     let events = run_apikey_turn(home.path());
+    let visible_events = non_diagnostic_events(&events);
 
     assert_eq!(
-        events.iter().map(|event| event.0).collect::<Vec<_>>(),
+        visible_events
+            .iter()
+            .map(|event| event.0)
+            .collect::<Vec<_>>(),
         vec![KIND_TURN_STARTING, KIND_ERROR]
     );
-    assert!(events[1].1.contains("invalid model-context pointer"));
+    assert!(
+        visible_events[1]
+            .1
+            .contains("invalid model-context pointer")
+    );
     assert_eq!(
         std::fs::read(pointer_path).expect("preserved pointer"),
         pointer_bytes
@@ -1442,22 +1534,26 @@ fn failed_model_context_resume_preserves_pointer_and_rollout() {
     std::fs::write(&pointer_path, &pointer_bytes).expect("pointer");
 
     let events = run_apikey_turn(home.path());
+    let visible_events = non_diagnostic_events(&events);
 
     assert_eq!(
-        events.iter().map(|event| event.0).collect::<Vec<_>>(),
+        visible_events
+            .iter()
+            .map(|event| event.0)
+            .collect::<Vec<_>>(),
         vec![KIND_TURN_STARTING, KIND_ERROR]
     );
     assert_eq!(
-        events[1].1,
+        visible_events[1].1,
         "failed to resume persistent model context \
          [malformed_json;stage=execution_reconciliation;reason=rollout_read]"
     );
     assert!(
-        !events[1].1.contains(relative_rollout),
+        !visible_events[1].1.contains(relative_rollout),
         "public resume errors must not expose the rollout path"
     );
     assert!(
-        !events[0].1.contains("not a valid rollout"),
+        !visible_events[0].1.contains("not a valid rollout"),
         "public resume errors must not expose record content"
     );
     assert_eq!(
@@ -1489,13 +1585,17 @@ fn truncated_model_context_resume_preserves_typed_failure() {
     std::fs::write(&pointer_path, &pointer_bytes).expect("pointer");
 
     let events = run_apikey_turn(home.path());
+    let visible_events = non_diagnostic_events(&events);
 
     assert_eq!(
-        events.iter().map(|event| event.0).collect::<Vec<_>>(),
+        visible_events
+            .iter()
+            .map(|event| event.0)
+            .collect::<Vec<_>>(),
         vec![KIND_TURN_STARTING, KIND_ERROR]
     );
     assert_eq!(
-        events[1].1,
+        visible_events[1].1,
         "failed to resume persistent model context \
          [truncated_record;stage=execution_reconciliation;reason=rollout_read]"
     );

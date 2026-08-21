@@ -82,6 +82,15 @@ use codex_protocol::user_input::UserInput;
 use serde::Serialize;
 use tokio::time::timeout;
 
+mod warm_thread_cache;
+
+use warm_thread_cache::WarmThreadEntry;
+use warm_thread_cache::cache_warm_thread;
+use warm_thread_cache::retire_warm_thread;
+use warm_thread_cache::retire_warm_threads_in_background;
+use warm_thread_cache::take_warm_thread;
+use warm_thread_cache::warm_thread_fingerprint;
+
 const CONTEXT_LOCK_FILE: &str = ".agentapp-context.lock";
 const CONTEXT_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTEXT_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -306,6 +315,8 @@ const KIND_TURN_STARTING: c_int = 17;
 /// Versioned structured provider/Core error envelope. Legacy bridge-local
 /// failures continue to use KIND_ERROR so older app builds remain compatible.
 const KIND_STRUCTURED_ERROR: c_int = 18;
+/// Content-free native startup stage used only for latency diagnostics.
+const KIND_STARTUP_STAGE: c_int = 19;
 const TOOL_DISCOVERY_CONTRACT_VERSION: u32 = 1;
 const KIND_ERROR: c_int = 3;
 const ERROR_ENVELOPE_CONTRACT_VERSION: u32 = 1;
@@ -873,7 +884,7 @@ fn emit_item_started_events(callback: EventCallback, ctx: *mut c_void, event: &I
 }
 
 fn emit_debug_stage(callback: EventCallback, ctx: *mut c_void, stage: &str) {
-    let _ = (callback, ctx, stage);
+    emit(callback, ctx, KIND_STARTUP_STAGE, stage);
 }
 
 /// Monotonic per-turn handle allocated for each turn that may pause on a dynamic
@@ -1469,10 +1480,20 @@ pub(crate) async fn run_turn_async(
     dynamic_tools_json: String,
     uploads: Vec<ServerFileUpload>,
     server_mode: Option<ServerMode>,
+    credential_guard: Option<Arc<tempfile::TempDir>>,
     callback: EventCallback,
     ctx: *mut c_void,
 ) -> Result<(), TurnFailure> {
     emit_debug_stage(callback, ctx, "run_turn_async_entered");
+    let configuration_fingerprint = warm_thread_fingerprint(
+        &provider_config,
+        &model,
+        &reasoning_effort,
+        &service_tier,
+        &workspace,
+        &dynamic_tools_json,
+        server_mode.as_ref(),
+    );
     let reasoning_effort = parse_reasoning_effort(&reasoning_effort)?;
     let service_tier = match service_tier.trim() {
         "" => None,
@@ -1494,208 +1515,244 @@ pub(crate) async fn run_turn_async(
     let turn_lock = context_turn_lock(&codex_home)?;
     let _turn_guard = turn_lock.lock().await;
     let _context_file_lock = acquire_context_file_lock(&codex_home).await?;
-
-    // Build auth and provider independently from the persistent context home.
-    // Credentials remain in memory and are never written beside the rollout.
-    let (auth, provider, model_provider_override) = match provider_config {
-        ProviderAuthConfig::ChatgptOAuth {
-            access_token,
-            id_token,
-            account_id,
-        } => {
-            let auth = build_auth(access_token, id_token, account_id).await?;
-            let _ = tokio::fs::remove_file(codex_home.join("config.toml")).await;
-            // The built-in OpenAI provider with ChatGPT auth resolves its
-            // base_url to `https://chatgpt.com/backend-api/codex` automatically
-            // (see ModelProviderInfo::to_api_provider).
-            let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-            (auth, provider, None)
-        }
-        ProviderAuthConfig::ApiKey {
-            base_url,
-            api_key,
-            wire_api,
-        } => {
-            // `CodexAuth::from_api_key` produces a plain `Authorization: Bearer
-            // <key>` header. The provider (name != "OpenAI") targets the given
-            // base_url via the Responses wire API. requires_openai_auth is false
-            // for the oss provider, so none of the ChatGPT-specific auth applies.
-            //
-            // The Config built below must also select a provider with this
-            // base_url. Otherwise the thread starts with the default `openai`
-            // provider and the request falls back to api.openai.com.
-            write_api_key_provider_config(&codex_home, &base_url, wire_api).await?;
-            let auth = CodexAuth::from_api_key(&api_key);
-            let provider = create_oss_provider_with_base_url(&base_url, wire_api);
-            (auth, provider, Some(IOS_APIKEY_PROVIDER_ID.to_string()))
-        }
-    };
-    emit_debug_stage(callback, ctx, "auth_ready");
-
-    // In server mode, build a ThreadManager whose EnvironmentManager has the
-    // SSH environment registered AND selected as the default, so the turn's
-    // shell/exec tools route through the SSH backend (and `has_environment()`
-    // is true). Otherwise keep the default (local, shell-disabled) path intact.
-    let thread_manager = match &server_mode {
-        Some(server) => {
-            let environment_manager = std::sync::Arc::new(EnvironmentManager::ssh_with_config(
-                SERVER_MODE_ENVIRONMENT_ID,
-                SshEnvironmentConfig {
-                    connection_key: server.connection_key.clone(),
-                    agent_key: server.session_key.clone(),
-                    host: server.host.clone(),
-                    port: server.port,
-                    user: server.user.clone(),
-                    authentication: server.authentication.clone(),
-                    host_fingerprint: server.host_fingerprint.clone(),
-                    tmux_mode: server.tmux_mode,
-                },
-            ));
-            thread_manager_with_models_provider_and_home(
-                auth,
-                provider,
-                codex_home.clone(),
-                environment_manager,
-            )
-        }
-        None => thread_manager_with_models_provider_and_home(
-            auth,
-            provider,
-            codex_home.clone(),
-            Arc::new(EnvironmentManager::default_for_tests()),
-        ),
-    };
-
-    // Minimal Config rooted at the temp home (no on-disk config => defaults).
-    let mut config = ConfigBuilder::default()
-        .codex_home(codex_home.clone())
-        .harness_overrides(ConfigOverrides {
-            // An empty model means "use the account's current catalog default".
-            // This keeps the iOS Provider Default option live as models evolve.
-            model: (!model.trim().is_empty()).then_some(model.clone()),
-            // Root the turn in the node's workspace dir ("zone") so file tools
-            // operate inside it.
-            cwd: if workspace.is_empty() {
-                None
-            } else {
-                Some(std::path::PathBuf::from(&workspace))
-            },
-            // The mobile build has no human in the loop to answer approval
-            // prompts and no OS sandbox: never block on an approval (that would
-            // hang the turn forever — there is no UI to approve), and treat the
-            // node's workspace as writable so any write-capable tool proceeds.
-            approval_policy: Some(AskForApproval::Never),
-            // In server mode the command runs on a REMOTE machine over SSH, so a
-            // *local* OS sandbox is meaningless — and iOS has no seatbelt to set
-            // one up, so trying to sandbox would force an escalation that
-            // approval=Never auto-denies ("blocked by the execution environment").
-            // Use DangerFullAccess so exec dispatches straight to the SSH backend;
-            // the real security boundary is the remote host (key-only SSH).
-            // Local mode keeps WorkspaceWrite.
-            sandbox_mode: Some(if server_mode.is_some() {
-                SandboxMode::DangerFullAccess
-            } else {
-                SandboxMode::WorkspaceWrite
-            }),
-            model_provider: model_provider_override,
-            service_tier: service_tier.map(Some),
-            ..Default::default()
-        })
-        .build()
-        .await
-        .map_err(|e| format!("failed to build config: {e}"))?;
-    emit_debug_stage(callback, ctx, "config_ready");
-
-    // An explicit effort comes from the node picker. None means the model
-    // manager applies the selected model's live default.
-    config.model_reasoning_effort = reasoning_effort.clone();
-    config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
-    // AgentApp has its own durable plan surface and no bridge for the upstream
-    // blocking question request yet. Do not advertise tools this host cannot
-    // service correctly.
-    config.update_plan_enabled = false;
-    config.experimental_request_user_input_enabled = false;
-
-    // Shell tool gating:
-    // - Local (no server mode): iOS has no shell — there is no `/bin/zsh` to
-    //   spawn, so the unified-exec / shell tools can never run here. Worse, when
-    //   offered them the model prefers shell (`printf … | tee file`) over our
-    //   native `write_file`, which then trips the approval machinery and hangs
-    //   the turn. Disable the shell tool so the only file-mutating tools are our
-    //   on-device read_file/write_file/list_dir handlers.
-    // - Server mode: shell/exec tools run on the SSH host, so re-enable the
-    //   shell tool. The SSH environment is registered+selected above, which
-    //   makes `has_environment()` true and routes the tools through the SSH
-    //   backend.
-    if server_mode.is_some() {
-        let _ = config.features.enable(Feature::ShellTool);
-        // Keep the mobile bridge's public contract explicit: server mode offers
-        // exec_command + write_stdin even if an upstream default changes.
-        let _ = config.features.enable(Feature::UnifiedExec);
+    let resume_path = read_thread_pointer(&codex_home).await?;
+    let (warm_thread, stale_thread) = if temporary_home.is_none() {
+        take_warm_thread(
+            &codex_home,
+            configuration_fingerprint,
+            resume_path.as_deref(),
+        )
     } else {
-        let _ = config.features.disable(Feature::ShellTool);
-        let _ = config.features.disable(Feature::UnifiedExec);
+        (None, None)
+    };
+    if let Some(stale_thread) = stale_thread {
+        retire_warm_thread(stale_thread).await;
     }
 
-    // Disable Codex's built-in multi-agent suites (spawn_agent / wait_agent /
-    // close_agent / send_message / …). Their tool names clash with OUR
-    // orchestration dynamic tools (executed in Swift as persistent, visible graph
-    // nodes), and the built-ins run in-process — invisible to the graph and
-    // capped at ~6 concurrent threads. BOTH versions must be off:
-    //   - MultiAgentV2 (feature `multi_agent_v2`) → the V2 suite
-    //   - Collab       (feature `multi_agent`)    → the V1 (`multi_agent_v1__…`)
-    // Missing the Collab one let the model fall back to the V1 built-ins, which
-    // spawned invisible, capped sub-agents instead of our graph nodes.
-    disable_upstream_multi_agent(&mut config);
-
-    // Orchestration tools are supplied by the client (Swift) as dynamic tool
-    // specs and executed on-device. The bridge, rather than client JSON, owns
-    // the fixed browser argument-privacy policy. It is appended even when the
-    // Browser Tool setting is Off so stale calls and resumed histories remain
-    // protected without restoring any model-visible browser schema.
-    let dynamic_tools = parse_agentapp_dynamic_tools_json(&dynamic_tools_json)?;
-
-    let resume_path = read_thread_pointer(&codex_home).await?;
-    let mut resumed = false;
-    let new_thread = if let Some(rollout_path) = resume_path {
-        let reconciliation_request = thread_manager
-            .execution_reconciliation_request_from_rollout(rollout_path.clone())
-            .await
-            .map_err(|error| {
-                persistent_model_context_resume_error("execution_reconciliation", &error)
-            })?;
-        let pending_writes = reconciliation_request.pending_writes.clone();
-        let recovered_executions = thread_manager
-            .environment_manager()
-            .reconcile_default_environment(reconciliation_request)
-            .await
-            .map_err(|error| format!("failed to reconcile exact remote executions: {error}"))?;
-        emit_debug_stage(callback, ctx, "exact_execution_reconciled");
-        let thread = thread_manager
-            .resume_thread_from_rollout_with_tools_and_recovered_executions(
-                config.clone(),
-                rollout_path.clone(),
-                thread_manager.auth_manager(),
-                /*parent_trace*/ None,
-                /*supports_openai_form_elicitation*/ false,
-                dynamic_tools.clone(),
-                recovered_executions,
-                pending_writes,
+    let (thread_id, thread, session_model, resumed, retained_credential_guard) =
+        if let Some(warm_thread) = warm_thread {
+            emit_debug_stage(callback, ctx, "thread_reused");
+            (
+                warm_thread.thread_id,
+                warm_thread.thread,
+                warm_thread.session_model,
+                true,
+                warm_thread.credential_guard,
             )
-            .await
-            .map_err(|error| persistent_model_context_resume_error("thread_resume", &error))?;
-        resumed = true;
-        emit_debug_stage(callback, ctx, "thread_resumed");
-        thread
-    } else {
-        thread_manager
-            .start_thread_with_tools(config, dynamic_tools)
-            .await
-            .map_err(|e| format!("failed to start thread: {e}"))?
-    };
+        } else {
+            // Build auth and provider independently from the persistent context home.
+            // Credentials remain in memory and are never written beside the rollout.
+            let (auth, provider, model_provider_override) = match provider_config {
+                ProviderAuthConfig::ChatgptOAuth {
+                    access_token,
+                    id_token,
+                    account_id,
+                } => {
+                    let auth = build_auth(access_token, id_token, account_id).await?;
+                    let _ = tokio::fs::remove_file(codex_home.join("config.toml")).await;
+                    // The built-in OpenAI provider with ChatGPT auth resolves its
+                    // base_url to `https://chatgpt.com/backend-api/codex` automatically
+                    // (see ModelProviderInfo::to_api_provider).
+                    let provider =
+                        ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+                    (auth, provider, None)
+                }
+                ProviderAuthConfig::ApiKey {
+                    base_url,
+                    api_key,
+                    wire_api,
+                } => {
+                    // `CodexAuth::from_api_key` produces a plain `Authorization: Bearer
+                    // <key>` header. The provider (name != "OpenAI") targets the given
+                    // base_url via the Responses wire API. requires_openai_auth is false
+                    // for the oss provider, so none of the ChatGPT-specific auth applies.
+                    //
+                    // The Config built below must also select a provider with this
+                    // base_url. Otherwise the thread starts with the default `openai`
+                    // provider and the request falls back to api.openai.com.
+                    write_api_key_provider_config(&codex_home, &base_url, wire_api).await?;
+                    let auth = CodexAuth::from_api_key(&api_key);
+                    let provider = create_oss_provider_with_base_url(&base_url, wire_api);
+                    (auth, provider, Some(IOS_APIKEY_PROVIDER_ID.to_string()))
+                }
+            };
+            emit_debug_stage(callback, ctx, "auth_ready");
+
+            // In server mode, build a ThreadManager whose EnvironmentManager has the
+            // SSH environment registered AND selected as the default, so the turn's
+            // shell/exec tools route through the SSH backend (and `has_environment()`
+            // is true). Otherwise keep the default (local, shell-disabled) path intact.
+            let thread_manager = match &server_mode {
+                Some(server) => {
+                    let environment_manager =
+                        std::sync::Arc::new(EnvironmentManager::ssh_with_config(
+                            SERVER_MODE_ENVIRONMENT_ID,
+                            SshEnvironmentConfig {
+                                connection_key: server.connection_key.clone(),
+                                agent_key: server.session_key.clone(),
+                                host: server.host.clone(),
+                                port: server.port,
+                                user: server.user.clone(),
+                                authentication: server.authentication.clone(),
+                                host_fingerprint: server.host_fingerprint.clone(),
+                                tmux_mode: server.tmux_mode,
+                            },
+                        ));
+                    thread_manager_with_models_provider_and_home(
+                        auth,
+                        provider,
+                        codex_home.clone(),
+                        environment_manager,
+                    )
+                }
+                None => thread_manager_with_models_provider_and_home(
+                    auth,
+                    provider,
+                    codex_home.clone(),
+                    Arc::new(EnvironmentManager::default_for_tests()),
+                ),
+            };
+
+            // Minimal Config rooted at the temp home (no on-disk config => defaults).
+            let mut config = ConfigBuilder::default()
+                .codex_home(codex_home.clone())
+                .harness_overrides(ConfigOverrides {
+                    // An empty model means "use the account's current catalog default".
+                    // This keeps the iOS Provider Default option live as models evolve.
+                    model: (!model.trim().is_empty()).then_some(model.clone()),
+                    // Root the turn in the node's workspace dir ("zone") so file tools
+                    // operate inside it.
+                    cwd: if workspace.is_empty() {
+                        None
+                    } else {
+                        Some(std::path::PathBuf::from(&workspace))
+                    },
+                    // The mobile build has no human in the loop to answer approval
+                    // prompts and no OS sandbox: never block on an approval (that would
+                    // hang the turn forever — there is no UI to approve), and treat the
+                    // node's workspace as writable so any write-capable tool proceeds.
+                    approval_policy: Some(AskForApproval::Never),
+                    // In server mode the command runs on a REMOTE machine over SSH, so a
+                    // *local* OS sandbox is meaningless — and iOS has no seatbelt to set
+                    // one up, so trying to sandbox would force an escalation that
+                    // approval=Never auto-denies ("blocked by the execution environment").
+                    // Use DangerFullAccess so exec dispatches straight to the SSH backend;
+                    // the real security boundary is the remote host (key-only SSH).
+                    // Local mode keeps WorkspaceWrite.
+                    sandbox_mode: Some(if server_mode.is_some() {
+                        SandboxMode::DangerFullAccess
+                    } else {
+                        SandboxMode::WorkspaceWrite
+                    }),
+                    model_provider: model_provider_override,
+                    service_tier: service_tier.map(Some),
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .map_err(|e| format!("failed to build config: {e}"))?;
+            emit_debug_stage(callback, ctx, "config_ready");
+
+            // An explicit effort comes from the node picker. None means the model
+            // manager applies the selected model's live default.
+            config.model_reasoning_effort = reasoning_effort.clone();
+            config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
+            // AgentApp has its own durable plan surface and no bridge for the upstream
+            // blocking question request yet. Do not advertise tools this host cannot
+            // service correctly.
+            config.update_plan_enabled = false;
+            config.experimental_request_user_input_enabled = false;
+
+            // Shell tool gating:
+            // - Local (no server mode): iOS has no shell — there is no `/bin/zsh` to
+            //   spawn, so the unified-exec / shell tools can never run here. Worse, when
+            //   offered them the model prefers shell (`printf … | tee file`) over our
+            //   native `write_file`, which then trips the approval machinery and hangs
+            //   the turn. Disable the shell tool so the only file-mutating tools are our
+            //   on-device read_file/write_file/list_dir handlers.
+            // - Server mode: shell/exec tools run on the SSH host, so re-enable the
+            //   shell tool. The SSH environment is registered+selected above, which
+            //   makes `has_environment()` true and routes the tools through the SSH
+            //   backend.
+            if server_mode.is_some() {
+                let _ = config.features.enable(Feature::ShellTool);
+                // Keep the mobile bridge's public contract explicit: server mode offers
+                // exec_command + write_stdin even if an upstream default changes.
+                let _ = config.features.enable(Feature::UnifiedExec);
+            } else {
+                let _ = config.features.disable(Feature::ShellTool);
+                let _ = config.features.disable(Feature::UnifiedExec);
+            }
+
+            // Disable Codex's built-in multi-agent suites (spawn_agent / wait_agent /
+            // close_agent / send_message / …). Their tool names clash with OUR
+            // orchestration dynamic tools (executed in Swift as persistent, visible graph
+            // nodes), and the built-ins run in-process — invisible to the graph and
+            // capped at ~6 concurrent threads. BOTH versions must be off:
+            //   - MultiAgentV2 (feature `multi_agent_v2`) → the V2 suite
+            //   - Collab       (feature `multi_agent`)    → the V1 (`multi_agent_v1__…`)
+            // Missing the Collab one let the model fall back to the V1 built-ins, which
+            // spawned invisible, capped sub-agents instead of our graph nodes.
+            disable_upstream_multi_agent(&mut config);
+
+            // Orchestration tools are supplied by the client (Swift) as dynamic tool
+            // specs and executed on-device. The bridge, rather than client JSON, owns
+            // the fixed browser argument-privacy policy. It is appended even when the
+            // Browser Tool setting is Off so stale calls and resumed histories remain
+            // protected without restoring any model-visible browser schema.
+            let dynamic_tools = parse_agentapp_dynamic_tools_json(&dynamic_tools_json)?;
+
+            let mut resumed = false;
+            let new_thread = if let Some(rollout_path) = resume_path {
+                let reconciliation_request = thread_manager
+                    .execution_reconciliation_request_from_rollout(rollout_path.clone())
+                    .await
+                    .map_err(|error| {
+                        persistent_model_context_resume_error("execution_reconciliation", &error)
+                    })?;
+                let pending_writes = reconciliation_request.pending_writes.clone();
+                let recovered_executions = thread_manager
+                    .environment_manager()
+                    .reconcile_default_environment(reconciliation_request)
+                    .await
+                    .map_err(|error| {
+                        format!("failed to reconcile exact remote executions: {error}")
+                    })?;
+                emit_debug_stage(callback, ctx, "exact_execution_reconciled");
+                let thread = thread_manager
+                    .resume_thread_from_rollout_with_tools_and_recovered_executions(
+                        config.clone(),
+                        rollout_path.clone(),
+                        thread_manager.auth_manager(),
+                        /*parent_trace*/ None,
+                        /*supports_openai_form_elicitation*/ false,
+                        dynamic_tools.clone(),
+                        recovered_executions,
+                        pending_writes,
+                    )
+                    .await
+                    .map_err(|error| {
+                        persistent_model_context_resume_error("thread_resume", &error)
+                    })?;
+                resumed = true;
+                emit_debug_stage(callback, ctx, "thread_resumed");
+                thread
+            } else {
+                thread_manager
+                    .start_thread_with_tools(config, dynamic_tools)
+                    .await
+                    .map_err(|e| format!("failed to start thread: {e}"))?
+            };
+            (
+                new_thread.thread_id,
+                new_thread.thread,
+                new_thread.session_configured.model,
+                resumed,
+                credential_guard,
+            )
+        };
     emit_debug_stage(callback, ctx, "thread_ready");
-    let thread = new_thread.thread;
-    let session_model = new_thread.session_configured.model.clone();
+    let warm_rollout_path = thread.rollout_path();
     let mut protected_error_emitted = false;
     let mut completed_turn = false;
     let turn_result: Result<(), String> = async {
@@ -1737,10 +1794,10 @@ pub(crate) async fn run_turn_async(
         let rollout_meta = codex_core::read_session_meta_line(&rollout_path)
             .await
             .map_err(|error| persistent_model_context_storage_error("validate", &error))?;
-        if rollout_meta.meta.id != new_thread.thread_id {
+        if rollout_meta.meta.id != thread_id {
             return Err("persistent model-context rollout belongs to another thread".to_string());
         }
-        write_thread_pointer(&codex_home, new_thread.thread_id, &rollout_path).await?;
+        write_thread_pointer(&codex_home, thread_id, &rollout_path).await?;
     }
 
     // Submit a single user turn through the real loop, pinning the model.
@@ -1771,7 +1828,7 @@ pub(crate) async fn run_turn_async(
                 mode: ModeKind::Default,
                 settings: Settings {
                     model: if model.trim().is_empty() {
-                        session_model
+                        session_model.clone()
                     } else {
                         model
                     },
@@ -2222,15 +2279,73 @@ pub(crate) async fn run_turn_async(
     let cleanup_result = match claim_turn_exit_disposition(turn_handle) {
         Ok(exit_disposition) => match exit_disposition {
             TurnExitDisposition::HostDetach => {
-                let detach_result = thread
-                    .prepare_for_host_detach()
-                    .await
-                    .map_err(|error| persistent_model_context_storage_error("flush", &error));
-                let shutdown_result = thread
-                    .shutdown_and_wait()
-                    .await
-                    .map_err(|error| persistent_model_context_storage_error("shutdown", &error));
-                finish_host_detach_cleanup(completed_turn, detach_result, shutdown_result)
+                if temporary_home.is_none()
+                    && completed_turn
+                    && turn_result.is_ok()
+                    && !protected_error_emitted
+                {
+                    match warm_rollout_path {
+                        Some(rollout_path) => {
+                            let reuse_result =
+                                thread.prepare_for_host_reuse().await.map_err(|error| {
+                                    persistent_model_context_storage_error("flush", &error)
+                                });
+                            if reuse_result.is_ok() {
+                                let retired = cache_warm_thread(
+                                    codex_home.clone(),
+                                    WarmThreadEntry {
+                                        fingerprint: configuration_fingerprint,
+                                        thread_id,
+                                        thread: Arc::clone(&thread),
+                                        session_model: session_model.clone(),
+                                        rollout_path,
+                                        credential_guard: retained_credential_guard,
+                                        last_used: Instant::now(),
+                                    },
+                                );
+                                retire_warm_threads_in_background(retired);
+                                emit_debug_stage(callback, ctx, "thread_cached");
+                                Ok(())
+                            } else {
+                                let _ = thread.prepare_for_host_detach().await;
+                                let shutdown_result =
+                                    thread.shutdown_and_wait().await.map_err(|error| {
+                                        persistent_model_context_storage_error("shutdown", &error)
+                                    });
+                                finish_host_detach_cleanup(
+                                    completed_turn,
+                                    reuse_result,
+                                    shutdown_result,
+                                )
+                            }
+                        }
+                        None => {
+                            let detach_result = Err(
+                                "persistent model-context thread did not provide a rollout path"
+                                    .to_string(),
+                            );
+                            let _ = thread.prepare_for_host_detach().await;
+                            let shutdown_result =
+                                thread.shutdown_and_wait().await.map_err(|error| {
+                                    persistent_model_context_storage_error("shutdown", &error)
+                                });
+                            finish_host_detach_cleanup(
+                                completed_turn,
+                                detach_result,
+                                shutdown_result,
+                            )
+                        }
+                    }
+                } else {
+                    let detach_result = thread
+                        .prepare_for_host_detach()
+                        .await
+                        .map_err(|error| persistent_model_context_storage_error("flush", &error));
+                    let shutdown_result = thread.shutdown_and_wait().await.map_err(|error| {
+                        persistent_model_context_storage_error("shutdown", &error)
+                    });
+                    finish_host_detach_cleanup(completed_turn, detach_result, shutdown_result)
+                }
             }
             TurnExitDisposition::UserInterrupt => thread
                 .shutdown_and_wait()
@@ -2494,6 +2609,7 @@ pub extern "C" fn codex_run_turn_streaming(
                     dynamic_tools,
                     uploads,
                     /*server_mode*/ None,
+                    /*credential_guard*/ None,
                     callback,
                     ctx,
                 ))
@@ -2618,6 +2734,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
                     dynamic_tools,
                     uploads,
                     /*server_mode*/ None,
+                    /*credential_guard*/ None,
                     callback,
                     ctx,
                 ))
@@ -2750,6 +2867,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
             parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
         };
         let (authentication, secret_guard) = parse_ssh_authentication(&auth_method, secret)?;
+        let credential_guard = secret_guard.map(Arc::new);
 
         let server_mode = ServerMode {
             connection_key,
@@ -2766,7 +2884,6 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
             .spawn(move || -> Result<(), TurnFailure> {
-                let _secret_guard = secret_guard;
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(async move {
                     let _receipts = upload_server_files_for_steering(
@@ -2794,6 +2911,7 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
                         dynamic_tools,
                         uploads,
                         Some(server_mode),
+                        credential_guard,
                         callback,
                         ctx,
                     )
@@ -2944,6 +3062,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
             parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
         };
         let (authentication, secret_guard) = parse_ssh_authentication(&auth_method, secret)?;
+        let credential_guard = secret_guard.map(Arc::new);
 
         let server_mode = ServerMode {
             connection_key,
@@ -2961,8 +3080,6 @@ pub extern "C" fn codex_run_turn_streaming_server(
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
             .spawn(move || -> Result<(), TurnFailure> {
-                // Hold a temporary key file alive when private-key auth is used.
-                let _secret_guard = secret_guard;
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(async move {
                     let _receipts = upload_server_files_for_steering(
@@ -2990,6 +3107,7 @@ pub extern "C" fn codex_run_turn_streaming_server(
                         dynamic_tools,
                         uploads,
                         /*server_mode*/ Some(server_mode),
+                        credential_guard,
                         callback,
                         ctx,
                     )
@@ -3065,6 +3183,7 @@ pub unsafe fn run_turn_streaming(
                     dynamic_tools_json,
                     uploads,
                     server_mode,
+                    /*credential_guard*/ None,
                     callback,
                     ctx,
                 ))
