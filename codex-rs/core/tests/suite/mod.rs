@@ -101,6 +101,7 @@ mod realtime_conversation;
 mod realtime_initial_items;
 mod remote_env;
 mod remote_models;
+mod remote_resume_reconciliation;
 mod request_compression;
 #[cfg(not(target_os = "windows"))]
 mod request_permissions;

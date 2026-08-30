@@ -880,28 +880,41 @@ impl ThreadManager {
         let Some(environment) = self.environment_manager().default_environment() else {
             return Ok(Vec::new());
         };
-        reconcile_remote_executions_with_terminal_proof(environment.as_ref(), request)
-            .await
-            .map_err(|error| match error {
-                RemoteTerminalProofReconciliationError::Backend(error) => CodexErr::Fatal(format!(
-                    "failed to reconcile exact remote executions: {error}"
-                )),
-                RemoteTerminalProofReconciliationError::DescriptorCount(count) => {
-                    CodexErr::Fatal(format!(
-                        "exact remote execution reconciliation returned an invalid descriptor \
-                         count ({count})"
-                    ))
-                }
-                RemoteTerminalProofReconciliationError::ProofDidNotConverge => CodexErr::Fatal(
-                    "remote terminal proof did not converge during execution reconciliation"
-                        .to_string(),
-                ),
-                RemoteTerminalProofReconciliationError::DeadlineExceeded => CodexErr::Fatal(
-                    "remote execution reconciliation deadline exceeded while proving terminal \
-                     lifecycle"
-                        .to_string(),
-                ),
-            })
+        let expected_descriptor_count = request.incomplete_executions.len();
+        let recovered = reconcile_remote_executions_with_terminal_proof(
+            environment.as_ref(),
+            request,
+        )
+        .await
+        .map_err(|error| match error {
+            RemoteTerminalProofReconciliationError::Backend(error) => CodexErr::Fatal(format!(
+                "remote execution lifecycle unresolved: failed to reconcile exact remote \
+                 executions: {error}"
+            )),
+            RemoteTerminalProofReconciliationError::DescriptorCount(count) => {
+                CodexErr::Fatal(format!(
+                    "remote execution lifecycle unresolved: exact remote execution \
+                     reconciliation returned an invalid descriptor count ({count})"
+                ))
+            }
+            RemoteTerminalProofReconciliationError::ProofDidNotConverge => CodexErr::Fatal(
+                "remote terminal proof did not converge during execution reconciliation"
+                    .to_string(),
+            ),
+            RemoteTerminalProofReconciliationError::DeadlineExceeded => CodexErr::Fatal(
+                "remote execution reconciliation deadline exceeded while proving terminal \
+                 lifecycle"
+                    .to_string(),
+            ),
+        })?;
+        if recovered.len() != expected_descriptor_count {
+            return Err(CodexErr::Fatal(format!(
+                "remote execution lifecycle unresolved: exact remote execution reconciliation \
+                 returned an invalid descriptor count ({}; expected {expected_descriptor_count})",
+                recovered.len()
+            )));
+        }
+        Ok(recovered)
     }
 
     pub(crate) fn scan_active_remote_calls(
