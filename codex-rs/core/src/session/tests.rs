@@ -3,6 +3,268 @@ use super::*;
 use codex_exec_server::PendingWriteInteraction;
 use codex_exec_server::RemoteExecutionProtocolEvidence;
 
+struct TerminalProofBackend {
+    reconcile_calls: Arc<std::sync::atomic::AtomicUsize>,
+    proof_after_reconcile: usize,
+    conflicting_digest: bool,
+}
+
+struct HangingTerminalProofBackend {
+    reconcile_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl codex_exec_server::ExecBackend for TerminalProofBackend {
+    fn start(
+        &self,
+        _params: codex_exec_server::ExecParams,
+    ) -> codex_exec_server::ExecBackendFuture<'_> {
+        Box::pin(async {
+            Err(codex_exec_server::ExecServerError::Protocol(
+                "terminal-proof fixture must not start a process".to_string(),
+            ))
+        })
+    }
+
+    fn adopt_execution(
+        &self,
+        _request: codex_exec_server::AdoptionRequest,
+    ) -> codex_exec_server::ExecBackendFuture<'_> {
+        Box::pin(async {
+            Err(codex_exec_server::ExecServerError::Protocol(
+                "terminal-proof fixture must not adopt a process".to_string(),
+            ))
+        })
+    }
+
+    fn reconcile(
+        &self,
+        request: codex_exec_server::ReconciliationRequest,
+    ) -> codex_exec_server::ExecBackendReconcileFuture<'_> {
+        let call = self
+            .reconcile_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let proof_after_reconcile = self.proof_after_reconcile;
+        let conflicting_digest = self.conflicting_digest;
+        Box::pin(async move {
+            let [incomplete] = request.incomplete_executions.as_slice() else {
+                return Err(codex_exec_server::ExecServerError::Protocol(
+                    "terminal-proof fixture expected one execution".to_string(),
+                ));
+            };
+            let output = b"settled output".to_vec();
+            Ok(vec![codex_exec_server::RecoveredExecution {
+                identity: codex_exec_server::ExecutionIdentity {
+                    thread_id: request.thread_id,
+                    turn_id: incomplete.turn_id.clone(),
+                    call_id: incomplete.call_id.clone(),
+                    attempt_generation: incomplete.attempt_generation,
+                },
+                command_digest: Some(if conflicting_digest {
+                    "conflicting-digest".to_string()
+                } else {
+                    incomplete
+                        .expected_command_digest
+                        .clone()
+                        .expect("fixture command digest")
+                }),
+                committed_output_cursor: output.len() as u64,
+                output,
+                status: codex_exec_server::RecoveredExecutionStatus::Exited(0),
+                terminal_verified_dead: call >= proof_after_reconcile,
+                session_id: incomplete.expected_session_id,
+                delivery_unknown: false,
+                acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+                    "terminal-proof-fixture".to_string(),
+                ),
+            }])
+        })
+    }
+}
+
+impl codex_exec_server::ExecBackend for HangingTerminalProofBackend {
+    fn start(
+        &self,
+        _params: codex_exec_server::ExecParams,
+    ) -> codex_exec_server::ExecBackendFuture<'_> {
+        Box::pin(async {
+            Err(codex_exec_server::ExecServerError::Protocol(
+                "hanging terminal-proof fixture must not start a process".to_string(),
+            ))
+        })
+    }
+
+    fn adopt_execution(
+        &self,
+        _request: codex_exec_server::AdoptionRequest,
+    ) -> codex_exec_server::ExecBackendFuture<'_> {
+        Box::pin(async {
+            Err(codex_exec_server::ExecServerError::Protocol(
+                "hanging terminal-proof fixture must not adopt a process".to_string(),
+            ))
+        })
+    }
+
+    fn reconcile(
+        &self,
+        _request: codex_exec_server::ReconciliationRequest,
+    ) -> codex_exec_server::ExecBackendReconcileFuture<'_> {
+        self.reconcile_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            std::future::pending::<
+                Result<
+                    Vec<codex_exec_server::RecoveredExecution>,
+                    codex_exec_server::ExecServerError,
+                >,
+            >()
+            .await
+        })
+    }
+}
+
+fn terminal_proof_request() -> codex_exec_server::ReconciliationRequest {
+    codex_exec_server::ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![codex_exec_server::IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("command-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn terminal_proof_reconciliation_waits_for_matching_death_proof() {
+    let reconcile_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let manager = EnvironmentManager::with_exec_backend_for_tests(
+        "terminal-proof",
+        Arc::new(TerminalProofBackend {
+            reconcile_calls: Arc::clone(&reconcile_calls),
+            proof_after_reconcile: 2,
+            conflicting_digest: false,
+        }),
+        /*durable_remote_exec_recovery*/ true,
+    );
+    let environment = manager
+        .get_environment("terminal-proof")
+        .expect("terminal-proof environment");
+
+    let execution = reconcile_remote_execution_with_terminal_proof(
+        environment.as_ref(),
+        terminal_proof_request(),
+    )
+    .await
+    .expect("matching terminal proof should converge");
+
+    assert!(execution.terminal_verified_dead);
+    assert_eq!(reconcile_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn terminal_proof_reconciliation_is_bounded_and_does_not_wait_on_conflicts() {
+    let timeout_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let timeout_manager = EnvironmentManager::with_exec_backend_for_tests(
+        "terminal-proof-timeout",
+        Arc::new(TerminalProofBackend {
+            reconcile_calls: Arc::clone(&timeout_calls),
+            proof_after_reconcile: usize::MAX,
+            conflicting_digest: false,
+        }),
+        /*durable_remote_exec_recovery*/ true,
+    );
+    let timeout_environment = timeout_manager
+        .get_environment("terminal-proof-timeout")
+        .expect("terminal-proof timeout environment");
+    let error = reconcile_remote_execution_with_terminal_proof(
+        timeout_environment.as_ref(),
+        terminal_proof_request(),
+    )
+    .await
+    .expect_err("unverified death proof must remain fail-closed");
+    assert!(matches!(
+        error,
+        RemoteTerminalProofReconciliationError::ProofDidNotConverge
+    ));
+    assert_eq!(
+        timeout_calls.load(std::sync::atomic::Ordering::SeqCst),
+        REMOTE_TERMINAL_PROOF_MAX_RECONCILIATIONS
+    );
+
+    let conflict_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let conflict_manager = EnvironmentManager::with_exec_backend_for_tests(
+        "terminal-proof-conflict",
+        Arc::new(TerminalProofBackend {
+            reconcile_calls: Arc::clone(&conflict_calls),
+            proof_after_reconcile: usize::MAX,
+            conflicting_digest: true,
+        }),
+        /*durable_remote_exec_recovery*/ true,
+    );
+    let conflict_environment = conflict_manager
+        .get_environment("terminal-proof-conflict")
+        .expect("terminal-proof conflict environment");
+    let request = terminal_proof_request();
+    let execution = reconcile_remote_execution_with_terminal_proof(
+        conflict_environment.as_ref(),
+        request.clone(),
+    )
+    .await
+    .expect("conflicting descriptor must return for immediate authority rejection");
+    assert!(!recovered_execution_matches_reconciliation_slot(
+        &execution,
+        &request.thread_id,
+        &request.incomplete_executions[0],
+    ));
+    assert_eq!(conflict_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn terminal_proof_reconciliation_has_an_elapsed_deadline_for_hung_backends() {
+    let reconcile_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let manager = EnvironmentManager::with_exec_backend_for_tests(
+        "terminal-proof-hang",
+        Arc::new(HangingTerminalProofBackend {
+            reconcile_calls: Arc::clone(&reconcile_calls),
+        }),
+        /*durable_remote_exec_recovery*/ true,
+    );
+    let environment = manager
+        .get_environment("terminal-proof-hang")
+        .expect("terminal-proof hang environment");
+    let started_at = tokio::time::Instant::now();
+    let error = reconcile_remote_executions_with_terminal_proof_using_policy(
+        environment.as_ref(),
+        terminal_proof_request(),
+        RemoteTerminalProofReconciliationPolicy {
+            max_reconciliations: 5,
+            retry_delay: Duration::from_millis(1),
+            total_timeout: Duration::from_millis(40),
+        },
+    )
+    .await
+    .expect_err("hung reconciliation must meet the total deadline");
+
+    assert!(matches!(
+        error,
+        RemoteTerminalProofReconciliationError::DeadlineExceeded
+    ));
+    assert_eq!(
+        reconcile_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a hung first attempt must not admit a sixth or overlapping retry"
+    );
+    assert!(
+        started_at.elapsed() < Duration::from_secs(1),
+        "test deadline must bound elapsed time"
+    );
+}
+
 fn background_prepared(session_id: i32, operation_call_id: &str, cursor: u64) -> RolloutItem {
     RolloutItem::RemoteExecutionSessionPrepared(RemoteExecutionSessionPrepared {
         thread_id: "thread".to_string(),

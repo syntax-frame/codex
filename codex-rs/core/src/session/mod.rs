@@ -2200,6 +2200,166 @@ pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
+const REMOTE_TERMINAL_PROOF_MAX_RECONCILIATIONS: usize = 5;
+const REMOTE_TERMINAL_PROOF_RETRY_DELAY: Duration = Duration::from_millis(250);
+const REMOTE_TERMINAL_PROOF_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug)]
+pub(crate) enum RemoteTerminalProofReconciliationError {
+    Backend(String),
+    DescriptorCount(usize),
+    ProofDidNotConverge,
+    DeadlineExceeded,
+}
+
+#[derive(Clone, Copy)]
+struct RemoteTerminalProofReconciliationPolicy {
+    max_reconciliations: usize,
+    retry_delay: Duration,
+    total_timeout: Duration,
+}
+
+impl RemoteTerminalProofReconciliationPolicy {
+    fn production() -> Self {
+        Self {
+            max_reconciliations: REMOTE_TERMINAL_PROOF_MAX_RECONCILIATIONS,
+            retry_delay: REMOTE_TERMINAL_PROOF_RETRY_DELAY,
+            total_timeout: REMOTE_TERMINAL_PROOF_TOTAL_TIMEOUT,
+        }
+    }
+}
+
+fn recovered_execution_matches_reconciliation_slot(
+    execution: &codex_exec_server::RecoveredExecution,
+    thread_id: &str,
+    incomplete: &codex_exec_server::IncompleteExecution,
+) -> bool {
+    let descriptor_authority_matches = match execution.status {
+        codex_exec_server::RecoveredExecutionStatus::Missing => {
+            execution.command_digest.is_none()
+                && execution.session_id.is_none()
+                && execution.output.is_empty()
+                && execution.committed_output_cursor == 0
+                && execution.terminal_verified_dead
+        }
+        codex_exec_server::RecoveredExecutionStatus::Unknown => false,
+        _ => {
+            execution.command_digest == incomplete.expected_command_digest
+                && execution.session_id == incomplete.expected_session_id
+        }
+    };
+    execution.identity.thread_id == thread_id
+        && execution.identity.turn_id == incomplete.turn_id
+        && execution.identity.call_id == incomplete.call_id
+        && execution.identity.attempt_generation == incomplete.attempt_generation
+        && descriptor_authority_matches
+        && u64::try_from(execution.output.len()).ok() == Some(execution.committed_output_cursor)
+        && !execution.delivery_unknown
+}
+
+fn recovered_executions_wait_only_for_terminal_proof(
+    recovered: &[codex_exec_server::RecoveredExecution],
+    request: &codex_exec_server::ReconciliationRequest,
+) -> bool {
+    if recovered.len() != request.incomplete_executions.len() {
+        return false;
+    }
+    let mut proof_is_pending = false;
+    for incomplete in &request.incomplete_executions {
+        let mut matching = recovered.iter().filter(|execution| {
+            execution.identity.thread_id == request.thread_id
+                && execution.identity.turn_id == incomplete.turn_id
+                && execution.identity.call_id == incomplete.call_id
+                && execution.identity.attempt_generation == incomplete.attempt_generation
+        });
+        let Some(execution) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some()
+            || !recovered_execution_matches_reconciliation_slot(
+                execution,
+                &request.thread_id,
+                incomplete,
+            )
+        {
+            return false;
+        }
+        match execution.status {
+            codex_exec_server::RecoveredExecutionStatus::Exited(_)
+            | codex_exec_server::RecoveredExecutionStatus::Terminated
+            | codex_exec_server::RecoveredExecutionStatus::RecoveryLost
+            | codex_exec_server::RecoveredExecutionStatus::LaunchInterrupted => {
+                proof_is_pending |= !execution.terminal_verified_dead;
+            }
+            codex_exec_server::RecoveredExecutionStatus::Missing => {}
+            codex_exec_server::RecoveredExecutionStatus::Prepared
+            | codex_exec_server::RecoveredExecutionStatus::Running
+                if !execution.terminal_verified_dead => {}
+            _ => return false,
+        }
+    }
+    proof_is_pending
+}
+
+async fn reconcile_remote_executions_with_terminal_proof_with_policy(
+    environment: &Environment,
+    request: codex_exec_server::ReconciliationRequest,
+) -> Result<Vec<codex_exec_server::RecoveredExecution>, RemoteTerminalProofReconciliationError> {
+    reconcile_remote_executions_with_terminal_proof_using_policy(
+        environment,
+        request,
+        RemoteTerminalProofReconciliationPolicy::production(),
+    )
+    .await
+}
+
+async fn reconcile_remote_executions_with_terminal_proof_using_policy(
+    environment: &Environment,
+    request: codex_exec_server::ReconciliationRequest,
+    policy: RemoteTerminalProofReconciliationPolicy,
+) -> Result<Vec<codex_exec_server::RecoveredExecution>, RemoteTerminalProofReconciliationError> {
+    let deadline = tokio::time::Instant::now() + policy.total_timeout;
+    let backend = environment.get_exec_backend();
+    for attempt in 1..=policy.max_reconciliations {
+        let recovered = tokio::time::timeout_at(deadline, backend.reconcile(request.clone()))
+            .await
+            .map_err(|_| RemoteTerminalProofReconciliationError::DeadlineExceeded)?
+            .map_err(|error| RemoteTerminalProofReconciliationError::Backend(error.to_string()))?;
+        if !recovered_executions_wait_only_for_terminal_proof(&recovered, &request) {
+            return Ok(recovered);
+        }
+        if attempt == policy.max_reconciliations {
+            return Err(RemoteTerminalProofReconciliationError::ProofDidNotConverge);
+        }
+        let retry_at = tokio::time::Instant::now() + policy.retry_delay;
+        if retry_at >= deadline {
+            return Err(RemoteTerminalProofReconciliationError::DeadlineExceeded);
+        }
+        tokio::time::sleep_until(retry_at).await;
+    }
+    unreachable!("bounded terminal-proof reconciliation loop must return")
+}
+
+pub(crate) async fn reconcile_remote_executions_with_terminal_proof(
+    environment: &Environment,
+    request: codex_exec_server::ReconciliationRequest,
+) -> Result<Vec<codex_exec_server::RecoveredExecution>, RemoteTerminalProofReconciliationError> {
+    reconcile_remote_executions_with_terminal_proof_with_policy(environment, request).await
+}
+
+async fn reconcile_remote_execution_with_terminal_proof(
+    environment: &Environment,
+    request: codex_exec_server::ReconciliationRequest,
+) -> Result<codex_exec_server::RecoveredExecution, RemoteTerminalProofReconciliationError> {
+    let recovered =
+        reconcile_remote_executions_with_terminal_proof_with_policy(environment, request).await?;
+    let [execution] = recovered.as_slice() else {
+        return Err(RemoteTerminalProofReconciliationError::DescriptorCount(
+            recovered.len(),
+        ));
+    };
+    Ok(execution.clone())
+}
 
 impl Session {
     /// Spawn and initialize a new session.
@@ -3367,22 +3527,40 @@ impl Session {
             let mut adoption_error = None;
             let mut restored = false;
             for attempt in 0..2 {
-                let mut recovered = environment
-                    .get_exec_backend()
-                    .reconcile(reconciliation_request.clone())
-                    .await
-                    .map_err(|error| {
+                let execution = reconcile_remote_execution_with_terminal_proof(
+                    environment.as_ref(),
+                    reconciliation_request.clone(),
+                )
+                .await
+                .map_err(|error| match error {
+                    RemoteTerminalProofReconciliationError::Backend(error) => {
                         CodexErr::Fatal(format!(
                             "failed to reconcile committed background session {}: {error}",
                             committed.session_id
                         ))
-                    })?;
-                let [execution] = recovered.as_mut_slice() else {
-                    return Err(CodexErr::Fatal(format!(
-                        "committed background session {} did not resolve to one exact descriptor",
-                        committed.session_id
-                    )));
-                };
+                    }
+                    RemoteTerminalProofReconciliationError::DescriptorCount(count) => {
+                        CodexErr::Fatal(format!(
+                            "committed background session {} did not resolve to one exact \
+                             descriptor ({count} returned)",
+                            committed.session_id
+                        ))
+                    }
+                    RemoteTerminalProofReconciliationError::ProofDidNotConverge => {
+                        CodexErr::Fatal(format!(
+                            "terminal background session {} death proof did not converge during \
+                             committed-session restoration",
+                            committed.session_id
+                        ))
+                    }
+                    RemoteTerminalProofReconciliationError::DeadlineExceeded => {
+                        CodexErr::Fatal(format!(
+                            "terminal background session {} reconciliation deadline exceeded \
+                             during committed-session restoration",
+                            committed.session_id
+                        ))
+                    }
+                })?;
                 if execution.identity != identity
                     || execution.command_digest.as_deref()
                         != Some(committed.command_digest.as_str())
@@ -3456,7 +3634,7 @@ impl Session {
                         self.services
                             .unified_exec_manager
                             .restore_terminal_background_process(
-                                execution,
+                                &execution,
                                 committed.range_end,
                                 self,
                                 committed.exec_call_id.clone(),
@@ -3826,22 +4004,39 @@ impl Session {
             }],
             pending_writes: Vec::new(),
         };
-        let mut recovered = environment
-            .get_exec_backend()
-            .reconcile(request.clone())
-            .await
-            .map_err(|error| {
-                CodexErr::Fatal(format!(
-                    "failed to reconcile background session {} for nonempty write recovery: {error}",
-                    pending.session_id
-                ))
-            })?;
-        let [execution] = recovered.as_mut_slice() else {
-            return Err(CodexErr::Fatal(format!(
-                "background session {} did not resolve to one exact descriptor",
-                pending.session_id
-            )));
-        };
+        let execution =
+            reconcile_remote_execution_with_terminal_proof(environment.as_ref(), request.clone())
+                .await
+                .map_err(|error| match error {
+                    RemoteTerminalProofReconciliationError::Backend(error) => {
+                        CodexErr::Fatal(format!(
+                            "failed to reconcile background session {} for nonempty write \
+                             recovery: {error}",
+                            pending.session_id
+                        ))
+                    }
+                    RemoteTerminalProofReconciliationError::DescriptorCount(count) => {
+                        CodexErr::Fatal(format!(
+                            "background session {} did not resolve to one exact descriptor \
+                             ({count} returned)",
+                            pending.session_id
+                        ))
+                    }
+                    RemoteTerminalProofReconciliationError::ProofDidNotConverge => {
+                        CodexErr::Fatal(format!(
+                            "terminal background session {} death proof did not converge during \
+                             nonempty-write recovery",
+                            pending.session_id
+                        ))
+                    }
+                    RemoteTerminalProofReconciliationError::DeadlineExceeded => {
+                        CodexErr::Fatal(format!(
+                            "terminal background session {} reconciliation deadline exceeded \
+                             during nonempty-write recovery",
+                            pending.session_id
+                        ))
+                    }
+                })?;
         match execution.status {
             codex_exec_server::RecoveredExecutionStatus::Running => {
                 let cwd = PathUri::parse(&prepared.cwd).map_err(|error| {
@@ -3896,24 +4091,40 @@ impl Session {
             }
         }
 
-        let mut verified = environment
-            .get_exec_backend()
-            .reconcile(request)
-            .await
-            .map_err(|error| {
-                CodexErr::Fatal(format!(
-                    "failed to verify terminated background session {}: {error}",
-                    pending.session_id
-                ))
-            })?;
-        let [execution] = verified.as_mut_slice() else {
-            return Err(CodexErr::Fatal(format!(
-                "terminated background session {} did not resolve to one exact descriptor",
-                pending.session_id
-            )));
-        };
-        let observed_exit_code = match execution.status {
-            codex_exec_server::RecoveredExecutionStatus::Exited(exit_code) => exit_code,
+        let execution =
+            reconcile_remote_execution_with_terminal_proof(environment.as_ref(), request)
+                .await
+                .map_err(|error| match error {
+                    RemoteTerminalProofReconciliationError::Backend(error) => {
+                        CodexErr::Fatal(format!(
+                            "failed to verify terminated background session {}: {error}",
+                            pending.session_id
+                        ))
+                    }
+                    RemoteTerminalProofReconciliationError::DescriptorCount(count) => {
+                        CodexErr::Fatal(format!(
+                            "terminated background session {} did not resolve to one exact \
+                             descriptor ({count} returned)",
+                            pending.session_id
+                        ))
+                    }
+                    RemoteTerminalProofReconciliationError::ProofDidNotConverge => {
+                        CodexErr::Fatal(format!(
+                            "terminal background session {} death proof did not converge during \
+                             nonempty-write verification",
+                            pending.session_id
+                        ))
+                    }
+                    RemoteTerminalProofReconciliationError::DeadlineExceeded => {
+                        CodexErr::Fatal(format!(
+                            "terminal background session {} reconciliation deadline exceeded \
+                             during nonempty-write verification",
+                            pending.session_id
+                        ))
+                    }
+                })?;
+        let observed_exit_code = match &execution.status {
+            codex_exec_server::RecoveredExecutionStatus::Exited(exit_code) => *exit_code,
             codex_exec_server::RecoveredExecutionStatus::Terminated => 143,
             codex_exec_server::RecoveredExecutionStatus::RecoveryLost => 125,
             _ => {
@@ -4858,9 +5069,9 @@ impl Session {
             call_id: prepared.exec_call_id.clone(),
             attempt_generation: prepared.attempt_generation,
         };
-        let recovered = environment
-            .get_exec_backend()
-            .reconcile(codex_exec_server::ReconciliationRequest {
+        let execution = reconcile_remote_execution_with_terminal_proof(
+            environment.as_ref(),
+            codex_exec_server::ReconciliationRequest {
                 thread_id: prepared.thread_id.clone(),
                 incomplete_executions: vec![codex_exec_server::IncompleteExecution {
                     turn_id: prepared.exec_turn_id.clone(),
@@ -4872,20 +5083,34 @@ impl Session {
                     protocol_evidence: codex_exec_server::RemoteExecutionProtocolEvidence::V2Proven,
                 }],
                 pending_writes: Vec::new(),
-            })
-            .await
-            .map_err(|error| {
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            RemoteTerminalProofReconciliationError::Backend(error) => CodexErr::Fatal(format!(
+                "failed to verify terminal background session {}: {error}",
+                prepared.session_id
+            )),
+            RemoteTerminalProofReconciliationError::DescriptorCount(count) => {
                 CodexErr::Fatal(format!(
-                    "failed to verify terminal background session {}: {error}",
+                    "terminal background session {} did not resolve to one exact descriptor \
+                     ({count} returned)",
                     prepared.session_id
                 ))
-            })?;
-        let [execution] = recovered.as_slice() else {
-            return Err(CodexErr::Fatal(format!(
-                "terminal background session {} did not resolve to one exact descriptor",
+            }
+            RemoteTerminalProofReconciliationError::ProofDidNotConverge => {
+                CodexErr::Fatal(format!(
+                    "terminal background session {} death proof did not converge during receipt \
+                     verification",
+                    prepared.session_id
+                ))
+            }
+            RemoteTerminalProofReconciliationError::DeadlineExceeded => CodexErr::Fatal(format!(
+                "terminal background session {} reconciliation deadline exceeded during \
+                     receipt verification",
                 prepared.session_id
-            )));
-        };
+            )),
+        })?;
         let terminal_status = match &execution.status {
             codex_exec_server::RecoveredExecutionStatus::Exited(actual)
                 if *actual == observed_exit_code =>
@@ -4904,6 +5129,12 @@ impl Session {
             }
             _ => None,
         };
+        let Some(terminal_status) = terminal_status else {
+            return Err(CodexErr::Fatal(format!(
+                "terminal background session {} lacks exact durable death and cursor proof",
+                prepared.session_id
+            )));
+        };
         if execution.identity != expected_identity
             || execution.command_digest.as_deref() != Some(prepared.command_digest.as_str())
             || execution.session_id != Some(prepared.session_id)
@@ -4912,7 +5143,6 @@ impl Session {
             || execution.output.len() as u64 != range_end
             || !execution.terminal_verified_dead
             || execution.delivery_unknown
-            || terminal_status.is_none()
         {
             return Err(CodexErr::Fatal(format!(
                 "terminal background session {} lacks exact durable death and cursor proof",
@@ -4947,7 +5177,7 @@ impl Session {
         Ok((
             token.to_string(),
             remote_receipt_bytes_digest(suffix),
-            terminal_status.expect("terminal status checked above"),
+            terminal_status,
         ))
     }
 

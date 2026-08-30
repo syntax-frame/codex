@@ -412,6 +412,25 @@ fn model_context_resume_error_reason(error: &codex_protocol::error::CodexErr) ->
             "remote_write_receipt_gap"
         }
         codex_protocol::error::CodexErr::Fatal(detail)
+            if detail.contains("remote terminal proof did not converge")
+                || (detail.contains("terminal background session")
+                    && detail.contains("death proof did not converge")) =>
+        {
+            "remote_terminal_proof_timeout"
+        }
+        codex_protocol::error::CodexErr::Fatal(detail)
+            if detail.contains("remote execution reconciliation deadline exceeded")
+                || (detail.contains("terminal background session")
+                    && detail.contains("reconciliation deadline exceeded")) =>
+        {
+            "remote_reconciliation_timeout"
+        }
+        codex_protocol::error::CodexErr::Fatal(detail)
+            if detail.contains("remote execution lifecycle unresolved") =>
+        {
+            "remote_execution_lifecycle_unresolved"
+        }
+        codex_protocol::error::CodexErr::Fatal(detail)
             if detail.contains("committed background session")
                 && (detail.contains("failed to reconcile")
                     || detail.contains("did not resolve to one exact descriptor")
@@ -1712,11 +1731,10 @@ pub(crate) async fn run_turn_async(
                     })?;
                 let pending_writes = reconciliation_request.pending_writes.clone();
                 let recovered_executions = thread_manager
-                    .environment_manager()
-                    .reconcile_default_environment(reconciliation_request)
+                    .reconcile_remote_executions_for_resume(reconciliation_request)
                     .await
                     .map_err(|error| {
-                        format!("failed to reconcile exact remote executions: {error}")
+                        persistent_model_context_resume_error("execution_reconciliation", &error)
                     })?;
                 emit_debug_stage(callback, ctx, "exact_execution_reconciled");
                 let thread = thread_manager

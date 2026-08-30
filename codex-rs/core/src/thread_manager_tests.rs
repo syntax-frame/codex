@@ -648,8 +648,379 @@ fn scanner_does_not_reclassify_arbitrary_completed_write_output() {
     assert!(request.pending_writes.is_empty());
 }
 
+struct ResumePreflightBackend {
+    reconcile_calls: Arc<AtomicUsize>,
+}
+
+impl codex_exec_server::ExecBackend for ResumePreflightBackend {
+    fn start(
+        &self,
+        _params: codex_exec_server::ExecParams,
+    ) -> codex_exec_server::ExecBackendFuture<'_> {
+        Box::pin(async {
+            Err(codex_exec_server::ExecServerError::Protocol(
+                "resume preflight must not start a process".to_string(),
+            ))
+        })
+    }
+
+    fn adopt_execution(
+        &self,
+        _request: codex_exec_server::AdoptionRequest,
+    ) -> codex_exec_server::ExecBackendFuture<'_> {
+        Box::pin(async {
+            Err(codex_exec_server::ExecServerError::Protocol(
+                "resume preflight must not adopt a process".to_string(),
+            ))
+        })
+    }
+
+    fn reconcile(
+        &self,
+        request: codex_exec_server::ReconciliationRequest,
+    ) -> codex_exec_server::ExecBackendReconcileFuture<'_> {
+        let reconcile_call = self.reconcile_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        Box::pin(async move {
+            if request.incomplete_executions.len() != 2 || !request.pending_writes.is_empty() {
+                return Err(codex_exec_server::ExecServerError::Protocol(
+                    "resume preflight expected two execution generations".to_string(),
+                ));
+            }
+            let mut recovered = Vec::with_capacity(2);
+            for incomplete in request.incomplete_executions {
+                let is_generation_zero = incomplete.attempt_generation == 0;
+                if !is_generation_zero && incomplete.attempt_generation != 1 {
+                    return Err(codex_exec_server::ExecServerError::Protocol(
+                        "resume preflight received an unexpected generation".to_string(),
+                    ));
+                }
+                recovered.push(codex_exec_server::RecoveredExecution {
+                    identity: codex_exec_server::ExecutionIdentity {
+                        thread_id: request.thread_id.clone(),
+                        turn_id: incomplete.turn_id,
+                        call_id: incomplete.call_id,
+                        attempt_generation: incomplete.attempt_generation,
+                    },
+                    command_digest: is_generation_zero.then_some("command-digest".to_string()),
+                    output: Vec::new(),
+                    status: if is_generation_zero {
+                        codex_exec_server::RecoveredExecutionStatus::Exited(0)
+                    } else {
+                        codex_exec_server::RecoveredExecutionStatus::Missing
+                    },
+                    terminal_verified_dead: !is_generation_zero || reconcile_call >= 2,
+                    session_id: is_generation_zero.then_some(42),
+                    committed_output_cursor: 0,
+                    delivery_unknown: false,
+                    acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+                        format!(
+                            "resume-preflight-generation-{}",
+                            incomplete.attempt_generation
+                        ),
+                    ),
+                });
+            }
+            Ok(recovered)
+        })
+    }
+}
+
+#[tokio::test]
+async fn native_resume_preflight_waits_for_terminal_proof_before_generation_selection() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let reconcile_calls = Arc::new(AtomicUsize::new(0));
+    let environment_manager = Arc::new(
+        codex_exec_server::EnvironmentManager::with_exec_backend_for_tests(
+            "resume-preflight",
+            Arc::new(ResumePreflightBackend {
+                reconcile_calls: Arc::clone(&reconcile_calls),
+            }),
+            /*durable_remote_exec_recovery*/ true,
+        ),
+    );
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        environment_manager,
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: [0, 1]
+            .into_iter()
+            .map(|attempt_generation| IncompleteExecution {
+                turn_id: "turn".to_string(),
+                call_id: "call".to_string(),
+                attempt_generation,
+                expected_command_digest: Some("command-digest".to_string()),
+                expected_session_id: Some(42),
+                expected_tty: Some(false),
+                protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+            })
+            .collect(),
+        pending_writes: Vec::new(),
+    };
+
+    let recovered = manager
+        .reconcile_remote_executions_for_resume(request)
+        .await
+        .expect("exact terminal proof should converge in bridge preflight");
+
+    assert_eq!(reconcile_calls.load(Ordering::SeqCst), 2);
+    let evidence = HashSet::from([("thread".to_string(), "turn".to_string(), "call".to_string())]);
+    let selected =
+        select_recovered_execution_rows(recovered, &evidence).expect("select proven generation");
+    let [SelectedRecoveryAction::RepairAndAcknowledge(execution)] = selected.as_slice() else {
+        panic!("generation zero should be selected after exact death proof");
+    };
+    assert_eq!(execution.identity.attempt_generation, 0);
+    assert!(execution.terminal_verified_dead);
+}
+
+struct PostAdoptionVerificationBackend {
+    adopt_calls: Arc<AtomicUsize>,
+    reconcile_calls: Arc<AtomicUsize>,
+    proof_after_reconcile: usize,
+    hangs_during_reconciliation: bool,
+}
+
+impl codex_exec_server::ExecBackend for PostAdoptionVerificationBackend {
+    fn start(
+        &self,
+        _params: codex_exec_server::ExecParams,
+    ) -> codex_exec_server::ExecBackendFuture<'_> {
+        Box::pin(async {
+            Err(codex_exec_server::ExecServerError::Protocol(
+                "post-adoption fixture must not start a process".to_string(),
+            ))
+        })
+    }
+
+    fn adopt_execution(
+        &self,
+        request: codex_exec_server::AdoptionRequest,
+    ) -> codex_exec_server::ExecBackendFuture<'_> {
+        self.adopt_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if request.identity.thread_id != "thread"
+                || request.identity.turn_id != "turn"
+                || request.identity.call_id != "call"
+                || request.identity.attempt_generation != 0
+                || request.expected_command_digest != "command-digest"
+                || request.original_session_id != Some(42)
+                || request.committed_output_cursor != 7
+                || request.tty
+            {
+                return Err(codex_exec_server::ExecServerError::Protocol(
+                    "post-adoption fixture received conflicting authority".to_string(),
+                ));
+            }
+            codex_exec_server::StartedExecProcess::from_recovered_terminal(
+                42,
+                b"before\nafter\n",
+                7,
+                0,
+                /*tty*/ false,
+            )
+        })
+    }
+
+    fn reconcile(
+        &self,
+        request: codex_exec_server::ReconciliationRequest,
+    ) -> codex_exec_server::ExecBackendReconcileFuture<'_> {
+        let reconcile_call = self.reconcile_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let proof_after_reconcile = self.proof_after_reconcile;
+        let hangs_during_reconciliation = self.hangs_during_reconciliation;
+        Box::pin(async move {
+            if hangs_during_reconciliation {
+                return std::future::pending::<
+                    Result<
+                        Vec<codex_exec_server::RecoveredExecution>,
+                        codex_exec_server::ExecServerError,
+                    >,
+                >()
+                .await;
+            }
+            let [incomplete] = request.incomplete_executions.as_slice() else {
+                return Err(codex_exec_server::ExecServerError::Protocol(
+                    "post-adoption fixture expected one execution".to_string(),
+                ));
+            };
+            if request.thread_id != "thread"
+                || incomplete.turn_id != "turn"
+                || incomplete.call_id != "call"
+                || incomplete.attempt_generation != 0
+                || incomplete.expected_command_digest.as_deref() != Some("command-digest")
+                || incomplete.expected_session_id != Some(42)
+                || incomplete.expected_tty != Some(false)
+                || !request.pending_writes.is_empty()
+            {
+                return Err(codex_exec_server::ExecServerError::Protocol(
+                    "post-adoption verification request conflicts with authority".to_string(),
+                ));
+            }
+            let output = b"before\nafter\n".to_vec();
+            Ok(vec![codex_exec_server::RecoveredExecution {
+                identity: codex_exec_server::ExecutionIdentity {
+                    thread_id: request.thread_id,
+                    turn_id: incomplete.turn_id.clone(),
+                    call_id: incomplete.call_id.clone(),
+                    attempt_generation: incomplete.attempt_generation,
+                },
+                command_digest: incomplete.expected_command_digest.clone(),
+                output,
+                status: codex_exec_server::RecoveredExecutionStatus::Exited(0),
+                terminal_verified_dead: reconcile_call >= proof_after_reconcile,
+                session_id: incomplete.expected_session_id,
+                committed_output_cursor: 13,
+                delivery_unknown: false,
+                acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+                    "post-adoption-verification".to_string(),
+                ),
+            }])
+        })
+    }
+}
+
+fn post_adoption_running_execution() -> RecoveredExecution {
+    RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: Some("command-digest".to_string()),
+        output: b"before\n".to_vec(),
+        status: RecoveredExecutionStatus::Running,
+        terminal_verified_dead: false,
+        session_id: Some(42),
+        committed_output_cursor: 7,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "running-execution".to_string(),
+        ),
+    }
+}
+
+fn post_adoption_launch_authority() -> IncompleteExecution {
+    IncompleteExecution {
+        turn_id: "turn".to_string(),
+        call_id: "call".to_string(),
+        attempt_generation: 0,
+        expected_command_digest: Some("command-digest".to_string()),
+        expected_session_id: Some(42),
+        expected_tty: Some(false),
+        protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+    }
+}
+
+#[tokio::test]
+async fn adopted_running_execution_waits_for_exact_terminal_proof_after_exit() {
+    let adopt_calls = Arc::new(AtomicUsize::new(0));
+    let reconcile_calls = Arc::new(AtomicUsize::new(0));
+    let environment_manager = codex_exec_server::EnvironmentManager::with_exec_backend_for_tests(
+        "post-adoption",
+        Arc::new(PostAdoptionVerificationBackend {
+            adopt_calls: Arc::clone(&adopt_calls),
+            reconcile_calls: Arc::clone(&reconcile_calls),
+            proof_after_reconcile: 2,
+            hangs_during_reconciliation: false,
+        }),
+        /*durable_remote_exec_recovery*/ true,
+    );
+
+    let execution = reconcile_adopted_running_execution(
+        post_adoption_running_execution(),
+        &post_adoption_launch_authority(),
+        "thread",
+        &environment_manager,
+    )
+    .await
+    .expect("post-adoption terminal proof should converge");
+
+    assert_eq!(adopt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reconcile_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(execution.output, b"before\nafter\n");
+    assert_eq!(execution.status, RecoveredExecutionStatus::Exited(0));
+    assert!(execution.terminal_verified_dead);
+}
+
+#[tokio::test(start_paused = true)]
+async fn adopted_running_execution_hung_terminal_verification_meets_deadline() {
+    let adopt_calls = Arc::new(AtomicUsize::new(0));
+    let reconcile_calls = Arc::new(AtomicUsize::new(0));
+    let environment_manager = codex_exec_server::EnvironmentManager::with_exec_backend_for_tests(
+        "post-adoption-hang",
+        Arc::new(PostAdoptionVerificationBackend {
+            adopt_calls: Arc::clone(&adopt_calls),
+            reconcile_calls: Arc::clone(&reconcile_calls),
+            proof_after_reconcile: usize::MAX,
+            hangs_during_reconciliation: true,
+        }),
+        /*durable_remote_exec_recovery*/ true,
+    );
+
+    let error = reconcile_adopted_running_execution(
+        post_adoption_running_execution(),
+        &post_adoption_launch_authority(),
+        "thread",
+        &environment_manager,
+    )
+    .await
+    .expect_err("hung post-adoption verification must meet the shared deadline");
+
+    assert_eq!(adopt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reconcile_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        error
+            .to_string()
+            .contains("remote execution reconciliation deadline exceeded")
+    );
+}
+
+#[test]
+fn adopted_running_execution_authority_conflict_is_lifecycle_unresolved() {
+    let mut execution = post_adoption_running_execution();
+    execution.command_digest = Some("conflicting-command-digest".to_string());
+    let authority = post_adoption_launch_authority();
+
+    let error = validated_adopted_running_authority(&execution, Some(&authority))
+        .expect_err("conflicting adopted execution authority must remain a lifecycle hold");
+
+    assert!(
+        error
+            .to_string()
+            .contains("adopted remote execution lifecycle unresolved")
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with local launch authority")
+    );
+}
+
 struct ResumeRepairBackend {
     reconcile_calls: Arc<AtomicUsize>,
+    terminal_proof_after_reconcile: usize,
     start_calls: Arc<AtomicUsize>,
     adopt_calls: Arc<AtomicUsize>,
     write_calls: Arc<AtomicUsize>,
@@ -774,7 +1145,8 @@ impl codex_exec_server::ExecBackend for ResumeRepairBackend {
         &self,
         request: codex_exec_server::ReconciliationRequest,
     ) -> codex_exec_server::ExecBackendReconcileFuture<'_> {
-        self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+        let reconcile_call = self.reconcile_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let terminal_proof_after_reconcile = self.terminal_proof_after_reconcile;
         Box::pin(async move {
             if request.incomplete_executions.len() != 1 || !request.pending_writes.is_empty() {
                 return Err(codex_exec_server::ExecServerError::Protocol(
@@ -811,7 +1183,7 @@ impl codex_exec_server::ExecBackend for ResumeRepairBackend {
                 committed_output_cursor: output.len() as u64,
                 output,
                 status: status.clone(),
-                terminal_verified_dead: true,
+                terminal_verified_dead: reconcile_call >= terminal_proof_after_reconcile,
                 session_id: incomplete.expected_session_id,
                 delivery_unknown: false,
                 acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
@@ -977,6 +1349,7 @@ async fn receiptless_write_error_is_sealed_without_replaying_stdin() {
     let terminate_calls = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(ResumeRepairBackend {
         reconcile_calls: Arc::clone(&reconcile_calls),
+        terminal_proof_after_reconcile: 1,
         start_calls: Arc::clone(&start_calls),
         adopt_calls: Arc::clone(&adopt_calls),
         write_calls: Arc::clone(&write_calls),
@@ -1195,7 +1568,7 @@ async fn receiptless_write_error_is_sealed_without_replaying_stdin() {
 }
 
 #[tokio::test]
-async fn prepared_interrupt_rejection_resumes_once_and_preserves_completed_final_response() {
+async fn prepared_interrupt_rejection_waits_for_terminal_proof_and_preserves_final_response() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -1213,6 +1586,7 @@ async fn prepared_interrupt_rejection_resumes_once_and_preserves_completed_final
     let terminate_calls = Arc::new(AtomicUsize::new(0));
     let backend = Arc::new(ResumeRepairBackend {
         reconcile_calls: Arc::clone(&reconcile_calls),
+        terminal_proof_after_reconcile: 2,
         start_calls: Arc::clone(&start_calls),
         adopt_calls: Arc::clone(&adopt_calls),
         write_calls: Arc::clone(&write_calls),
@@ -1538,7 +1912,7 @@ async fn prepared_interrupt_rejection_resumes_once_and_preserves_completed_final
             1
         );
     }
-    assert_eq!(reconcile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reconcile_calls.load(Ordering::SeqCst), 2);
     assert_eq!(start_calls.load(Ordering::SeqCst), 0);
     assert_eq!(adopt_calls.load(Ordering::SeqCst), 0);
     assert_eq!(write_calls.load(Ordering::SeqCst), 0);
@@ -1860,27 +2234,18 @@ fn running_foreground_recovery_adopts_and_waits_before_rollout_repair() {
     let running = repair
         .find("RecoveredExecutionStatus::Running")
         .expect("running recovery branch");
-    let adopt = repair[running..]
-        .find("adopt_default_environment_execution")
-        .expect("exact foreground adoption")
+    let bounded_lifecycle = repair[running..]
+        .find("reconcile_adopted_running_execution")
+        .expect("bounded post-adoption lifecycle")
         + running;
-    let event_wait = repair[adopt..]
-        .find("events.recv().await")
-        .expect("truthful terminal wait")
-        + adopt;
-    let terminal_verify = repair[event_wait..]
-        .find("reconcile_default_environment")
-        .expect("exact retained-descriptor verification")
-        + event_wait;
     let append = repair
         .find("append_function_output_if_missing")
         .expect("durable rollout repair");
-    assert!(running < adopt);
-    assert!(adopt < event_wait);
-    assert!(event_wait < terminal_verify);
-    assert!(terminal_verify < append);
+    assert!(running < bounded_lifecycle);
+    assert!(bounded_lifecycle < append);
     assert!(source.contains("original_session_id: Some(original_session_id)"));
-    assert!(repair.contains("!verified.terminal_verified_dead"));
+    assert!(source.contains("reconcile_remote_executions_with_terminal_proof"));
+    assert!(source.contains("!verified.terminal_verified_dead"));
     assert!(!repair.contains("if execution.session_id.is_some()"));
 }
 

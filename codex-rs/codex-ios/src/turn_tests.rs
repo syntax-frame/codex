@@ -987,6 +987,30 @@ fn model_context_resume_errors_are_content_free_stable_classes() {
         model_context_resume_error_reason(&restoration),
         "remote_session_restoration"
     );
+    let terminal_proof_timeout = CodexErr::Fatal(
+        "terminal background session private death proof did not converge during receipt \
+         verification"
+            .to_string(),
+    );
+    assert_eq!(
+        model_context_resume_error_reason(&terminal_proof_timeout),
+        "remote_terminal_proof_timeout"
+    );
+    let reconciliation_timeout = CodexErr::Fatal(
+        "remote execution reconciliation deadline exceeded while proving terminal lifecycle"
+            .to_string(),
+    );
+    assert_eq!(
+        model_context_resume_error_reason(&reconciliation_timeout),
+        "remote_reconciliation_timeout"
+    );
+    let adopted_lifecycle = CodexErr::Fatal(
+        "adopted remote execution lifecycle unresolved: private verification conflict".to_string(),
+    );
+    assert_eq!(
+        model_context_resume_error_reason(&adopted_lifecycle),
+        "remote_execution_lifecycle_unresolved"
+    );
     let restoration_message = persistent_model_context_resume_error("thread_resume", &restoration);
     assert_eq!(
         restoration_message,
@@ -1002,6 +1026,31 @@ fn model_context_resume_errors_are_content_free_stable_classes() {
     );
     assert!(!public_message.contains("background session private"));
     assert!(!public_message.contains("write_stdin call private"));
+    let terminal_proof_message =
+        persistent_model_context_resume_error("thread_resume", &terminal_proof_timeout);
+    assert_eq!(
+        terminal_proof_message,
+        "failed to resume persistent model context \
+         [invalid_or_unavailable;stage=thread_resume;reason=remote_terminal_proof_timeout]"
+    );
+    assert!(!terminal_proof_message.contains("background session private"));
+    let reconciliation_timeout_message =
+        persistent_model_context_resume_error("execution_reconciliation", &reconciliation_timeout);
+    assert_eq!(
+        reconciliation_timeout_message,
+        "failed to resume persistent model context \
+         [invalid_or_unavailable;stage=execution_reconciliation;\
+         reason=remote_reconciliation_timeout]"
+    );
+    let adopted_lifecycle_message =
+        persistent_model_context_resume_error("thread_resume", &adopted_lifecycle);
+    assert_eq!(
+        adopted_lifecycle_message,
+        "failed to resume persistent model context \
+         [invalid_or_unavailable;stage=thread_resume;\
+         reason=remote_execution_lifecycle_unresolved]"
+    );
+    assert!(!adopted_lifecycle_message.contains("private verification conflict"));
 }
 
 #[test]

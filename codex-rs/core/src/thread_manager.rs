@@ -11,8 +11,10 @@ use crate::environment_selection::default_thread_environment_selections;
 use crate::mcp::McpManager;
 use crate::rollout::truncation;
 use crate::session::INITIAL_SUBMIT_ID;
+use crate::session::RemoteTerminalProofReconciliationError;
 use crate::session::SessionIo;
 use crate::session::SessionSpawnArgs;
+use crate::session::reconcile_remote_executions_with_terminal_proof;
 use crate::session::resolve_multi_agent_version;
 use crate::session::session::Session;
 use crate::tasks::InterruptedTurnHistoryMarker;
@@ -863,6 +865,45 @@ impl ThreadManager {
         )
     }
 
+    /// Reconciles the exact executions found in a persisted rollout before
+    /// native resume may select a generation or admit successor model work.
+    ///
+    /// A terminal descriptor whose identity and durable authority match the
+    /// request may need a short interval before SSH/tmux can prove that its
+    /// process and window are absent. The bounded helper retries only that
+    /// state; conflicts return immediately and a hung backend meets the same
+    /// elapsed deadline.
+    pub async fn reconcile_remote_executions_for_resume(
+        &self,
+        request: ReconciliationRequest,
+    ) -> CodexResult<Vec<RecoveredExecution>> {
+        let Some(environment) = self.environment_manager().default_environment() else {
+            return Ok(Vec::new());
+        };
+        reconcile_remote_executions_with_terminal_proof(environment.as_ref(), request)
+            .await
+            .map_err(|error| match error {
+                RemoteTerminalProofReconciliationError::Backend(error) => CodexErr::Fatal(format!(
+                    "failed to reconcile exact remote executions: {error}"
+                )),
+                RemoteTerminalProofReconciliationError::DescriptorCount(count) => {
+                    CodexErr::Fatal(format!(
+                        "exact remote execution reconciliation returned an invalid descriptor \
+                         count ({count})"
+                    ))
+                }
+                RemoteTerminalProofReconciliationError::ProofDidNotConverge => CodexErr::Fatal(
+                    "remote terminal proof did not converge during execution reconciliation"
+                        .to_string(),
+                ),
+                RemoteTerminalProofReconciliationError::DeadlineExceeded => CodexErr::Fatal(
+                    "remote execution reconciliation deadline exceeded while proving terminal \
+                     lifecycle"
+                        .to_string(),
+                ),
+            })
+    }
+
     pub(crate) fn scan_active_remote_calls(
         thread_id: String,
         history: &[RolloutItem],
@@ -1451,7 +1492,12 @@ impl ThreadManager {
             recovered_executions,
             &self.environment_manager(),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            CodexErr::Fatal(format!(
+                "remote execution lifecycle unresolved during resume repair: {error}"
+            ))
+        })?;
         let initial_history = if repaired {
             self.initial_history_from_rollout_path(rollout_path).await?
         } else {
@@ -2536,6 +2582,130 @@ fn stored_thread_to_initial_history(
     }))
 }
 
+async fn reconcile_adopted_running_execution(
+    mut execution: RecoveredExecution,
+    launch_authority: &IncompleteExecution,
+    conversation_id: &str,
+    environment_manager: &EnvironmentManager,
+) -> CodexResult<RecoveredExecution> {
+    let started = environment_manager
+        .adopt_default_environment_execution(foreground_adoption_request(
+            &execution,
+            Some(launch_authority),
+        )?)
+        .await
+        .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
+    let mut events = started.process.subscribe_events();
+    let mut exit_code = None;
+    loop {
+        match events.recv().await {
+            Ok(ExecProcessEvent::Output(chunk)) => {
+                execution.output.extend_from_slice(&chunk.chunk.0);
+            }
+            Ok(ExecProcessEvent::Exited {
+                exit_code: code, ..
+            }) => exit_code = Some(code),
+            Ok(ExecProcessEvent::Closed { .. }) if exit_code.is_some() => break,
+            Ok(ExecProcessEvent::Closed { .. }) => {
+                return Err(CodexErr::Fatal(format!(
+                    "adopted execution closed without a terminal status for call {}",
+                    execution.identity.call_id
+                )));
+            }
+            Ok(ExecProcessEvent::Failed(error)) => {
+                return Err(CodexErr::Fatal(format!(
+                    "adopted execution failed for call {}: {error}",
+                    execution.identity.call_id
+                )));
+            }
+            Err(error) => {
+                return Err(CodexErr::Fatal(format!(
+                    "adopted execution event stream failed for call {}: {error}",
+                    execution.identity.call_id
+                )));
+            }
+        }
+    }
+    let Some(exit_code) = exit_code else {
+        return Err(CodexErr::Fatal(format!(
+            "adopted execution closed without a terminal status for call {}",
+            execution.identity.call_id
+        )));
+    };
+    execution.status = RecoveredExecutionStatus::Exited(exit_code);
+
+    // Terminal status and output closure are not independently sufficient
+    // proof that the exact process group and retained tmux window are absent.
+    // Re-query the same descriptor while it is still retained, then use only
+    // that verified snapshot for rollout repair.
+    let verification_request = ReconciliationRequest {
+        thread_id: conversation_id.to_string(),
+        incomplete_executions: vec![launch_authority.clone()],
+        pending_writes: Vec::new(),
+    };
+    let environment = environment_manager.default_environment().ok_or_else(|| {
+        CodexErr::Fatal(format!(
+            "adopted execution environment is unavailable for call {}",
+            execution.identity.call_id
+        ))
+    })?;
+    let mut verified =
+        reconcile_remote_executions_with_terminal_proof(environment.as_ref(), verification_request)
+            .await
+            .map_err(|error| {
+                match error {
+        RemoteTerminalProofReconciliationError::Backend(error) => CodexErr::Fatal(format!(
+            "adopted execution terminal reconciliation failed for call {}: {error}",
+            execution.identity.call_id
+        )),
+        RemoteTerminalProofReconciliationError::DescriptorCount(count) => {
+            CodexErr::Fatal(format!(
+                "adopted execution terminal verification returned {count} rows for call {}",
+                execution.identity.call_id
+            ))
+        }
+        RemoteTerminalProofReconciliationError::ProofDidNotConverge => CodexErr::Fatal(
+            "remote terminal proof did not converge during adopted-execution verification"
+                .to_string(),
+        ),
+        RemoteTerminalProofReconciliationError::DeadlineExceeded => CodexErr::Fatal(
+            "remote execution reconciliation deadline exceeded while proving adopted terminal \
+             lifecycle"
+                .to_string(),
+        ),
+    }
+            })?;
+    if verified.len() != 1 {
+        return Err(CodexErr::Fatal(format!(
+            "adopted execution terminal verification returned {} rows for call {}",
+            verified.len(),
+            execution.identity.call_id
+        )));
+    }
+    let verified = verified.pop().expect("length checked above");
+    validate_recovered_execution_authority(&verified, Some(launch_authority))?;
+    let terminal_matches = matches!(
+        &verified.status,
+        RecoveredExecutionStatus::Exited(verified_exit_code)
+            if *verified_exit_code == exit_code
+    ) || matches!(
+        &verified.status,
+        RecoveredExecutionStatus::Terminated if exit_code == 143
+    );
+    if verified.identity != execution.identity
+        || !terminal_matches
+        || !verified.terminal_verified_dead
+        || verified.output != execution.output
+        || verified.committed_output_cursor != verified.output.len() as u64
+    {
+        return Err(CodexErr::Fatal(format!(
+            "adopted execution terminal verification is inconsistent for call {}",
+            execution.identity.call_id
+        )));
+    }
+    Ok(verified)
+}
+
 async fn append_recovered_execution_outputs_to_rollout(
     rollout_path: &std::path::Path,
     history: &InitialHistory,
@@ -2611,7 +2781,10 @@ async fn append_recovered_execution_outputs_to_rollout(
             execution.identity.call_id.clone(),
             execution.identity.attempt_generation,
         ));
-        if !matches!(execution.status, RecoveredExecutionStatus::Missing) {
+        if !matches!(
+            execution.status,
+            RecoveredExecutionStatus::Missing | RecoveredExecutionStatus::Running
+        ) {
             validate_recovered_execution_authority(&execution, launch_authority)?;
         }
         match execution.status {
@@ -2628,99 +2801,20 @@ async fn append_recovered_execution_outputs_to_rollout(
             }
             RecoveredExecutionStatus::LaunchInterrupted => {}
             RecoveredExecutionStatus::Running => {
-                let started = environment_manager
-                    .adopt_default_environment_execution(foreground_adoption_request(
-                        &execution,
-                        launch_authority,
-                    )?)
-                    .await
-                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
-                let mut events = started.process.subscribe_events();
-                let mut exit_code = None;
-                loop {
-                    match events.recv().await {
-                        Ok(ExecProcessEvent::Output(chunk)) => {
-                            execution.output.extend_from_slice(&chunk.chunk.0);
-                        }
-                        Ok(ExecProcessEvent::Exited {
-                            exit_code: code, ..
-                        }) => exit_code = Some(code),
-                        Ok(ExecProcessEvent::Closed { .. }) if exit_code.is_some() => break,
-                        Ok(ExecProcessEvent::Closed { .. }) => {
-                            return Err(CodexErr::Fatal(format!(
-                                "adopted execution closed without a terminal status for call {}",
-                                execution.identity.call_id
-                            )));
-                        }
-                        Ok(ExecProcessEvent::Failed(error)) => {
-                            return Err(CodexErr::Fatal(format!(
-                                "adopted execution failed for call {}: {error}",
-                                execution.identity.call_id
-                            )));
-                        }
-                        Err(error) => {
-                            return Err(CodexErr::Fatal(format!(
-                                "adopted execution event stream failed for call {}: {error}",
-                                execution.identity.call_id
-                            )));
-                        }
-                    }
-                }
-                execution.status = RecoveredExecutionStatus::Exited(
-                    exit_code.expect("closed branch requires an exit status"),
-                );
-                // Terminal status and output closure are not independently
-                // sufficient proof that the exact process group and retained
-                // tmux window are absent. Re-query the same descriptor while it
-                // is still retained, then use only that verified snapshot for
-                // rollout repair.
-                let authority = launch_authority.cloned().ok_or_else(|| {
+                let authority =
+                    validated_adopted_running_authority(&execution, launch_authority)?.clone();
+                execution = reconcile_adopted_running_execution(
+                    execution,
+                    &authority,
+                    &conversation_id,
+                    environment_manager,
+                )
+                .await
+                .map_err(|error| {
                     CodexErr::Fatal(format!(
-                        "adopted execution lacks local launch authority for call {}",
-                        execution.identity.call_id
+                        "adopted remote execution lifecycle unresolved: {error}"
                     ))
                 })?;
-                let verification_request = ReconciliationRequest {
-                    thread_id: conversation_id.clone(),
-                    incomplete_executions: vec![authority],
-                    pending_writes: Vec::new(),
-                };
-                let mut verified = environment_manager
-                    .reconcile_default_environment(verification_request)
-                    .await
-                    .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
-                if verified.len() != 1 {
-                    return Err(CodexErr::Fatal(format!(
-                        "adopted execution terminal verification returned {} rows for call {}",
-                        verified.len(),
-                        execution.identity.call_id
-                    )));
-                }
-                let verified = verified.pop().expect("length checked above");
-                validate_recovered_execution_authority(&verified, launch_authority)?;
-                let observed_exit = match execution.status {
-                    RecoveredExecutionStatus::Exited(exit_code) => exit_code,
-                    _ => unreachable!("adopted execution records an observed exit above"),
-                };
-                let terminal_matches = matches!(
-                    &verified.status,
-                    RecoveredExecutionStatus::Exited(exit_code) if *exit_code == observed_exit
-                ) || matches!(
-                    &verified.status,
-                    RecoveredExecutionStatus::Terminated if observed_exit == 143
-                );
-                if verified.identity != execution.identity
-                    || !terminal_matches
-                    || !verified.terminal_verified_dead
-                    || verified.output != execution.output
-                    || verified.committed_output_cursor != verified.output.len() as u64
-                {
-                    return Err(CodexErr::Fatal(format!(
-                        "adopted execution terminal verification is inconsistent for call {}",
-                        execution.identity.call_id
-                    )));
-                }
-                execution = verified;
             }
             RecoveredExecutionStatus::Unknown => {
                 return Err(CodexErr::Fatal(format!(
@@ -2842,6 +2936,24 @@ fn validate_recovered_execution_authority(
         )));
     }
     Ok(())
+}
+
+fn validated_adopted_running_authority<'a>(
+    execution: &RecoveredExecution,
+    authority: Option<&'a IncompleteExecution>,
+) -> CodexResult<&'a IncompleteExecution> {
+    validate_recovered_execution_authority(execution, authority).map_err(|error| {
+        CodexErr::Fatal(format!(
+            "adopted remote execution lifecycle unresolved: {error}"
+        ))
+    })?;
+    authority.ok_or_else(|| {
+        CodexErr::Fatal(format!(
+            "adopted remote execution lifecycle unresolved: \
+             adopted execution lacks local launch authority for call {}",
+            execution.identity.call_id
+        ))
+    })
 }
 
 #[derive(Debug)]
