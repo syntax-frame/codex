@@ -813,6 +813,8 @@ pub struct AgentAppTurnAdmission {
     pub agent_inbox_ticket_id: *const c_char,
     pub semantic_request_prompt: *const c_char,
     pub semantic_request_digest: *const c_char,
+    pub model_input_prompt_digest: *const c_char,
+    pub execution_request_digest: *const c_char,
     pub receipt_root_path: *const c_char,
     pub requested_generation: u32,
 }
@@ -822,10 +824,11 @@ struct ParsedAgentAppTurnAdmission {
     agent_inbox_ticket_id: String,
     semantic_request_prompt: String,
     semantic_request_digest: String,
+    model_input_prompt_digest: String,
+    execution_request_digest: String,
 }
 
-const AGENTAPP_SEMANTIC_REQUEST_VERSION: &str = "agentapp-automatic-context-recovery-v2";
-const AGENTAPP_RECOVERY_PROMPT_DELIMITER: &str = "\n\n[current user request]\n";
+const AGENTAPP_SEMANTIC_REQUEST_VERSION: &str = "agentapp-automatic-context-recovery-v3";
 
 struct AgentAppSemanticRequestEnvelope {
     provider_kind: String,
@@ -836,6 +839,7 @@ struct AgentAppSemanticRequestEnvelope {
     service_tier: String,
     history: String,
     workspace: String,
+    context_home: String,
     dynamic_tools: String,
     uploads: String,
     server_kind: String,
@@ -859,6 +863,7 @@ impl AgentAppSemanticRequestEnvelope {
         service_tier: String,
         history: String,
         workspace: String,
+        context_home: String,
         dynamic_tools: String,
         uploads: String,
     ) -> Self {
@@ -871,6 +876,7 @@ impl AgentAppSemanticRequestEnvelope {
             service_tier,
             history,
             workspace,
+            context_home,
             dynamic_tools,
             uploads,
             server_kind: "local".to_string(),
@@ -917,6 +923,25 @@ impl AgentAppSemanticRequestEnvelope {
             .join("|");
         format!("{:x}", Sha256::digest(framed.as_bytes()))
     }
+
+    fn execution_digest(
+        &self,
+        semantic_request_digest: &str,
+        model_input_prompt_digest: &str,
+    ) -> String {
+        let fields = [
+            "agentapp-automatic-context-recovery-execution-v1",
+            semantic_request_digest,
+            model_input_prompt_digest,
+            self.context_home.as_str(),
+        ];
+        let framed = fields
+            .iter()
+            .map(|field| format!("{}:{field}", field.len()))
+            .collect::<Vec<_>>()
+            .join("|");
+        format!("{:x}", Sha256::digest(framed.as_bytes()))
+    }
 }
 
 fn c_str_to_string(ptr: *const c_char, field: &str) -> Result<String, String> {
@@ -939,6 +964,59 @@ fn optional_c_str_to_string(ptr: *const c_char, field: &str) -> Result<String, S
     }
 }
 
+struct OwnedTurnInput {
+    model: String,
+    reasoning_effort: String,
+    service_tier: String,
+    prompt: String,
+    history: String,
+    context_home: String,
+    workspace: String,
+    dynamic_tools: String,
+    uploads_manifest: String,
+    uploads: Vec<ServerFileUpload>,
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn parse_owned_turn_input(
+    model: *const c_char,
+    reasoning_effort: *const c_char,
+    service_tier: *const c_char,
+    prompt: *const c_char,
+    history_json: *const c_char,
+    context_home_path: *const c_char,
+    workspace_path: *const c_char,
+    dynamic_tools_json: *const c_char,
+    uploads_json: *const c_char,
+) -> Result<OwnedTurnInput, String> {
+    let model = c_str_to_string(model, "model")?;
+    let reasoning_effort = optional_c_str_to_string(reasoning_effort, "reasoning_effort")?;
+    let service_tier = optional_c_str_to_string(service_tier, "service_tier")?;
+    let prompt = c_str_to_string(prompt, "prompt")?;
+    let history = optional_c_str_to_string(history_json, "history_json")?;
+    let context_home = c_str_to_string(context_home_path, "context_home_path")?;
+    let workspace = optional_c_str_to_string(workspace_path, "workspace_path")?;
+    let dynamic_tools = optional_c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?;
+    let uploads_manifest = optional_c_str_to_string(uploads_json, "uploads_json")?;
+    let uploads = if uploads_manifest.is_empty() {
+        Vec::new()
+    } else {
+        parse_server_file_uploads(&uploads_manifest)?
+    };
+    Ok(OwnedTurnInput {
+        model,
+        reasoning_effort,
+        service_tier,
+        prompt,
+        history,
+        context_home,
+        workspace,
+        dynamic_tools,
+        uploads_manifest,
+        uploads,
+    })
+}
+
 unsafe fn parse_agentapp_turn_admission(
     admission: *const AgentAppTurnAdmission,
 ) -> Result<ParsedAgentAppTurnAdmission, AdmissionError> {
@@ -956,26 +1034,40 @@ unsafe fn parse_agentapp_turn_admission(
     let semantic_request_digest =
         c_str_to_string(admission.semantic_request_digest, "semantic_request_digest")
             .map_err(|_| AdmissionError::InvalidRequest)?;
+    let model_input_prompt_digest = c_str_to_string(
+        admission.model_input_prompt_digest,
+        "model_input_prompt_digest",
+    )
+    .map_err(|_| AdmissionError::InvalidRequest)?;
+    let execution_request_digest = c_str_to_string(
+        admission.execution_request_digest,
+        "execution_request_digest",
+    )
+    .map_err(|_| AdmissionError::InvalidRequest)?;
     let receipt_root_path = c_str_to_string(admission.receipt_root_path, "receipt_root_path")
         .map_err(|_| AdmissionError::InvalidRequest)?;
     let request = AdmissionRequest::new(
         agent_inbox_ticket_id.clone(),
         semantic_request_digest.clone(),
+        execution_request_digest.clone(),
         receipt_root_path,
         admission.requested_generation,
-    )?;
+    )?
+    .with_semantic_request_prompt(semantic_request_prompt.clone());
     Ok(ParsedAgentAppTurnAdmission {
         request,
         agent_inbox_ticket_id,
         semantic_request_prompt,
         semantic_request_digest,
+        model_input_prompt_digest,
+        execution_request_digest,
     })
 }
 
-unsafe fn validate_agentapp_turn_admission(
+unsafe fn validate_owned_agentapp_turn_admission(
     admission: Option<*const AgentAppTurnAdmission>,
-    actual_prompt: *const c_char,
-    envelope: AgentAppSemanticRequestEnvelope,
+    actual_prompt: &str,
+    envelope: &AgentAppSemanticRequestEnvelope,
 ) -> Result<Option<AdmissionRequest>, String> {
     let Some(admission) = admission else {
         return Ok(None);
@@ -984,22 +1076,10 @@ unsafe fn validate_agentapp_turn_admission(
     // the synchronous call. All values are copied before a worker is spawned.
     let parsed =
         unsafe { parse_agentapp_turn_admission(admission) }.map_err(|error| error.to_string())?;
-    let actual_prompt = c_str_to_string(actual_prompt, "prompt")?;
-    let prompt_matches = if actual_prompt == parsed.semantic_request_prompt {
-        true
-    } else {
-        let suffix =
-            AGENTAPP_RECOVERY_PROMPT_DELIMITER.to_string() + &parsed.semantic_request_prompt;
-        actual_prompt
-            .strip_suffix(&suffix)
-            .is_some_and(|bootstrap| {
-                bootstrap.starts_with("[recovered model context]")
-                    || bootstrap.starts_with("[forked model context]")
-            })
-    };
-    if !prompt_matches {
+    let actual_prompt_digest = format!("{:x}", Sha256::digest(actual_prompt.as_bytes()));
+    if actual_prompt_digest != parsed.model_input_prompt_digest {
         return Err(
-            "AgentApp turn admission prompt does not match the guarded request.".to_string(),
+            "AgentApp turn admission model input does not match the guarded request.".to_string(),
         );
     }
     let derived = envelope.digest(
@@ -1011,232 +1091,140 @@ unsafe fn validate_agentapp_turn_admission(
             "AgentApp turn admission digest does not match the guarded request.".to_string(),
         );
     }
+    let execution_digest =
+        envelope.execution_digest(&parsed.semantic_request_digest, &actual_prompt_digest);
+    if execution_digest != parsed.execution_request_digest {
+        return Err(
+            "AgentApp turn execution digest does not match the guarded request.".to_string(),
+        );
+    }
     Ok(Some(parsed.request))
 }
 
-#[allow(clippy::too_many_arguments)]
-unsafe fn validate_agentapp_local_oauth_admission(
+#[cfg(test)]
+unsafe fn validate_agentapp_turn_admission(
     admission: Option<*const AgentAppTurnAdmission>,
-    account_id: *const c_char,
-    model: *const c_char,
-    reasoning_effort: *const c_char,
-    service_tier: *const c_char,
-    prompt: *const c_char,
-    history_json: *const c_char,
-    workspace_path: *const c_char,
-    dynamic_tools_json: *const c_char,
-    uploads_json: *const c_char,
+    actual_prompt: *const c_char,
+    envelope: AgentAppSemanticRequestEnvelope,
 ) -> Result<Option<AdmissionRequest>, String> {
-    if admission.is_none() {
-        return Ok(None);
-    }
-    let envelope = AgentAppSemanticRequestEnvelope::local(
-        "oauth",
-        c_str_to_string(account_id, "account_id")?,
-        String::new(),
-        c_str_to_string(model, "model")?,
-        optional_c_str_to_string(reasoning_effort, "reasoning_effort")?,
-        optional_c_str_to_string(service_tier, "service_tier")?,
-        optional_c_str_to_string(history_json, "history_json")?,
-        optional_c_str_to_string(workspace_path, "workspace_path")?,
-        optional_c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?,
-        optional_c_str_to_string(uploads_json, "uploads_json")?,
-    );
+    let actual_prompt = c_str_to_string(actual_prompt, "prompt")?;
     // SAFETY: forwarded from the guarded FFI entrypoint.
-    unsafe { validate_agentapp_turn_admission(admission, prompt, envelope) }
+    unsafe { validate_owned_agentapp_turn_admission(admission, &actual_prompt, &envelope) }
 }
 
-#[allow(clippy::too_many_arguments)]
-unsafe fn validate_agentapp_local_apikey_admission(
-    admission: Option<*const AgentAppTurnAdmission>,
-    base_url: *const c_char,
-    wire_api: *const c_char,
-    model: *const c_char,
-    reasoning_effort: *const c_char,
-    service_tier: *const c_char,
-    prompt: *const c_char,
-    history_json: *const c_char,
-    workspace_path: *const c_char,
-    dynamic_tools_json: *const c_char,
-    uploads_json: *const c_char,
-) -> Result<Option<AdmissionRequest>, String> {
-    if admission.is_none() {
-        return Ok(None);
-    }
-    let wire_api = if wire_api.is_null() {
-        "responses".to_string()
-    } else {
-        c_str_to_string(wire_api, "wire_api")?
+fn revalidate_owned_agentapp_turn_admission(
+    admission: &Option<TurnAdmission>,
+    actual_prompt: &str,
+    envelope: &AgentAppSemanticRequestEnvelope,
+) -> Result<(), String> {
+    let Some(admission) = admission else {
+        return Ok(());
     };
-    let envelope = AgentAppSemanticRequestEnvelope::local(
-        "api_key",
-        c_str_to_string(base_url, "base_url")?,
-        wire_api,
-        c_str_to_string(model, "model")?,
-        optional_c_str_to_string(reasoning_effort, "reasoning_effort")?,
-        optional_c_str_to_string(service_tier, "service_tier")?,
-        optional_c_str_to_string(history_json, "history_json")?,
-        optional_c_str_to_string(workspace_path, "workspace_path")?,
-        optional_c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?,
-        optional_c_str_to_string(uploads_json, "uploads_json")?,
+    let actual_prompt_digest = format!("{:x}", Sha256::digest(actual_prompt.as_bytes()));
+    let semantic_digest = envelope.digest(
+        admission.agent_inbox_ticket_id(),
+        admission.semantic_request_prompt(),
     );
-    // SAFETY: forwarded from the guarded FFI entrypoint.
-    unsafe { validate_agentapp_turn_admission(admission, prompt, envelope) }
+    if semantic_digest != admission.semantic_request_digest() {
+        return Err(
+            "AgentApp owned semantic inputs changed after admission validation.".to_string(),
+        );
+    }
+    let execution_digest =
+        envelope.execution_digest(admission.semantic_request_digest(), &actual_prompt_digest);
+    if execution_digest != admission.execution_request_digest() {
+        return Err("AgentApp owned turn inputs changed after admission validation.".to_string());
+    }
+    Ok(())
+}
+
+fn add_agentapp_server_envelope_owned(
+    mut envelope: AgentAppSemanticRequestEnvelope,
+    server_mode: &ServerMode,
+    auth_method: String,
+    fingerprint: String,
+    tmux_mode: String,
+) -> AgentAppSemanticRequestEnvelope {
+    envelope.server_kind = "ssh".to_string();
+    envelope.server_connection_key = server_mode.connection_key.clone();
+    envelope.server_session_key = server_mode.session_key.clone();
+    envelope.server_host = server_mode.host.clone();
+    envelope.server_port = server_mode.port.to_string();
+    envelope.server_user = server_mode.user.clone();
+    envelope.server_auth_method = auth_method;
+    envelope.server_fingerprint = fingerprint;
+    envelope.server_tmux_mode = tmux_mode;
+    envelope
+}
+
+struct OwnedServerInput {
+    server_mode: ServerMode,
+    auth_method_name: String,
+    fingerprint_name: String,
+    tmux_mode_name: String,
+    credential_guard: Option<Arc<tempfile::TempDir>>,
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn add_agentapp_server_envelope(
-    mut envelope: AgentAppSemanticRequestEnvelope,
+unsafe fn parse_owned_server_input(
     ssh_connection_key: *const c_char,
     ssh_session_key: *const c_char,
     ssh_host: *const c_char,
     ssh_port: u16,
     ssh_user: *const c_char,
     ssh_auth_method: *const c_char,
+    ssh_secret: *const c_char,
     ssh_fingerprint: *const c_char,
     ssh_tmux_mode: *const c_char,
-) -> Result<AgentAppSemanticRequestEnvelope, String> {
+    workspace: &str,
+) -> Result<OwnedServerInput, String> {
     let host = c_str_to_string(ssh_host, "ssh_host")?;
     let user = c_str_to_string(ssh_user, "ssh_user")?;
-    let workspace = envelope.workspace.clone();
+    let auth_method_name = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
+    let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
     let connection_key = optional_c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
-    let session_key = optional_c_str_to_string(ssh_session_key, "ssh_session_key")?;
-    envelope.server_kind = "ssh".to_string();
-    envelope.server_connection_key = if connection_key.trim().is_empty() {
+    let connection_key = if connection_key.trim().is_empty() {
         format!("{user}@{host}:{ssh_port}")
     } else {
         connection_key
     };
-    envelope.server_session_key = if session_key.trim().is_empty() {
+    let session_key = optional_c_str_to_string(ssh_session_key, "ssh_session_key")?;
+    let session_key = if session_key.trim().is_empty() {
         format!("{user}@{host}:{ssh_port}:{workspace}")
     } else {
         session_key
     };
-    envelope.server_host = host;
-    envelope.server_port = ssh_port.to_string();
-    envelope.server_user = user;
-    envelope.server_auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
-    envelope.server_fingerprint = optional_c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
-    envelope.server_tmux_mode = if ssh_tmux_mode.is_null() {
+    let fingerprint_name = optional_c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
+    let fingerprint = if fingerprint_name.trim().is_empty() {
+        None
+    } else {
+        Some(fingerprint_name.clone())
+    };
+    let tmux_mode_name = if ssh_tmux_mode.is_null() {
         "required".to_string()
     } else {
         c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?
     };
-    Ok(envelope)
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn validate_agentapp_server_oauth_admission(
-    admission: Option<*const AgentAppTurnAdmission>,
-    account_id: *const c_char,
-    model: *const c_char,
-    reasoning_effort: *const c_char,
-    service_tier: *const c_char,
-    prompt: *const c_char,
-    history_json: *const c_char,
-    workspace_path: *const c_char,
-    dynamic_tools_json: *const c_char,
-    uploads_json: *const c_char,
-    ssh_connection_key: *const c_char,
-    ssh_session_key: *const c_char,
-    ssh_host: *const c_char,
-    ssh_port: u16,
-    ssh_user: *const c_char,
-    ssh_auth_method: *const c_char,
-    ssh_fingerprint: *const c_char,
-    ssh_tmux_mode: *const c_char,
-) -> Result<Option<AdmissionRequest>, String> {
-    if admission.is_none() {
-        return Ok(None);
-    }
-    let local = AgentAppSemanticRequestEnvelope::local(
-        "oauth",
-        c_str_to_string(account_id, "account_id")?,
-        String::new(),
-        c_str_to_string(model, "model")?,
-        optional_c_str_to_string(reasoning_effort, "reasoning_effort")?,
-        optional_c_str_to_string(service_tier, "service_tier")?,
-        optional_c_str_to_string(history_json, "history_json")?,
-        optional_c_str_to_string(workspace_path, "workspace_path")?,
-        optional_c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?,
-        optional_c_str_to_string(uploads_json, "uploads_json")?,
-    );
-    // SAFETY: forwarded from the guarded FFI entrypoint.
-    let envelope = unsafe {
-        add_agentapp_server_envelope(
-            local,
-            ssh_connection_key,
-            ssh_session_key,
-            ssh_host,
-            ssh_port,
-            ssh_user,
-            ssh_auth_method,
-            ssh_fingerprint,
-            ssh_tmux_mode,
-        )
-    }?;
-    // SAFETY: forwarded from the guarded FFI entrypoint.
-    unsafe { validate_agentapp_turn_admission(admission, prompt, envelope) }
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn validate_agentapp_server_apikey_admission(
-    admission: Option<*const AgentAppTurnAdmission>,
-    base_url: *const c_char,
-    wire_api: *const c_char,
-    model: *const c_char,
-    reasoning_effort: *const c_char,
-    service_tier: *const c_char,
-    prompt: *const c_char,
-    history_json: *const c_char,
-    workspace_path: *const c_char,
-    dynamic_tools_json: *const c_char,
-    uploads_json: *const c_char,
-    ssh_connection_key: *const c_char,
-    ssh_session_key: *const c_char,
-    ssh_host: *const c_char,
-    ssh_port: u16,
-    ssh_user: *const c_char,
-    ssh_auth_method: *const c_char,
-    ssh_fingerprint: *const c_char,
-    ssh_tmux_mode: *const c_char,
-) -> Result<Option<AdmissionRequest>, String> {
-    if admission.is_none() {
-        return Ok(None);
-    }
-    let wire_api = if wire_api.is_null() {
-        "responses".to_string()
-    } else {
-        c_str_to_string(wire_api, "wire_api")?
+    let tmux_mode = parse_tmux_mode(&tmux_mode_name)?;
+    let (authentication, secret_guard) = parse_ssh_authentication(&auth_method_name, secret)?;
+    let credential_guard = secret_guard.map(Arc::new);
+    let server_mode = ServerMode {
+        connection_key,
+        session_key,
+        host,
+        port: ssh_port,
+        user,
+        authentication,
+        host_fingerprint: fingerprint,
+        tmux_mode,
     };
-    let local = AgentAppSemanticRequestEnvelope::local(
-        "api_key",
-        c_str_to_string(base_url, "base_url")?,
-        wire_api,
-        c_str_to_string(model, "model")?,
-        optional_c_str_to_string(reasoning_effort, "reasoning_effort")?,
-        optional_c_str_to_string(service_tier, "service_tier")?,
-        optional_c_str_to_string(history_json, "history_json")?,
-        optional_c_str_to_string(workspace_path, "workspace_path")?,
-        optional_c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?,
-        optional_c_str_to_string(uploads_json, "uploads_json")?,
-    );
-    // SAFETY: forwarded from the guarded FFI entrypoint.
-    let envelope = unsafe {
-        add_agentapp_server_envelope(
-            local,
-            ssh_connection_key,
-            ssh_session_key,
-            ssh_host,
-            ssh_port,
-            ssh_user,
-            ssh_auth_method,
-            ssh_fingerprint,
-            ssh_tmux_mode,
-        )
-    }?;
-    // SAFETY: forwarded from the guarded FFI entrypoint.
-    unsafe { validate_agentapp_turn_admission(admission, prompt, envelope) }
+    Ok(OwnedServerInput {
+        server_mode,
+        auth_method_name,
+        fingerprint_name,
+        tmux_mode_name,
+        credential_guard,
+    })
 }
 
 fn begin_agentapp_turn_admission(
@@ -1311,7 +1299,8 @@ pub extern "C" fn codex_query_agentapp_turn_admission_receipt(
             .unwrap_or_else(|_| AdmissionReceiptQuery::unavailable("unavailable"));
         serde_json::to_string(&query).unwrap_or_else(|_| {
             "{\"contract_version\":1,\"receipt_version\":0,\"state\":\"unavailable\",\
-             \"generation\":0,\"digest_match\":false}"
+             \"generation\":0,\"digest_match\":false,\
+             \"authorizes_generation_one_start\":false}"
                 .to_string()
         })
     });
@@ -1319,7 +1308,8 @@ pub extern "C" fn codex_query_agentapp_turn_admission_receipt(
         Ok(json) => crate::into_c_string(json),
         Err(_) => crate::into_c_string(
             "{\"contract_version\":1,\"receipt_version\":0,\"state\":\"unavailable\",\
-             \"generation\":0,\"digest_match\":false}"
+             \"generation\":0,\"digest_match\":false,\
+             \"authorizes_generation_one_start\":false}"
                 .to_string(),
         ),
     }
@@ -3538,22 +3528,50 @@ unsafe fn codex_run_turn_streaming_inner(
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
-    // SAFETY: all pointers are owned by the synchronous FFI caller. The
-    // validator copies the guarded semantic envelope before any receipt or
-    // native turn is created.
+    // Copy and validate every caller-owned input before creating a durable
+    // receipt. No raw FFI pointer is read after this point.
+    let parsed = match (|| {
+        Ok::<_, String>((
+            c_str_to_string(access_token, "access_token")?,
+            c_str_to_string(id_token, "id_token")?,
+            c_str_to_string(account_id, "account_id")?,
+            unsafe {
+                parse_owned_turn_input(
+                    model,
+                    reasoning_effort,
+                    service_tier,
+                    prompt,
+                    history_json,
+                    context_home_path,
+                    workspace_path,
+                    dynamic_tools_json,
+                    uploads_json,
+                )
+            }?,
+        ))
+    })() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            emit(callback, ctx, KIND_ERROR, &error);
+            return;
+        }
+    };
+    let (token, id_tok, account, input) = parsed;
+    let owned_envelope = AgentAppSemanticRequestEnvelope::local(
+        "oauth",
+        account.clone(),
+        String::new(),
+        input.model.clone(),
+        input.reasoning_effort.clone(),
+        input.service_tier.clone(),
+        input.history.clone(),
+        input.workspace.clone(),
+        input.context_home.clone(),
+        input.dynamic_tools.clone(),
+        input.uploads_manifest.clone(),
+    );
     let admission_request = match unsafe {
-        validate_agentapp_local_oauth_admission(
-            agentapp_admission,
-            account_id,
-            model,
-            reasoning_effort,
-            service_tier,
-            prompt,
-            history_json,
-            workspace_path,
-            dynamic_tools_json,
-            uploads_json,
-        )
+        validate_owned_agentapp_turn_admission(agentapp_admission, &input.prompt, &owned_envelope)
     } {
         Ok(request) => request,
         Err(error) => {
@@ -3568,12 +3586,11 @@ unsafe fn codex_run_turn_streaming_inner(
     };
     let result = std::panic::catch_unwind(move || {
         let mut admission = admission;
-        // Parse the C strings on the calling thread (the pointers are only valid
-        // for the duration of this call), then move the owned data into a worker.
-        let (
-            token,
-            id_tok,
-            account,
+        pre_admission_try!(
+            admission,
+            revalidate_owned_agentapp_turn_admission(&admission, &input.prompt, &owned_envelope,)
+        );
+        let OwnedTurnInput {
             model,
             reasoning_effort,
             service_tier,
@@ -3583,64 +3600,8 @@ unsafe fn codex_run_turn_streaming_inner(
             workspace,
             dynamic_tools,
             uploads,
-        ) = pre_admission_try!(
-            admission,
-            (|| {
-                let token = c_str_to_string(access_token, "access_token")?;
-                let id_tok = c_str_to_string(id_token, "id_token")?;
-                let account = c_str_to_string(account_id, "account_id")?;
-                let model = c_str_to_string(model, "model")?;
-                let reasoning_effort = if reasoning_effort.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(reasoning_effort, "reasoning_effort")?
-                };
-                let service_tier = if service_tier.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(service_tier, "service_tier")?
-                };
-                let prompt = c_str_to_string(prompt, "prompt")?;
-                // History is optional: NULL or empty means a fresh conversation.
-                let history = if history_json.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(history_json, "history_json")?
-                };
-                let context_home = c_str_to_string(context_home_path, "context_home_path")?;
-                // Workspace dir to root the turn at (where file tools operate). Optional.
-                let workspace = if workspace_path.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(workspace_path, "workspace_path")?
-                };
-                // Client-supplied dynamic tool specs (JSON array). Optional.
-                let dynamic_tools = if dynamic_tools_json.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
-                };
-                let uploads = if uploads_json.is_null() {
-                    Vec::new()
-                } else {
-                    parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
-                };
-                Ok((
-                    token,
-                    id_tok,
-                    account,
-                    model,
-                    reasoning_effort,
-                    service_tier,
-                    prompt,
-                    history,
-                    context_home,
-                    workspace,
-                    dynamic_tools,
-                    uploads,
-                ))
-            })()
-        );
+            uploads_manifest: _,
+        } = input;
 
         // `block_on` drives the main future on the CALLING thread. On iOS the
         // caller is a GCD worker (~512 KiB stack), which Codex's deep async
@@ -3733,21 +3694,56 @@ unsafe fn codex_run_turn_streaming_apikey_inner(
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
-    // SAFETY: all pointers are owned by the synchronous FFI caller.
+    // Copy and validate every caller-owned input before creating a durable
+    // receipt. No raw FFI pointer is read after this point.
+    let parsed = match (|| {
+        let wire_api_name = if wire_api.is_null() {
+            "responses".to_string()
+        } else {
+            c_str_to_string(wire_api, "wire_api")?
+        };
+        Ok::<_, String>((
+            c_str_to_string(base_url, "base_url")?,
+            c_str_to_string(api_key, "api_key")?,
+            parse_wire_api(&wire_api_name)?,
+            wire_api_name,
+            unsafe {
+                parse_owned_turn_input(
+                    model,
+                    reasoning_effort,
+                    service_tier,
+                    prompt,
+                    history_json,
+                    context_home_path,
+                    workspace_path,
+                    dynamic_tools_json,
+                    uploads_json,
+                )
+            }?,
+        ))
+    })() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            emit(callback, ctx, KIND_ERROR, &error);
+            return;
+        }
+    };
+    let (base_url, api_key, wire_api, wire_api_name, input) = parsed;
+    let owned_envelope = AgentAppSemanticRequestEnvelope::local(
+        "api_key",
+        base_url.clone(),
+        wire_api_name,
+        input.model.clone(),
+        input.reasoning_effort.clone(),
+        input.service_tier.clone(),
+        input.history.clone(),
+        input.workspace.clone(),
+        input.context_home.clone(),
+        input.dynamic_tools.clone(),
+        input.uploads_manifest.clone(),
+    );
     let admission_request = match unsafe {
-        validate_agentapp_local_apikey_admission(
-            agentapp_admission,
-            base_url,
-            wire_api,
-            model,
-            reasoning_effort,
-            service_tier,
-            prompt,
-            history_json,
-            workspace_path,
-            dynamic_tools_json,
-            uploads_json,
-        )
+        validate_owned_agentapp_turn_admission(agentapp_admission, &input.prompt, &owned_envelope)
     } {
         Ok(request) => request,
         Err(error) => {
@@ -3762,12 +3758,11 @@ unsafe fn codex_run_turn_streaming_apikey_inner(
     };
     let result = std::panic::catch_unwind(move || {
         let mut admission = admission;
-        // Parse the C strings on the calling thread (the pointers are only valid
-        // for the duration of this call), then move the owned data into a worker.
-        let (
-            base_url,
-            api_key,
-            wire_api,
+        pre_admission_try!(
+            admission,
+            revalidate_owned_agentapp_turn_admission(&admission, &input.prompt, &owned_envelope,)
+        );
+        let OwnedTurnInput {
             model,
             reasoning_effort,
             service_tier,
@@ -3777,68 +3772,8 @@ unsafe fn codex_run_turn_streaming_apikey_inner(
             workspace,
             dynamic_tools,
             uploads,
-        ) = pre_admission_try!(
-            admission,
-            (|| {
-                let base_url = c_str_to_string(base_url, "base_url")?;
-                let api_key = c_str_to_string(api_key, "api_key")?;
-                let wire_api = if wire_api.is_null() {
-                    WireApi::Responses
-                } else {
-                    parse_wire_api(&c_str_to_string(wire_api, "wire_api")?)?
-                };
-                let model = c_str_to_string(model, "model")?;
-                let reasoning_effort = if reasoning_effort.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(reasoning_effort, "reasoning_effort")?
-                };
-                let service_tier = if service_tier.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(service_tier, "service_tier")?
-                };
-                let prompt = c_str_to_string(prompt, "prompt")?;
-                // History is optional: NULL or empty means a fresh conversation.
-                let history = if history_json.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(history_json, "history_json")?
-                };
-                let context_home = c_str_to_string(context_home_path, "context_home_path")?;
-                // Workspace dir to root the turn at (where file tools operate). Optional.
-                let workspace = if workspace_path.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(workspace_path, "workspace_path")?
-                };
-                // Client-supplied dynamic tool specs (JSON array). Optional.
-                let dynamic_tools = if dynamic_tools_json.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
-                };
-                let uploads = if uploads_json.is_null() {
-                    Vec::new()
-                } else {
-                    parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
-                };
-                Ok((
-                    base_url,
-                    api_key,
-                    wire_api,
-                    model,
-                    reasoning_effort,
-                    service_tier,
-                    prompt,
-                    history,
-                    context_home,
-                    workspace,
-                    dynamic_tools,
-                    uploads,
-                ))
-            })()
-        );
+            uploads_manifest: _,
+        } = input;
 
         // Same big-stack worker + multi-thread runtime dance as the OAuth FFI.
         let worker_admission = admission.clone();
@@ -3943,29 +3878,79 @@ unsafe fn codex_run_turn_streaming_apikey_server_inner(
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
-    // SAFETY: all pointers are owned by the synchronous FFI caller.
+    // Copy and validate every caller-owned input before creating a durable
+    // receipt. No raw FFI pointer is read after this point.
+    let parsed = match (|| {
+        let wire_api_name = if wire_api.is_null() {
+            "responses".to_string()
+        } else {
+            c_str_to_string(wire_api, "wire_api")?
+        };
+        let input = unsafe {
+            parse_owned_turn_input(
+                model,
+                reasoning_effort,
+                service_tier,
+                prompt,
+                history_json,
+                context_home_path,
+                workspace_path,
+                dynamic_tools_json,
+                uploads_json,
+            )
+        }?;
+        let server = unsafe {
+            parse_owned_server_input(
+                ssh_connection_key,
+                ssh_session_key,
+                ssh_host,
+                ssh_port,
+                ssh_user,
+                ssh_auth_method,
+                ssh_secret,
+                ssh_fingerprint,
+                ssh_tmux_mode,
+                &input.workspace,
+            )
+        }?;
+        Ok::<_, String>((
+            c_str_to_string(base_url, "base_url")?,
+            c_str_to_string(api_key, "api_key")?,
+            parse_wire_api(&wire_api_name)?,
+            wire_api_name,
+            input,
+            server,
+        ))
+    })() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            emit(callback, ctx, KIND_ERROR, &error);
+            return;
+        }
+    };
+    let (base_url, api_key, wire_api, wire_api_name, input, server) = parsed;
+    let owned_local_envelope = AgentAppSemanticRequestEnvelope::local(
+        "api_key",
+        base_url.clone(),
+        wire_api_name,
+        input.model.clone(),
+        input.reasoning_effort.clone(),
+        input.service_tier.clone(),
+        input.history.clone(),
+        input.workspace.clone(),
+        input.context_home.clone(),
+        input.dynamic_tools.clone(),
+        input.uploads_manifest.clone(),
+    );
+    let owned_envelope = add_agentapp_server_envelope_owned(
+        owned_local_envelope,
+        &server.server_mode,
+        server.auth_method_name.clone(),
+        server.fingerprint_name.clone(),
+        server.tmux_mode_name.clone(),
+    );
     let admission_request = match unsafe {
-        validate_agentapp_server_apikey_admission(
-            agentapp_admission,
-            base_url,
-            wire_api,
-            model,
-            reasoning_effort,
-            service_tier,
-            prompt,
-            history_json,
-            workspace_path,
-            dynamic_tools_json,
-            uploads_json,
-            ssh_connection_key,
-            ssh_session_key,
-            ssh_host,
-            ssh_port,
-            ssh_user,
-            ssh_auth_method,
-            ssh_fingerprint,
-            ssh_tmux_mode,
-        )
+        validate_owned_agentapp_turn_admission(agentapp_admission, &input.prompt, &owned_envelope)
     } {
         Ok(request) => request,
         Err(error) => {
@@ -3980,10 +3965,11 @@ unsafe fn codex_run_turn_streaming_apikey_server_inner(
     };
     let result = std::panic::catch_unwind(move || {
         let mut admission = admission;
-        let (
-            base_url,
-            api_key,
-            wire_api,
+        pre_admission_try!(
+            admission,
+            revalidate_owned_agentapp_turn_admission(&admission, &input.prompt, &owned_envelope,)
+        );
+        let OwnedTurnInput {
             model,
             reasoning_effort,
             service_tier,
@@ -3993,122 +3979,15 @@ unsafe fn codex_run_turn_streaming_apikey_server_inner(
             workspace,
             dynamic_tools,
             uploads,
+            uploads_manifest: _,
+        } = input;
+        let OwnedServerInput {
             server_mode,
             credential_guard,
-        ) = pre_admission_try!(
-            admission,
-            (|| {
-                let base_url = c_str_to_string(base_url, "base_url")?;
-                let api_key = c_str_to_string(api_key, "api_key")?;
-                let wire_api = if wire_api.is_null() {
-                    WireApi::Responses
-                } else {
-                    parse_wire_api(&c_str_to_string(wire_api, "wire_api")?)?
-                };
-                let model = c_str_to_string(model, "model")?;
-                let reasoning_effort = if reasoning_effort.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(reasoning_effort, "reasoning_effort")?
-                };
-                let service_tier = if service_tier.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(service_tier, "service_tier")?
-                };
-                let prompt = c_str_to_string(prompt, "prompt")?;
-                let history = if history_json.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(history_json, "history_json")?
-                };
-                let context_home = c_str_to_string(context_home_path, "context_home_path")?;
-                let workspace = if workspace_path.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(workspace_path, "workspace_path")?
-                };
-                let dynamic_tools = if dynamic_tools_json.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
-                };
-                let uploads = if uploads_json.is_null() {
-                    Vec::new()
-                } else {
-                    parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
-                };
-
-                let host = c_str_to_string(ssh_host, "ssh_host")?;
-                let user = c_str_to_string(ssh_user, "ssh_user")?;
-                let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
-                let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
-                let connection_key = if ssh_connection_key.is_null() {
-                    format!("{user}@{host}:{ssh_port}")
-                } else {
-                    let value = c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
-                    if value.trim().is_empty() {
-                        format!("{user}@{host}:{ssh_port}")
-                    } else {
-                        value
-                    }
-                };
-                let session_key = if ssh_session_key.is_null() {
-                    format!("{user}@{host}:{ssh_port}:{workspace}")
-                } else {
-                    let session_key = c_str_to_string(ssh_session_key, "ssh_session_key")?;
-                    if session_key.trim().is_empty() {
-                        format!("{user}@{host}:{ssh_port}:{workspace}")
-                    } else {
-                        session_key
-                    }
-                };
-                let fingerprint = if ssh_fingerprint.is_null() {
-                    None
-                } else {
-                    let fingerprint = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
-                    if fingerprint.trim().is_empty() {
-                        None
-                    } else {
-                        Some(fingerprint)
-                    }
-                };
-                let tmux_mode = if ssh_tmux_mode.is_null() {
-                    SshTmuxMode::Required
-                } else {
-                    parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
-                };
-                let (authentication, secret_guard) =
-                    parse_ssh_authentication(&auth_method, secret)?;
-                let credential_guard = secret_guard.map(Arc::new);
-                let server_mode = ServerMode {
-                    connection_key,
-                    session_key,
-                    host,
-                    port: ssh_port,
-                    user,
-                    authentication,
-                    host_fingerprint: fingerprint,
-                    tmux_mode,
-                };
-                Ok((
-                    base_url,
-                    api_key,
-                    wire_api,
-                    model,
-                    reasoning_effort,
-                    service_tier,
-                    prompt,
-                    history,
-                    context_home,
-                    workspace,
-                    dynamic_tools,
-                    uploads,
-                    server_mode,
-                    credential_guard,
-                ))
-            })()
-        );
+            auth_method_name: _,
+            fingerprint_name: _,
+            tmux_mode_name: _,
+        } = server;
 
         let worker_admission = admission.clone();
         let worker = match std::thread::Builder::new()
@@ -4225,28 +4104,73 @@ unsafe fn codex_run_turn_streaming_server_inner(
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
-    // SAFETY: all pointers are owned by the synchronous FFI caller.
+    // Copy and validate every caller-owned input before creating a durable
+    // receipt. No raw FFI pointer is read after this point.
+    let parsed = match (|| {
+        let input = unsafe {
+            parse_owned_turn_input(
+                model,
+                reasoning_effort,
+                service_tier,
+                prompt,
+                history_json,
+                context_home_path,
+                workspace_path,
+                dynamic_tools_json,
+                uploads_json,
+            )
+        }?;
+        let server = unsafe {
+            parse_owned_server_input(
+                ssh_connection_key,
+                ssh_session_key,
+                ssh_host,
+                ssh_port,
+                ssh_user,
+                ssh_auth_method,
+                ssh_secret,
+                ssh_fingerprint,
+                ssh_tmux_mode,
+                &input.workspace,
+            )
+        }?;
+        Ok::<_, String>((
+            c_str_to_string(access_token, "access_token")?,
+            c_str_to_string(id_token, "id_token")?,
+            c_str_to_string(account_id, "account_id")?,
+            input,
+            server,
+        ))
+    })() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            emit(callback, ctx, KIND_ERROR, &error);
+            return;
+        }
+    };
+    let (token, id_tok, account, input, server) = parsed;
+    let owned_local_envelope = AgentAppSemanticRequestEnvelope::local(
+        "oauth",
+        account.clone(),
+        String::new(),
+        input.model.clone(),
+        input.reasoning_effort.clone(),
+        input.service_tier.clone(),
+        input.history.clone(),
+        input.workspace.clone(),
+        input.context_home.clone(),
+        input.dynamic_tools.clone(),
+        input.uploads_manifest.clone(),
+    );
+    let owned_envelope = add_agentapp_server_envelope_owned(
+        owned_local_envelope,
+        &server.server_mode,
+        server.auth_method_name.clone(),
+        server.fingerprint_name.clone(),
+        server.tmux_mode_name.clone(),
+    );
     let admission_request = match unsafe {
-        validate_agentapp_server_oauth_admission(
-            agentapp_admission,
-            account_id,
-            model,
-            reasoning_effort,
-            service_tier,
-            prompt,
-            history_json,
-            workspace_path,
-            dynamic_tools_json,
-            uploads_json,
-            ssh_connection_key,
-            ssh_session_key,
-            ssh_host,
-            ssh_port,
-            ssh_user,
-            ssh_auth_method,
-            ssh_fingerprint,
-            ssh_tmux_mode,
-        )
+        validate_owned_agentapp_turn_admission(agentapp_admission, &input.prompt, &owned_envelope)
     } {
         Ok(request) => request,
         Err(error) => {
@@ -4261,12 +4185,11 @@ unsafe fn codex_run_turn_streaming_server_inner(
     };
     let result = std::panic::catch_unwind(move || {
         let mut admission = admission;
-        // Parse the C strings on the calling thread (the pointers are only valid
-        // for the duration of this call), then move the owned data into a worker.
-        let (
-            token,
-            id_tok,
-            account,
+        pre_admission_try!(
+            admission,
+            revalidate_owned_agentapp_turn_admission(&admission, &input.prompt, &owned_envelope,)
+        );
+        let OwnedTurnInput {
             model,
             reasoning_effort,
             service_tier,
@@ -4276,123 +4199,15 @@ unsafe fn codex_run_turn_streaming_server_inner(
             workspace,
             dynamic_tools,
             uploads,
+            uploads_manifest: _,
+        } = input;
+        let OwnedServerInput {
             server_mode,
             credential_guard,
-        ) = pre_admission_try!(
-            admission,
-            (|| {
-                let token = c_str_to_string(access_token, "access_token")?;
-                let id_tok = c_str_to_string(id_token, "id_token")?;
-                let account = c_str_to_string(account_id, "account_id")?;
-                let model = c_str_to_string(model, "model")?;
-                let reasoning_effort = if reasoning_effort.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(reasoning_effort, "reasoning_effort")?
-                };
-                let service_tier = if service_tier.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(service_tier, "service_tier")?
-                };
-                let prompt = c_str_to_string(prompt, "prompt")?;
-                // History is optional: NULL or empty means a fresh conversation.
-                let history = if history_json.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(history_json, "history_json")?
-                };
-                let context_home = c_str_to_string(context_home_path, "context_home_path")?;
-                // Workspace dir to root the turn at (on the SERVER). Optional.
-                let workspace = if workspace_path.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(workspace_path, "workspace_path")?
-                };
-                // Client-supplied dynamic tool specs (JSON array). Optional.
-                let dynamic_tools = if dynamic_tools_json.is_null() {
-                    String::new()
-                } else {
-                    c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
-                };
-                let uploads = if uploads_json.is_null() {
-                    Vec::new()
-                } else {
-                    parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
-                };
-
-                // SSH connection settings.
-                let host = c_str_to_string(ssh_host, "ssh_host")?;
-                let user = c_str_to_string(ssh_user, "ssh_user")?;
-                let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
-                let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
-                let connection_key = if ssh_connection_key.is_null() {
-                    format!("{user}@{host}:{ssh_port}")
-                } else {
-                    let value = c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
-                    if value.trim().is_empty() {
-                        format!("{user}@{host}:{ssh_port}")
-                    } else {
-                        value
-                    }
-                };
-                let session_key = if ssh_session_key.is_null() {
-                    format!("{user}@{host}:{ssh_port}:{workspace}")
-                } else {
-                    let session_key = c_str_to_string(ssh_session_key, "ssh_session_key")?;
-                    if session_key.trim().is_empty() {
-                        format!("{user}@{host}:{ssh_port}:{workspace}")
-                    } else {
-                        session_key
-                    }
-                };
-                // Fingerprint is optional: null/empty => no host-key pinning.
-                let fingerprint = if ssh_fingerprint.is_null() {
-                    None
-                } else {
-                    let fingerprint = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
-                    if fingerprint.trim().is_empty() {
-                        None
-                    } else {
-                        Some(fingerprint)
-                    }
-                };
-                let tmux_mode = if ssh_tmux_mode.is_null() {
-                    SshTmuxMode::Required
-                } else {
-                    parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
-                };
-                let (authentication, secret_guard) =
-                    parse_ssh_authentication(&auth_method, secret)?;
-                let credential_guard = secret_guard.map(Arc::new);
-                let server_mode = ServerMode {
-                    connection_key,
-                    session_key,
-                    host,
-                    port: ssh_port,
-                    user,
-                    authentication,
-                    host_fingerprint: fingerprint,
-                    tmux_mode,
-                };
-                Ok((
-                    token,
-                    id_tok,
-                    account,
-                    model,
-                    reasoning_effort,
-                    service_tier,
-                    prompt,
-                    history,
-                    context_home,
-                    workspace,
-                    dynamic_tools,
-                    uploads,
-                    server_mode,
-                    credential_guard,
-                ))
-            })()
-        );
+            auth_method_name: _,
+            fingerprint_name: _,
+            tmux_mode_name: _,
+        } = server;
 
         // Same big-stack worker + multi-thread runtime dance as the local FFI.
         let worker_admission = admission.clone();

@@ -126,11 +126,17 @@ typedef void (*codex_event_callback)(void *ctx, int event_kind, const char *text
 
 /*
  * Content-free admission input for the AgentApp-only turn entrypoints.
- * `semantic_request_prompt` is the immutable work prompt before an optional
- * generation-one recovery-context prefix. `semantic_request_digest` must be
- * the canonical lower-case SHA-256 digest of the versioned request envelope;
- * guarded entrypoints independently derive that envelope from their actual
- * arguments and reject a mismatch before creating a receipt.
+ * `semantic_request_prompt` is the immutable work prompt used by both
+ * generations. `semantic_request_digest` must be the canonical lower-case
+ * SHA-256 digest of the versioned request envelope. The generation-specific
+ * `model_input_prompt_digest` binds every byte of the exact prompt passed to
+ * the guarded entrypoint, including any recovery bootstrap.
+ * `execution_request_digest` binds that exact model input plus the exact
+ * model-context directory selected for this generation to the immutable
+ * semantic digest. Guarded entrypoints independently derive all three digests
+ * from their actual arguments and reject a mismatch before creating a
+ * receipt. Generation one must retain the semantic digest, but deliberately
+ * receives a new execution digest for its verified fresh-context retry.
  * `requested_generation` is 0 for the original call or 1 for its sole
  * automatic retry. The ticket, digest, receipt root, prompt, credentials, and
  * provider errors are never returned by the receipt query.
@@ -139,6 +145,8 @@ typedef struct {
     const char *agent_inbox_ticket_id;
     const char *semantic_request_prompt;
     const char *semantic_request_digest;
+    const char *model_input_prompt_digest;
+    const char *execution_request_digest;
     const char *receipt_root_path;
     uint32_t requested_generation;
 } codex_agentapp_turn_admission;

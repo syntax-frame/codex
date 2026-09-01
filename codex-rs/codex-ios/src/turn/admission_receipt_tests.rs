@@ -23,6 +23,7 @@ fn request(
     AdmissionRequest::new(
         ticket.to_string(),
         digest(digest_byte),
+        digest('f'),
         root.to_string_lossy().into_owned(),
         generation,
     )
@@ -41,10 +42,11 @@ fn atomically_persists_and_reopens_a_queued_receipt() {
         serde_json::to_value(query(&request)).expect("query JSON"),
         serde_json::json!({
             "contract_version": 1,
-            "receipt_version": 1,
+            "receipt_version": 2,
             "state": "persisted_queued",
             "generation": 0,
             "digest_match": true,
+            "authorizes_generation_one_start": false,
         })
     );
 }
@@ -84,10 +86,11 @@ fn retry_requires_the_same_semantic_digest() {
         serde_json::to_value(query(&mismatched)).expect("query JSON"),
         serde_json::json!({
             "contract_version": 1,
-            "receipt_version": 1,
+            "receipt_version": 2,
             "state": "rejected_before_admission",
             "generation": 0,
             "digest_match": false,
+            "authorizes_generation_one_start": false,
         })
     );
 }
@@ -99,6 +102,7 @@ fn generation_is_bounded_and_one_retry_is_consumed_once() {
         AdmissionRequest::new(
             "ticket-a".to_string(),
             digest('a'),
+            digest('f'),
             root.path().to_string_lossy().into_owned(),
             2,
         )
@@ -112,11 +116,53 @@ fn generation_is_bounded_and_one_retry_is_consumed_once() {
         .mark_rejected_before_admission()
         .expect("durable rejection");
     let retry = request(root.path(), "ticket-a", 'a', 1);
+    assert_eq!(
+        serde_json::to_value(query(&retry)).expect("query JSON"),
+        serde_json::json!({
+            "contract_version": 1,
+            "receipt_version": 2,
+            "state": "rejected_before_admission",
+            "generation": 0,
+            "digest_match": false,
+            "authorizes_generation_one_start": true,
+        })
+    );
     let _retry = TurnAdmission::begin(retry.clone()).expect("admit sole retry");
 
     assert_eq!(
         TurnAdmission::begin(retry).expect_err("duplicate retry denied"),
         AdmissionError::NotEligible
+    );
+}
+
+#[test]
+fn sole_retry_binds_its_own_exact_execution_digest() {
+    let root = tempfile::tempdir().expect("receipt root");
+    let original = request(root.path(), "ticket-a", 'a', 0);
+    let mut admission = TurnAdmission::begin(original).expect("admit original");
+    admission
+        .mark_rejected_before_admission()
+        .expect("durable rejection");
+    let retry = AdmissionRequest::new(
+        "ticket-a".to_string(),
+        digest('a'),
+        digest('e'),
+        root.path().to_string_lossy().into_owned(),
+        1,
+    )
+    .expect("valid retry");
+    let _retry = TurnAdmission::begin(retry.clone()).expect("admit retry");
+
+    assert_eq!(
+        serde_json::to_value(query(&retry)).expect("query JSON"),
+        serde_json::json!({
+            "contract_version": 1,
+            "receipt_version": 2,
+            "state": "persisted_queued",
+            "generation": 1,
+            "digest_match": true,
+            "authorizes_generation_one_start": false,
+        })
     );
 }
 
@@ -171,10 +217,11 @@ fn transitions_preserve_the_only_retryable_pre_admission_state() {
         serde_json::to_value(query(&request)).expect("query JSON"),
         serde_json::json!({
             "contract_version": 1,
-            "receipt_version": 1,
+            "receipt_version": 2,
             "state": "terminal",
             "generation": 0,
             "digest_match": true,
+            "authorizes_generation_one_start": false,
         })
     );
 }
@@ -198,10 +245,11 @@ fn remote_or_tool_side_effect_boundary_is_never_retryable() {
         serde_json::to_value(query(&request)).expect("query JSON"),
         serde_json::json!({
             "contract_version": 1,
-            "receipt_version": 1,
+            "receipt_version": 2,
             "state": "tool_or_side_effect_possible",
             "generation": 0,
             "digest_match": true,
+            "authorizes_generation_one_start": false,
         })
     );
 
@@ -231,6 +279,7 @@ fn malformed_or_incomplete_atomic_writes_fail_closed() {
             "state": "ambiguous",
             "generation": 0,
             "digest_match": false,
+            "authorizes_generation_one_start": false,
         })
     );
 }

@@ -1,8 +1,11 @@
 //! Durable, content-free admission receipts for AgentApp-owned turns.
 //!
-//! Only the immutable ticket hash and semantic request digest are persisted.
-//! The receipt deliberately never records a prompt, provider error, upload
-//! path, credential, or model output.
+//! Only the immutable ticket hash, semantic request digest, and exact
+//! generation-specific execution digest are persisted. The execution digest
+//! binds the actual model input and model-context selector without preventing
+//! the one verified retry from moving to a fresh context. The receipt
+//! deliberately never records a prompt, provider error, upload path,
+//! credential, or model output.
 
 use std::fmt;
 use std::fs;
@@ -17,7 +20,7 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 
-const RECEIPT_VERSION: u32 = 1;
+const RECEIPT_VERSION: u32 = 2;
 const QUERY_CONTRACT_VERSION: u32 = 1;
 const DIGEST_LENGTH: usize = 64;
 const MAX_TICKET_BYTES: usize = 512;
@@ -36,8 +39,11 @@ pub(crate) enum AdmissionState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AdmissionRequest {
+    agent_inbox_ticket_id: String,
     ticket_digest: String,
+    semantic_request_prompt: String,
     semantic_request_digest: String,
+    execution_request_digest: String,
     receipt_root: PathBuf,
     generation: u32,
 }
@@ -46,6 +52,7 @@ impl AdmissionRequest {
     pub(crate) fn new(
         agent_inbox_ticket_id: String,
         semantic_request_digest: String,
+        execution_request_digest: String,
         receipt_root: String,
         generation: u32,
     ) -> Result<Self, AdmissionError> {
@@ -53,6 +60,7 @@ impl AdmissionRequest {
             || agent_inbox_ticket_id.len() > MAX_TICKET_BYTES
             || generation > 1
             || !is_canonical_digest(&semantic_request_digest)
+            || !is_canonical_digest(&execution_request_digest)
         {
             return Err(AdmissionError::InvalidRequest);
         }
@@ -60,18 +68,29 @@ impl AdmissionRequest {
         if !receipt_root.is_absolute() {
             return Err(AdmissionError::InvalidRequest);
         }
+        let ticket_digest = format!("{:x}", Sha256::digest(agent_inbox_ticket_id.as_bytes()));
         Ok(Self {
-            ticket_digest: format!("{:x}", Sha256::digest(agent_inbox_ticket_id.as_bytes())),
+            agent_inbox_ticket_id,
+            ticket_digest,
+            semantic_request_prompt: String::new(),
             semantic_request_digest,
+            execution_request_digest,
             receipt_root,
             generation,
         })
+    }
+
+    pub(crate) fn with_semantic_request_prompt(mut self, prompt: String) -> Self {
+        self.semantic_request_prompt = prompt;
+        self
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct TurnAdmission {
     receipt: Receipt,
+    agent_inbox_ticket_id: String,
+    semantic_request_prompt: String,
     runtime_state: RuntimeState,
 }
 
@@ -86,11 +105,31 @@ enum RuntimeState {
 
 impl TurnAdmission {
     pub(crate) fn begin(request: AdmissionRequest) -> Result<Self, AdmissionError> {
+        let agent_inbox_ticket_id = request.agent_inbox_ticket_id.clone();
+        let semantic_request_prompt = request.semantic_request_prompt.clone();
         let receipt = Receipt::begin(request)?;
         Ok(Self {
             receipt,
+            agent_inbox_ticket_id,
+            semantic_request_prompt,
             runtime_state: RuntimeState::PreAdmission,
         })
+    }
+
+    pub(crate) fn semantic_request_prompt(&self) -> &str {
+        &self.semantic_request_prompt
+    }
+
+    pub(crate) fn agent_inbox_ticket_id(&self) -> &str {
+        &self.agent_inbox_ticket_id
+    }
+
+    pub(crate) fn semantic_request_digest(&self) -> &str {
+        &self.receipt.semantic_request_digest
+    }
+
+    pub(crate) fn execution_request_digest(&self) -> &str {
+        &self.receipt.execution_request_digest
     }
 
     pub(crate) fn is_pre_admission(&self) -> bool {
@@ -193,6 +232,7 @@ pub(crate) struct AdmissionReceiptQuery {
     state: &'static str,
     generation: u32,
     digest_match: bool,
+    authorizes_generation_one_start: bool,
 }
 
 impl AdmissionReceiptQuery {
@@ -203,6 +243,7 @@ impl AdmissionReceiptQuery {
             state,
             generation: 0,
             digest_match: false,
+            authorizes_generation_one_start: false,
         }
     }
 }
@@ -224,7 +265,14 @@ pub(crate) fn query(request: &AdmissionRequest) -> AdmissionReceiptQuery {
             receipt_version: record.version,
             state: record.state.as_str(),
             generation: record.generation,
-            digest_match: record.semantic_request_digest == request.semantic_request_digest,
+            digest_match: record.semantic_request_digest == request.semantic_request_digest
+                && record.execution_request_digest == request.execution_request_digest
+                && record.generation == request.generation,
+            authorizes_generation_one_start: record.version == RECEIPT_VERSION
+                && record.state == AdmissionState::RejectedBeforeAdmission
+                && record.generation == 0
+                && request.generation == 1
+                && record.semantic_request_digest == request.semantic_request_digest,
         },
         Ok(None) => AdmissionReceiptQuery::unavailable("missing"),
         Err(AdmissionError::Ambiguous) => AdmissionReceiptQuery::unavailable("ambiguous"),
@@ -237,6 +285,7 @@ struct Receipt {
     paths: ReceiptPaths,
     ticket_digest: String,
     semantic_request_digest: String,
+    execution_request_digest: String,
     generation: u32,
 }
 
@@ -270,6 +319,7 @@ impl Receipt {
             paths,
             ticket_digest: request.ticket_digest,
             semantic_request_digest: request.semantic_request_digest,
+            execution_request_digest: request.execution_request_digest,
             generation: request.generation,
         })
     }
@@ -281,13 +331,20 @@ impl Receipt {
     ) -> Result<(), AdmissionError> {
         with_lock(&self.paths, || {
             let request = AdmissionRequest {
+                agent_inbox_ticket_id: String::new(),
                 ticket_digest: self.ticket_digest.clone(),
+                semantic_request_prompt: String::new(),
                 semantic_request_digest: self.semantic_request_digest.clone(),
+                execution_request_digest: self.execution_request_digest.clone(),
                 receipt_root: self.paths.root.clone(),
                 generation: self.generation,
             };
             let record = read_record(&self.paths, &request)?.ok_or(AdmissionError::Ambiguous)?;
-            if record.generation != self.generation || record.state != expected {
+            if record.generation != self.generation
+                || record.state != expected
+                || record.semantic_request_digest != self.semantic_request_digest
+                || record.execution_request_digest != self.execution_request_digest
+            {
                 return Err(AdmissionError::UnexpectedTransition);
             }
             write_record(
@@ -343,6 +400,7 @@ struct ReceiptRecord {
     generation: u32,
     ticket_digest: String,
     semantic_request_digest: String,
+    execution_request_digest: String,
     state: AdmissionState,
 }
 
@@ -353,6 +411,7 @@ impl ReceiptRecord {
             generation,
             ticket_digest: request.ticket_digest.clone(),
             semantic_request_digest: request.semantic_request_digest.clone(),
+            execution_request_digest: request.execution_request_digest.clone(),
             state,
         }
     }
@@ -412,6 +471,7 @@ fn read_record(
         || record.generation > 1
         || !is_canonical_digest(&record.ticket_digest)
         || !is_canonical_digest(&record.semantic_request_digest)
+        || !is_canonical_digest(&record.execution_request_digest)
         || record.ticket_digest != request.ticket_digest
     {
         return Err(AdmissionError::Ambiguous);

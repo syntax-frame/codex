@@ -35,6 +35,8 @@ use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
+use sha2::Digest;
+use sha2::Sha256;
 
 use super::AGENTAPP_BROWSER_TOOL_NAMES;
 use super::AgentAppSemanticRequestEnvelope;
@@ -54,6 +56,7 @@ use super::ProviderAuthConfig;
 use super::RemoteLifecycleAction;
 use super::ServerFileUpload;
 use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
+use super::TurnAdmission;
 use super::TurnBridge;
 use super::TurnExitDisposition;
 use super::TurnFailure;
@@ -689,28 +692,38 @@ fn guarded_ffi_persists_pre_submit_rejection_before_emitting_the_failure() {
     let dynamic_tools = CString::new(r#"{"not":"an array"}"#).expect("dynamic tools");
     let ticket = CString::new("agent-inbox-ticket").expect("ticket");
     let semantic_prompt = CString::new("test prompt").expect("semantic prompt");
-    let semantic_digest = CString::new(
-        AgentAppSemanticRequestEnvelope::local(
-            "api_key",
-            "http://127.0.0.1:1/v1".to_string(),
-            "responses".to_string(),
-            "gpt-5.4".to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            r#"{"not":"an array"}"#.to_string(),
-            String::new(),
-        )
-        .digest("agent-inbox-ticket", "test prompt"),
-    )
-    .expect("digest");
+    let envelope = AgentAppSemanticRequestEnvelope::local(
+        "api_key",
+        "http://127.0.0.1:1/v1".to_string(),
+        "responses".to_string(),
+        "gpt-5.4".to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        context_home
+            .to_str()
+            .expect("context home UTF-8")
+            .to_string(),
+        r#"{"not":"an array"}"#.to_string(),
+        String::new(),
+    );
+    let semantic_digest_value = envelope.digest("agent-inbox-ticket", "test prompt");
+    let semantic_digest = CString::new(semantic_digest_value.clone()).expect("digest");
+    let model_input_digest_value = format!("{:x}", Sha256::digest(b"test prompt"));
+    let model_input_digest =
+        CString::new(model_input_digest_value.clone()).expect("model input digest");
+    let execution_digest =
+        CString::new(envelope.execution_digest(&semantic_digest_value, &model_input_digest_value))
+            .expect("execution digest");
     let receipt_root =
         CString::new(receipt_root.path().to_string_lossy().as_bytes()).expect("receipt root");
     let admission = AgentAppTurnAdmission {
         agent_inbox_ticket_id: ticket.as_ptr(),
         semantic_request_prompt: semantic_prompt.as_ptr(),
         semantic_request_digest: semantic_digest.as_ptr(),
+        model_input_prompt_digest: model_input_digest.as_ptr(),
+        execution_request_digest: execution_digest.as_ptr(),
         receipt_root_path: receipt_root.as_ptr(),
         requested_generation: 0,
     };
@@ -751,10 +764,11 @@ fn guarded_ffi_persists_pre_submit_rejection_before_emitting_the_failure() {
         serde_json::from_str::<serde_json::Value>(&query).expect("receipt JSON"),
         serde_json::json!({
             "contract_version": 1,
-            "receipt_version": 1,
+            "receipt_version": 2,
             "state": "rejected_before_admission",
             "generation": 0,
             "digest_match": true,
+            "authorizes_generation_one_start": false,
         })
     );
 }
@@ -774,28 +788,39 @@ fn guarded_ffi_rejects_changed_payload_before_creating_a_receipt() {
     let dynamic_tools = CString::new("[]").expect("dynamic tools");
     let ticket = CString::new("changed-payload-ticket").expect("ticket");
     let semantic_prompt = CString::new("test prompt").expect("semantic prompt");
-    let semantic_digest = CString::new(
-        AgentAppSemanticRequestEnvelope::local(
-            "api_key",
-            claimed_base_url.to_string(),
-            "responses".to_string(),
-            "gpt-5.4".to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            "[]".to_string(),
-            String::new(),
-        )
-        .digest("changed-payload-ticket", "test prompt"),
+    let claimed_envelope = AgentAppSemanticRequestEnvelope::local(
+        "api_key",
+        claimed_base_url.to_string(),
+        "responses".to_string(),
+        "gpt-5.4".to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        context_home
+            .to_str()
+            .expect("context home UTF-8")
+            .to_string(),
+        "[]".to_string(),
+        String::new(),
+    );
+    let semantic_digest_value = claimed_envelope.digest("changed-payload-ticket", "test prompt");
+    let semantic_digest = CString::new(semantic_digest_value.clone()).expect("digest");
+    let model_input_digest_value = format!("{:x}", Sha256::digest(b"test prompt"));
+    let model_input_digest =
+        CString::new(model_input_digest_value.clone()).expect("model input digest");
+    let execution_digest = CString::new(
+        claimed_envelope.execution_digest(&semantic_digest_value, &model_input_digest_value),
     )
-    .expect("digest");
+    .expect("execution digest");
     let receipt_root =
         CString::new(receipt_root.path().to_string_lossy().as_bytes()).expect("receipt root");
     let admission = AgentAppTurnAdmission {
         agent_inbox_ticket_id: ticket.as_ptr(),
         semantic_request_prompt: semantic_prompt.as_ptr(),
         semantic_request_digest: semantic_digest.as_ptr(),
+        model_input_prompt_digest: model_input_digest.as_ptr(),
+        execution_request_digest: execution_digest.as_ptr(),
         receipt_root_path: receipt_root.as_ptr(),
         requested_generation: 0,
     };
@@ -838,6 +863,7 @@ fn guarded_ffi_rejects_changed_payload_before_creating_a_receipt() {
             "state": "missing",
             "generation": 0,
             "digest_match": false,
+            "authorizes_generation_one_start": false,
         })
     );
 }
@@ -853,14 +879,227 @@ fn agentapp_semantic_request_digest_has_a_stable_cross_language_vector() {
         "default".to_string(),
         String::new(),
         "/workspace".to_string(),
+        "/context".to_string(),
         "[]".to_string(),
         "[]".to_string(),
     );
 
+    let semantic_digest = envelope.digest("ticket", "hello");
     assert_eq!(
-        envelope.digest("ticket", "hello"),
-        "506d43115c65d4163ce55562fe817c82d7ebf4769e22208b6faa627f6fd0fdac"
+        semantic_digest,
+        "50077e098acf9283a8375b7621d56358ca5db630b91901b187d28230fb034e83"
     );
+    assert_eq!(
+        envelope.execution_digest(&semantic_digest, &format!("{:x}", Sha256::digest(b"hello")),),
+        "aa6aa5c5df7b7f311b67b9b60ca3a5924b2284367ac097a4f05b848dfb983b69"
+    );
+}
+
+#[test]
+fn guarded_admission_rejects_an_altered_recovery_bootstrap_before_receipt_creation() {
+    let receipt_root = tempfile::tempdir().expect("receipt root");
+    let ticket = CString::new("altered-bootstrap-ticket").expect("ticket");
+    let semantic_prompt = CString::new("exact semantic prompt").expect("semantic prompt");
+    let expected_model_input = "exact semantic prompt";
+    let altered_model_input = CString::new(
+        "[recovered model context]\nforged bytes\n\n[current user request]\nexact semantic prompt",
+    )
+    .expect("altered model input");
+    let envelope = || {
+        AgentAppSemanticRequestEnvelope::local(
+            "api_key",
+            "https://example.test/v1".to_string(),
+            "responses".to_string(),
+            "gpt-5.4".to_string(),
+            "high".to_string(),
+            "default".to_string(),
+            String::new(),
+            "/workspace".to_string(),
+            "/context".to_string(),
+            "[]".to_string(),
+            "[]".to_string(),
+        )
+    };
+    let semantic_digest =
+        CString::new(envelope().digest("altered-bootstrap-ticket", "exact semantic prompt"))
+            .expect("semantic digest");
+    let model_input_digest_value = format!("{:x}", Sha256::digest(expected_model_input.as_bytes()));
+    let model_input_digest =
+        CString::new(model_input_digest_value.clone()).expect("model input digest");
+    let execution_digest = CString::new(envelope().execution_digest(
+        semantic_digest.to_str().expect("semantic digest UTF-8"),
+        &model_input_digest_value,
+    ))
+    .expect("execution digest");
+    let receipt_root =
+        CString::new(receipt_root.path().to_string_lossy().as_bytes()).expect("receipt root");
+    let admission = AgentAppTurnAdmission {
+        agent_inbox_ticket_id: ticket.as_ptr(),
+        semantic_request_prompt: semantic_prompt.as_ptr(),
+        semantic_request_digest: semantic_digest.as_ptr(),
+        model_input_prompt_digest: model_input_digest.as_ptr(),
+        execution_request_digest: execution_digest.as_ptr(),
+        receipt_root_path: receipt_root.as_ptr(),
+        requested_generation: 1,
+    };
+
+    let error = unsafe {
+        super::validate_agentapp_turn_admission(
+            Some(&admission),
+            altered_model_input.as_ptr(),
+            envelope(),
+        )
+    }
+    .expect_err("altered model input must fail before admission");
+    assert!(error.contains("model input does not match"));
+
+    let query_ptr = codex_query_agentapp_turn_admission_receipt(&admission);
+    let query = unsafe { CStr::from_ptr(query_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    crate::codex_free_string(query_ptr);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&query).expect("receipt JSON"),
+        serde_json::json!({
+            "contract_version": 1,
+            "receipt_version": 0,
+            "state": "missing",
+            "generation": 0,
+            "digest_match": false,
+            "authorizes_generation_one_start": false,
+        })
+    );
+}
+
+#[test]
+fn guarded_admission_rechecks_owned_inputs_before_execution() {
+    let receipt_root = tempfile::tempdir().expect("receipt root");
+    let ticket = CString::new("owned-input-recheck-ticket").expect("ticket");
+    let prompt = CString::new("exact prompt").expect("prompt");
+    let semantic_prompt = CString::new("exact prompt").expect("semantic prompt");
+    let envelope = || {
+        AgentAppSemanticRequestEnvelope::local(
+            "api_key",
+            "https://example.test/v1".to_string(),
+            "responses".to_string(),
+            "gpt-5.4".to_string(),
+            "high".to_string(),
+            "default".to_string(),
+            String::new(),
+            "/workspace".to_string(),
+            "/context".to_string(),
+            "[]".to_string(),
+            "[]".to_string(),
+        )
+    };
+    let semantic_digest_value = envelope().digest("owned-input-recheck-ticket", "exact prompt");
+    let semantic_digest = CString::new(semantic_digest_value.clone()).expect("semantic digest");
+    let model_input_digest_value = format!("{:x}", Sha256::digest(b"exact prompt"));
+    let model_input_digest =
+        CString::new(model_input_digest_value.clone()).expect("model input digest");
+    let execution_digest = CString::new(
+        envelope().execution_digest(&semantic_digest_value, &model_input_digest_value),
+    )
+    .expect("execution digest");
+    let receipt_root =
+        CString::new(receipt_root.path().to_string_lossy().as_bytes()).expect("receipt root");
+    let admission = AgentAppTurnAdmission {
+        agent_inbox_ticket_id: ticket.as_ptr(),
+        semantic_request_prompt: semantic_prompt.as_ptr(),
+        semantic_request_digest: semantic_digest.as_ptr(),
+        model_input_prompt_digest: model_input_digest.as_ptr(),
+        execution_request_digest: execution_digest.as_ptr(),
+        receipt_root_path: receipt_root.as_ptr(),
+        requested_generation: 0,
+    };
+    let request = unsafe {
+        super::validate_agentapp_turn_admission(Some(&admission), prompt.as_ptr(), envelope())
+    }
+    .expect("initial validation")
+    .expect("guarded request");
+    let owned = Some(TurnAdmission::begin(request).expect("persist receipt"));
+
+    super::revalidate_owned_agentapp_turn_admission(&owned, "exact prompt", &envelope())
+        .expect("unchanged owned values");
+    let changed_envelope = AgentAppSemanticRequestEnvelope::local(
+        "api_key",
+        "https://example.test/v1".to_string(),
+        "responses".to_string(),
+        "different-model".to_string(),
+        "high".to_string(),
+        "default".to_string(),
+        String::new(),
+        "/workspace".to_string(),
+        "/context".to_string(),
+        "[]".to_string(),
+        "[]".to_string(),
+    );
+    assert!(
+        super::revalidate_owned_agentapp_turn_admission(&owned, "exact prompt", &changed_envelope,)
+            .expect_err("changed owned inputs must fail")
+            .contains("semantic inputs changed")
+    );
+}
+
+#[test]
+fn guarded_admission_rejects_a_changed_context_home_before_receipt_creation() {
+    let receipt_root = tempfile::tempdir().expect("receipt root");
+    let ticket = CString::new("changed-context-home-ticket").expect("ticket");
+    let prompt = CString::new("exact prompt").expect("prompt");
+    let claimed_envelope = AgentAppSemanticRequestEnvelope::local(
+        "api_key",
+        "https://example.test/v1".to_string(),
+        "responses".to_string(),
+        "gpt-5.4".to_string(),
+        "high".to_string(),
+        "default".to_string(),
+        String::new(),
+        "/workspace".to_string(),
+        "/claimed-context".to_string(),
+        "[]".to_string(),
+        "[]".to_string(),
+    );
+    let actual_envelope = AgentAppSemanticRequestEnvelope::local(
+        "api_key",
+        "https://example.test/v1".to_string(),
+        "responses".to_string(),
+        "gpt-5.4".to_string(),
+        "high".to_string(),
+        "default".to_string(),
+        String::new(),
+        "/workspace".to_string(),
+        "/actual-context".to_string(),
+        "[]".to_string(),
+        "[]".to_string(),
+    );
+    let semantic_digest =
+        CString::new(claimed_envelope.digest("changed-context-home-ticket", "exact prompt"))
+            .expect("semantic digest");
+    let model_input_digest_value = format!("{:x}", Sha256::digest(b"exact prompt"));
+    let model_input_digest =
+        CString::new(model_input_digest_value.clone()).expect("model input digest");
+    let execution_digest = CString::new(claimed_envelope.execution_digest(
+        semantic_digest.to_str().expect("semantic digest UTF-8"),
+        &model_input_digest_value,
+    ))
+    .expect("execution digest");
+    let receipt_root =
+        CString::new(receipt_root.path().to_string_lossy().as_bytes()).expect("receipt root");
+    let admission = AgentAppTurnAdmission {
+        agent_inbox_ticket_id: ticket.as_ptr(),
+        semantic_request_prompt: prompt.as_ptr(),
+        semantic_request_digest: semantic_digest.as_ptr(),
+        model_input_prompt_digest: model_input_digest.as_ptr(),
+        execution_request_digest: execution_digest.as_ptr(),
+        receipt_root_path: receipt_root.as_ptr(),
+        requested_generation: 0,
+    };
+
+    let error = unsafe {
+        super::validate_agentapp_turn_admission(Some(&admission), prompt.as_ptr(), actual_envelope)
+    }
+    .expect_err("changed context home must fail before admission");
+    assert!(error.contains("execution digest does not match"));
 }
 
 struct RejectingResponsesServer {
