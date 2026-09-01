@@ -57,6 +57,7 @@ const BOOTSTRAP_KEEPER_MAX_SECONDS: u64 = 2 * 60;
 // suspension ample recovery time, while still bounding crash-orphan lifetime.
 const CONTROLLER_LEASE_SECONDS: u64 = 15 * 60;
 const CONTROLLER_HEARTBEAT_SECONDS: u64 = 5;
+const EXECUTION_MAX_LIFETIME_SECONDS: u64 = 24 * 60 * 60;
 // A remote monitor is only a transport attachment; the tmux execution owns
 // continuity. Periodic reattachment bounds orphaned SSH exec processes when a
 // client disappears without closing its channel cleanly.
@@ -94,6 +95,64 @@ fn output_drain_function_fragment() -> &'static str {
         "  [ -f \"$root/output-closed.$output_pipe_generation\" ] || { echo AGENTAPP_TMUX_OUTPUT_PIPE_DRAIN_TIMEOUT >&2; return 83; }\n",
         "  return 0\n",
         "}\n"
+    )
+}
+
+fn orphaned_execution_session_reaper_command() -> String {
+    let identifier_pattern = "[0-9a-f]".repeat(16);
+    let session_pattern = format!("agentapp_{identifier_pattern}_{identifier_pattern}");
+    format!(
+        concat!(
+            "agentapp_reap_acknowledged_sessions() (\n",
+            "  base=\"$HOME/.agentapp/tmux\"\n",
+            "  lock=\"$base/.orphan-session-reaper\"\n",
+            "  mkdir -p \"$base\"\n",
+            "  if [ -d \"$lock\" ] && [ -n \"$(find \"$lock\" -prune -type d -mmin +30 -print 2>/dev/null)\" ]; then rmdir \"$lock\" 2>/dev/null || true; fi\n",
+            "  mkdir \"$lock\" 2>/dev/null || exit 0\n",
+            "  trap 'rmdir \"$lock\" 2>/dev/null || true' EXIT HUP INT TERM\n",
+            "  now=$(date +%s)\n",
+            "  case \"$now\" in ''|*[!0-9]*) exit 0 ;; esac\n",
+            "  listing=$(tmux list-sessions -F '#{{session_name}}|#{{session_created}}' 2>/dev/null) || exit 0\n",
+            "  reaped=0\n",
+            "  while IFS='|' read -r candidate created_at; do\n",
+            "    [ \"$reaped\" -lt {batch} ] || break\n",
+            "    case \"$candidate\" in {session_pattern}) ;; *) continue ;; esac\n",
+            "    case \"$created_at\" in ''|*[!0-9]*) continue ;; esac\n",
+            "    [ \"$now\" -ge \"$created_at\" ] || continue\n",
+            "    [ $((now - created_at)) -ge {max_lifetime} ] || continue\n",
+            "    suffix=${{candidate#agentapp_}}\n",
+            "    orphan_agent=${{suffix%%_*}}\n",
+            "    orphan_process=${{suffix#*_}}\n",
+            "    root=\"$base/$orphan_agent/$orphan_process\"\n",
+            "    {{ [ ! -e \"$root\" ] && [ ! -L \"$root\" ]; }} || continue\n",
+            "    panes=$(tmux list-panes -s -t \"$candidate\" -F '#{{window_name}}|#{{window_id}}|#{{pane_id}}|#{{pane_dead}}' 2>/dev/null) || continue\n",
+            "    valid=1\n",
+            "    pane_count=0\n",
+            "    window_ids=\n",
+            "    while IFS='|' read -r orphan_window orphan_window_id orphan_pane_id orphan_dead; do\n",
+            "      pane_count=$((pane_count + 1))\n",
+            "      case \"$orphan_window\" in \"p_$orphan_process\"|\"w_$orphan_process\"|__agentapp_keeper) ;; *) valid=0 ;; esac\n",
+            "      case \"$orphan_window_id\" in @*[!0-9]*|@) valid=0 ;; @*) ;; *) valid=0 ;; esac\n",
+            "      case \"$orphan_pane_id\" in %*[!0-9]*|%) valid=0 ;; %*) ;; *) valid=0 ;; esac\n",
+            "      [ \"$orphan_dead\" = 1 ] || valid=0\n",
+            "      window_ids=\"$window_ids $orphan_window_id\"\n",
+            "    done <<AGENTAPP_ORPHAN_PANES_EOF\n",
+            "$panes\n",
+            "AGENTAPP_ORPHAN_PANES_EOF\n",
+            "    [ \"$valid\" -eq 1 ] && [ \"$pane_count\" -gt 0 ] || continue\n",
+            "    for orphan_window_id in $window_ids; do tmux kill-window -t \"$orphan_window_id\" 2>/dev/null || true; done\n",
+            "    tmux has-session -t \"$candidate\" 2>/dev/null && continue\n",
+            "    reaped=$((reaped + 1))\n",
+            "  done <<AGENTAPP_ORPHAN_SESSIONS_EOF\n",
+            "$listing\n",
+            "AGENTAPP_ORPHAN_SESSIONS_EOF\n",
+            "  exit 0\n",
+            ")\n",
+            "agentapp_reap_acknowledged_sessions || true\n"
+        ),
+        batch = ORPHANED_SESSION_REAPER_BATCH,
+        max_lifetime = EXECUTION_MAX_LIFETIME_SECONDS,
+        session_pattern = session_pattern,
     )
 }
 
@@ -1127,7 +1186,7 @@ impl TmuxProcessDescriptor {
                 "    code=$(cat \"$root/status\" 2>/dev/null || printf '125')\n",
                 "  else\n",
                 "    claim_kind=$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\n",
-                "    case \"$claim_kind\" in terminated) code=143 ;; recovery-lost|launch-interrupted) code=125 ;; completed) while [ ! -f \"$root/status\" ]; do sleep 1; done; code=$(cat \"$root/status\" 2>/dev/null || printf '125') ;; *) code=125 ;; esac\n",
+                "    case \"$claim_kind\" in terminated) code=143 ;; expired) code=124 ;; recovery-lost|launch-interrupted) code=125 ;; completed) while [ ! -f \"$root/status\" ]; do sleep 1; done; code=$(cat \"$root/status\" 2>/dev/null || printf '125') ;; *) code=125 ;; esac\n",
                 "  fi\n",
                 "fi\n",
                 ": > \"$root/sentinel-release.tmp\"\n",
@@ -1165,10 +1224,211 @@ impl TmuxProcessDescriptor {
         format!("exec /bin/sh -c {}", shell_quote(&supervisor_command))
     }
 
+    fn expiry_script(&self) -> String {
+        let root = self.remote_directory();
+        let expiry_key =
+            stable_identifier(&format!("{}:{}:expiry", self.agent_id, self.process_id));
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "set -eu\n",
+                "root=\"{root}\"\n",
+                "default_session={default_session}\n",
+                "window={window}\n",
+                "watchdog_window={watchdog_window}\n",
+                "max_lifetime={max_lifetime}\n",
+                "{output_drain_function}",
+                "[ -d \"$root\" ] || exit 0\n",
+                "[ \"$(cat \"$root/owner\" 2>/dev/null || true)\" = {owner} ] || exit 0\n",
+                "[ \"$(cat \"$root/identity\" 2>/dev/null || true)\" = {identity} ] || exit 0\n",
+                "[ \"$(cat \"$root/thread-id\" 2>/dev/null || true)\" = {thread_id} ] || exit 0\n",
+                "[ \"$(cat \"$root/turn-id\" 2>/dev/null || true)\" = {turn_id} ] || exit 0\n",
+                "[ \"$(cat \"$root/call-id\" 2>/dev/null || true)\" = {call_id} ] || exit 0\n",
+                "[ \"$(cat \"$root/attempt-generation\" 2>/dev/null || true)\" = {attempt_generation} ] || exit 0\n",
+                "[ \"$(cat \"$root/session-id\" 2>/dev/null || true)\" = {session_id} ] || exit 0\n",
+                "[ \"$(cat \"$root/tty\" 2>/dev/null || true)\" = {tty} ] || exit 0\n",
+                "[ \"$(cat \"$root/digest\" 2>/dev/null || true)\" = {digest} ] || exit 0\n",
+                "[ \"$(cat \"$root/window\" 2>/dev/null || true)\" = \"$window\" ] || exit 0\n",
+                "session=$(cat \"$root/session\" 2>/dev/null || true)\n",
+                "[ \"$session\" = \"$default_session\" ] || exit 0\n",
+                "created_at=$(cat \"$root/created-at\" 2>/dev/null || true)\n",
+                "case \"$created_at\" in ''|*[!0-9]*) exit 0 ;; esac\n",
+                "now=$(date +%s)\n",
+                "case \"$now\" in ''|*[!0-9]*) exit 0 ;; esac\n",
+                "[ \"$now\" -ge \"$created_at\" ] || exit 0\n",
+                "[ $((now - created_at)) -ge \"$max_lifetime\" ] || exit 0\n",
+                "[ ! -f \"$root/status\" ] && [ \"$(cat \"$root/state\" 2>/dev/null || true)\" = running ] && [ -e \"$root/go\" ] || exit 0\n",
+                "process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true)\n",
+                "pane_pid=${{process_identity%%:*}}\n",
+                "pgid=${{process_identity#*:}}\n",
+                "case \"$process_identity\" in *:*:*) exit 0 ;; esac\n",
+                "case \"$pane_pid:$pgid\" in :|:*|*:|*[!0-9:]*) exit 0 ;; esac\n",
+                "stored_window_id=$(cat \"$root/window-id\" 2>/dev/null || true)\n",
+                "stored_pane_id=$(cat \"$root/pane-id\" 2>/dev/null || true)\n",
+                "[ -n \"$stored_window_id\" ] && [ -n \"$stored_pane_id\" ] || exit 0\n",
+                "[ \"$(tmux list-panes -t \"$session:$window\" -F '#{{pane_id}}' 2>/dev/null | wc -l | tr -d ' ')\" = 1 ] || exit 0\n",
+                "pane_observation=$(tmux display-message -p -t \"$session:$window.0\" '#{{window_id}}:#{{pane_id}}:#{{pane_pid}}:#{{pane_dead}}' 2>/dev/null || true)\n",
+                "old_ifs=$IFS; IFS=:; set -- $pane_observation; IFS=$old_ifs\n",
+                "[ \"$#\" -eq 4 ] || exit 0\n",
+                "current_window_id=$1; current_pane_id=$2; current_pane=$3; current_pane_dead=$4\n",
+                "[ \"$current_window_id:$current_pane_id:$current_pane:$current_pane_dead\" = \"$stored_window_id:$stored_pane_id:$pane_pid:0\" ] || exit 0\n",
+                "current_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' ')\n",
+                "[ \"$current_pgid\" = \"$pgid\" ] || exit 0\n",
+                "current_controller=$(cat \"$root/controller\" 2>/dev/null || true)\n",
+                "controller_generation=${{current_controller%%:*}}\n",
+                "controller_value=${{current_controller#*:}}\n",
+                "case \"$controller_generation\" in ''|*[!0-9]*) exit 0 ;; esac\n",
+                "[ -n \"$controller_value\" ] && [ \"$controller_value\" != \"$current_controller\" ] || exit 0\n",
+                "operation_pid=$$\n",
+                "operation_pgid=$(command -p ps -o pgid= -p \"$operation_pid\" 2>/dev/null | tr -d ' ')\n",
+                "case \"$operation_pid:$operation_pgid\" in :|:*|*:|*[!0-9:]*) exit 0 ;; esac\n",
+                "[ \"$operation_pgid\" != \"$pgid\" ] || exit 0\n",
+                "expiry_nonce=e_{expiry_key}_$operation_pid\n",
+                "transition_candidate=\"$root/.transition-candidate.$expiry_nonce.$operation_pid\"\n",
+                "expected_claim=\"expiry|$expiry_nonce|$current_controller|$operation_pid|$operation_pgid|$window|$pane_pid|$pgid\"\n",
+                "( umask 077; set -C; printf '%s\\n' \"$expected_claim\" > \"$transition_candidate\" ) || exit 0\n",
+                "if ! ln \"$transition_candidate\" \"$root/transition-claim\" 2>/dev/null; then rm -f \"$transition_candidate\"; exit 0; fi\n",
+                "release_expiry_claim() {{ if [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] && [ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"$expected_claim\" ]; then rm -f \"$root/transition-claim\"; fi; rm -f \"$transition_candidate\"; }}\n",
+                "trap 'release_expiry_claim' EXIT HUP INT TERM\n",
+                "require_expiry_claim() {{ [ -f \"$transition_candidate\" ] && [ \"$transition_candidate\" -ef \"$root/transition-claim\" ] && [ \"$(cat \"$root/transition-claim\" 2>/dev/null || true)\" = \"$expected_claim\" ] || {{ exit 79; }}; }}\n",
+                "require_expiry_claim\n",
+                "now=$(date +%s)\n",
+                "case \"$now\" in ''|*[!0-9]*) exit 0 ;; esac\n",
+                "[ \"$now\" -ge \"$created_at\" ] && [ $((now - created_at)) -ge \"$max_lifetime\" ] || exit 0\n",
+                "[ \"$(cat \"$root/controller\" 2>/dev/null || true)\" = \"$current_controller\" ] || exit 0\n",
+                "[ ! -f \"$root/status\" ] && [ \"$(cat \"$root/state\" 2>/dev/null || true)\" = running ] || exit 0\n",
+                "[ \"$(cat \"$root/process-identity\" 2>/dev/null || true)\" = \"$process_identity\" ] || exit 0\n",
+                "rechecked_pane=$(tmux display-message -p -t \"$current_pane_id\" '#{{window_id}}:#{{pane_id}}:#{{pane_pid}}:#{{pane_dead}}' 2>/dev/null || true)\n",
+                "[ \"$rechecked_pane\" = \"$pane_observation\" ] || exit 0\n",
+                "rechecked_pgid=$(command -p ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' ')\n",
+                "[ \"$rechecked_pgid\" = \"$pgid\" ] || exit 0\n",
+                "if ! mkdir \"$root/terminal-claim\" 2>/dev/null; then exit 0; fi\n",
+                "printf 'expired\\n' > \"$root/terminal-claim/kind.tmp\"\n",
+                "mv \"$root/terminal-claim/kind.tmp\" \"$root/terminal-claim/kind\"\n",
+                "require_expiry_claim\n",
+                "[ \"$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\" = expired ] || exit 0\n",
+                "{stop_process_group}\n",
+                "require_expiry_claim\n",
+                "if [ \"$(cat \"$root/tty\" 2>/dev/null || true)\" = 1 ]; then\n",
+                "  tmux pipe-pane -t \"$current_pane_id\"\n",
+                "  require_expiry_claim\n",
+                "fi\n",
+                "[ -e \"$root/output\" ] || : > \"$root/output\"\n",
+                "if [ \"$(cat \"$root/tty\" 2>/dev/null || true)\" = 1 ]; then\n",
+                "  agentapp_wait_for_output_drain\n",
+                "else\n",
+                "  if [ ! -f \"$root/output-closed\" ]; then : > \"$root/output-closed.tmp\"; mv \"$root/output-closed.tmp\" \"$root/output-closed\"; fi\n",
+                "fi\n",
+                "require_expiry_claim\n",
+                "printf '\\n%s\\n' {expiry_notice} >> \"$root/output\"\n",
+                "require_expiry_claim\n",
+                "[ ! -f \"$root/status\" ] || exit 0\n",
+                "printf '124\\n' > \"$root/status.tmp\"\n",
+                "mv \"$root/status.tmp\" \"$root/status\"\n",
+                "printf 'expired\\n' > \"$root/state.tmp\"\n",
+                "mv \"$root/state.tmp\" \"$root/state\"\n",
+                "rm -f \"$root/recovery-required\"\n",
+                "require_expiry_claim\n",
+                "{retire_windows}\n",
+                "release_expiry_claim\n",
+                "trap - EXIT HUP INT TERM\n",
+                "exit 0\n"
+            ),
+            root = root,
+            default_session = shell_quote(&self.session_name),
+            window = shell_quote(&self.window_name),
+            watchdog_window = shell_quote(&self.watchdog_window_name),
+            max_lifetime = EXECUTION_MAX_LIFETIME_SECONDS,
+            owner = shell_quote(OWNERSHIP_MARKER),
+            identity = shell_quote(&self.process_id),
+            thread_id = shell_quote(&self.thread_id_base64),
+            turn_id = shell_quote(&self.turn_id_base64),
+            call_id = shell_quote(&self.call_id_base64),
+            attempt_generation = shell_quote(&self.attempt_generation.to_string()),
+            session_id = shell_quote(
+                &self
+                    .session_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            ),
+            tty = shell_quote(if self.tty { "1" } else { "0" }),
+            digest = shell_quote(&self.command_digest),
+            expiry_notice = shell_quote(crate::EXECUTION_EXPIRY_SYSTEM_NOTICE),
+            expiry_key = expiry_key,
+            output_drain_function = output_drain_function_fragment(),
+            stop_process_group = self.confirmed_process_group_stop(),
+            retire_windows = self.retire_confirmed_process_windows(false),
+        )
+    }
+
+    fn terminal_cleanup_script(&self) -> String {
+        let root = self.remote_directory();
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "set -eu\n",
+                "root=\"{root}\"\n",
+                "default_session={default_session}\n",
+                "window={window}\n",
+                "watchdog_window={watchdog_window}\n",
+                "{output_drain_function}",
+                "[ -d \"$root\" ] || exit 1\n",
+                "[ \"$(cat \"$root/owner\" 2>/dev/null || true)\" = {owner} ] || exit 1\n",
+                "[ \"$(cat \"$root/identity\" 2>/dev/null || true)\" = {identity} ] || exit 1\n",
+                "[ \"$(cat \"$root/thread-id\" 2>/dev/null || true)\" = {thread_id} ] || exit 1\n",
+                "[ \"$(cat \"$root/turn-id\" 2>/dev/null || true)\" = {turn_id} ] || exit 1\n",
+                "[ \"$(cat \"$root/call-id\" 2>/dev/null || true)\" = {call_id} ] || exit 1\n",
+                "[ \"$(cat \"$root/attempt-generation\" 2>/dev/null || true)\" = {attempt_generation} ] || exit 1\n",
+                "[ \"$(cat \"$root/session-id\" 2>/dev/null || true)\" = {session_id} ] || exit 1\n",
+                "[ \"$(cat \"$root/tty\" 2>/dev/null || true)\" = {tty} ] || exit 1\n",
+                "[ \"$(cat \"$root/digest\" 2>/dev/null || true)\" = {digest} ] || exit 1\n",
+                "[ \"$(cat \"$root/window\" 2>/dev/null || true)\" = \"$window\" ] || exit 1\n",
+                "session=$(cat \"$root/session\" 2>/dev/null || true)\n",
+                "[ \"$session\" = \"$default_session\" ] || exit 1\n",
+                "state=$(cat \"$root/state\" 2>/dev/null || true)\n",
+                "claim_kind=$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\n",
+                "code=$(cat \"$root/status\" 2>/dev/null || true)\n",
+                "case \"$state:$claim_kind\" in completed:completed|terminated:terminated|expired:expired|recovery-lost:recovery-lost) ;; *) exit 1 ;; esac\n",
+                "case \"$state\" in\n",
+                "  completed) case \"$code\" in -*) numeric_code=${{code#-}} ;; *) numeric_code=$code ;; esac; case \"$numeric_code\" in ''|*[!0-9]*) exit 1 ;; esac ;;\n",
+                "  terminated) [ \"$code\" = 143 ] || exit 1 ;;\n",
+                "  expired) [ \"$code\" = 124 ] || exit 1 ;;\n",
+                "  recovery-lost) [ \"$code\" = 125 ] || exit 1 ;;\n",
+                "esac\n",
+                "{stop_process_group}\n",
+                "if [ \"$(cat \"$root/tty\" 2>/dev/null || true)\" = 1 ]; then tmux pipe-pane -t \"$current_pane_id\"; fi\n",
+                "agentapp_wait_for_output_drain\n",
+                "{retire_windows}\n",
+                "exit 0\n"
+            ),
+            root = root,
+            default_session = shell_quote(&self.session_name),
+            window = shell_quote(&self.window_name),
+            watchdog_window = shell_quote(&self.watchdog_window_name),
+            owner = shell_quote(OWNERSHIP_MARKER),
+            identity = shell_quote(&self.process_id),
+            thread_id = shell_quote(&self.thread_id_base64),
+            turn_id = shell_quote(&self.turn_id_base64),
+            call_id = shell_quote(&self.call_id_base64),
+            attempt_generation = shell_quote(&self.attempt_generation.to_string()),
+            session_id = shell_quote(
+                &self
+                    .session_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            ),
+            tty = shell_quote(if self.tty { "1" } else { "0" }),
+            digest = shell_quote(&self.command_digest),
+            output_drain_function = output_drain_function_fragment(),
+            stop_process_group = self.confirmed_process_group_stop(),
+            retire_windows = self.retire_confirmed_process_windows(false),
+        )
+    }
+
     fn watchdog_script(&self) -> String {
         let root = self.remote_directory();
         format!(
-            "#!/bin/sh\nroot=\"{root}\"\nwhile [ ! -f \"$root/status\" ]; do\n  now=$(date +%s)\n  lease=$(cat \"$root/lease\" 2>/dev/null || printf '0')\n  case \"$lease\" in ''|*[!0-9]*) lease=0 ;; esac\n  if [ $((now - lease)) -ge {CONTROLLER_LEASE_SECONDS} ] && [ ! -f \"$root/recovery-required\" ]; then\n    observed=$(cat \"$root/controller\" 2>/dev/null || true)\n    observed_generation=${{observed%%:*}}\n    observed_controller=${{observed#*:}}\n    case \"$observed_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_CONTROLLER_GENERATION_UNKNOWN >&2; exit 80 ;; esac\n    if [ -z \"$observed_controller\" ] || [ \"$observed_controller\" = \"$observed\" ]; then echo AGENTAPP_TMUX_CONTROLLER_UNKNOWN >&2; exit 80; fi\n    printf '%s:%s\\n' \"$observed_generation\" \"$observed_controller\" > \"$root/recovery-required.tmp\"\n    mv \"$root/recovery-required.tmp\" \"$root/recovery-required\"\n  fi\n  sleep {CONTROLLER_HEARTBEAT_SECONDS}\ndone\n",
+            "#!/bin/sh\nroot=\"{root}\"\nwhile :; do\n  if [ -f \"$root/status\" ]; then\n    if [ -x \"$root/terminal-cleanup.sh\" ] && /bin/sh \"$root/terminal-cleanup.sh\"; then exit 0; fi\n    sleep {CONTROLLER_HEARTBEAT_SECONDS}\n    continue\n  fi\n  if [ -x \"$root/expiry.sh\" ]; then /bin/sh \"$root/expiry.sh\" || true; fi\n  [ -f \"$root/status\" ] && continue\n  now=$(date +%s)\n  lease=$(cat \"$root/lease\" 2>/dev/null || printf '0')\n  case \"$lease\" in ''|*[!0-9]*) lease=0 ;; esac\n  if [ $((now - lease)) -ge {CONTROLLER_LEASE_SECONDS} ] && [ ! -f \"$root/recovery-required\" ]; then\n    observed=$(cat \"$root/controller\" 2>/dev/null || true)\n    observed_generation=${{observed%%:*}}\n    observed_controller=${{observed#*:}}\n    case \"$observed_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_CONTROLLER_GENERATION_UNKNOWN >&2; exit 80 ;; esac\n    if [ -z \"$observed_controller\" ] || [ \"$observed_controller\" = \"$observed\" ]; then echo AGENTAPP_TMUX_CONTROLLER_UNKNOWN >&2; exit 80; fi\n    printf '%s:%s\\n' \"$observed_generation\" \"$observed_controller\" > \"$root/recovery-required.tmp\"\n    mv \"$root/recovery-required.tmp\" \"$root/recovery-required\"\n  fi\n  sleep {CONTROLLER_HEARTBEAT_SECONDS}\ndone\n",
         )
     }
 
@@ -1177,6 +1437,8 @@ impl TmuxProcessDescriptor {
         let root = self.remote_directory();
         let script = self.process_script(params);
         let watchdog_script = self.watchdog_script();
+        let expiry_script = self.expiry_script();
+        let terminal_cleanup_script = self.terminal_cleanup_script();
         let start_command = self.supervisor_start_command();
         let watchdog_command = format!("exec /bin/sh \"{root}/watchdog.sh\"");
         let pipe_setup = if self.tty {
@@ -1236,7 +1498,7 @@ impl TmuxProcessDescriptor {
                 "if [ -d \"$root\" ]; then\n",
                 "  if [ \"$(cat \"$root/owner\" 2>/dev/null || true)\" != {owner_check} ] || [ \"$(cat \"$root/identity\" 2>/dev/null || true)\" != {identity} ] || [ \"$(cat \"$root/thread-id\" 2>/dev/null || true)\" != {thread_id} ] || [ \"$(cat \"$root/turn-id\" 2>/dev/null || true)\" != {turn_id} ] || [ \"$(cat \"$root/call-id\" 2>/dev/null || true)\" != {call_id} ] || [ \"$(cat \"$root/attempt-generation\" 2>/dev/null || true)\" != {attempt_generation} ] || [ \"$(cat \"$root/session-id\" 2>/dev/null || true)\" != {session_id} ] || [ \"$(cat \"$root/tty\" 2>/dev/null || true)\" != {tty} ] || [ \"$(cat \"$root/digest\" 2>/dev/null || true)\" != \"$digest\" ]; then echo AGENTAPP_TMUX_IDENTITY_MISMATCH >&2; exit 76; fi\n",
                 "  existing_state=$(cat \"$root/state\" 2>/dev/null || true)\n",
-                "  case \"$existing_state\" in prepared|running) ;; completed|terminated|launch-interrupted) echo AGENTAPP_TMUX_EXECUTION_TERMINAL >&2; exit 79 ;; *) echo AGENTAPP_TMUX_EXECUTION_STATE_UNKNOWN >&2; exit 79 ;; esac\n",
+                "  case \"$existing_state\" in prepared|running) ;; completed|terminated|expired|launch-interrupted) echo AGENTAPP_TMUX_EXECUTION_TERMINAL >&2; exit 79 ;; *) echo AGENTAPP_TMUX_EXECUTION_STATE_UNKNOWN >&2; exit 79 ;; esac\n",
                 "  if [ \"$window_exists\" -eq 1 ]; then current_pane=$(tmux display-message -p -t \"$session:$window.0\" '#{{pane_pid}}' 2>/dev/null || true); current_pgid=$(ps -o pgid= -p \"$current_pane\" 2>/dev/null | tr -d ' '); process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true); if [ -z \"$process_identity\" ] && [ ! -f \"$root/go\" ] && [ \"$(cat \"$root/state\" 2>/dev/null || true)\" = prepared ]; then case \"$current_pane:$current_pgid\" in :|:*|*:|*[!0-9:]*) echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80 ;; esac; printf '%s:%s\\n' \"$current_pane\" \"$current_pgid\" > \"$root/process-identity.tmp\"; mv \"$root/process-identity.tmp\" \"$root/process-identity\"; process_identity=\"$current_pane:$current_pgid\"; fi; stored_pane=${{process_identity%%:*}}; stored_pgid=${{process_identity#*:}}; if [ -z \"$current_pane\" ] || [ \"$stored_pane\" != \"$current_pane\" ] || [ \"$stored_pgid\" != \"$current_pgid\" ]; then echo AGENTAPP_TMUX_PROCESS_IDENTITY_MISMATCH >&2; exit 80; fi; if [ \"$(cat \"$root/state\" 2>/dev/null || true)\" = prepared ]; then release_start=1; fi; fi\n",
                 "  if [ \"$window_exists\" -eq 0 ] && [ ! -f \"$root/status\" ]; then if [ \"$(cat \"$root/state\" 2>/dev/null || true)\" = prepared ] && [ ! -f \"$root/process-identity\" ]; then create_window=1; release_start=1; else echo AGENTAPP_TMUX_EXECUTION_STATE_UNKNOWN >&2; exit 79; fi; fi\n",
                 "elif [ \"$window_exists\" -eq 1 ]; then\n",
@@ -1247,7 +1509,7 @@ impl TmuxProcessDescriptor {
                 "  cleanup_descriptor_staging_path() {{\n",
                 "    descriptor_staging_path=$1\n",
                 "    [ \"$owns_staging\" -eq 1 ] && [ -d \"$descriptor_staging_path\" ] || return 0\n",
-                "    rm -f \"$descriptor_staging_path/output\" \"$descriptor_staging_path/owner\" \"$descriptor_staging_path/identity\" \"$descriptor_staging_path/thread-id\" \"$descriptor_staging_path/turn-id\" \"$descriptor_staging_path/call-id\" \"$descriptor_staging_path/attempt-generation\" \"$descriptor_staging_path/session-id\" \"$descriptor_staging_path/session\" \"$descriptor_staging_path/tty\" \"$descriptor_staging_path/acknowledgement-token\" \"$descriptor_staging_path/digest\" \"$descriptor_staging_path/window\" \"$descriptor_staging_path/state\"\n",
+                "    rm -f \"$descriptor_staging_path/output\" \"$descriptor_staging_path/owner\" \"$descriptor_staging_path/identity\" \"$descriptor_staging_path/thread-id\" \"$descriptor_staging_path/turn-id\" \"$descriptor_staging_path/call-id\" \"$descriptor_staging_path/attempt-generation\" \"$descriptor_staging_path/session-id\" \"$descriptor_staging_path/session\" \"$descriptor_staging_path/tty\" \"$descriptor_staging_path/acknowledgement-token\" \"$descriptor_staging_path/digest\" \"$descriptor_staging_path/window\" \"$descriptor_staging_path/created-at\" \"$descriptor_staging_path/state\"\n",
                 "    rmdir \"$descriptor_staging_path\" 2>/dev/null || true\n",
                 "    return 0\n",
                 "  }}\n",
@@ -1276,6 +1538,9 @@ impl TmuxProcessDescriptor {
                 "  printf '%s\\n' {acknowledgement_token} > \"$staging/acknowledgement-token\" || descriptor_publish_failed\n",
                 "  printf '%s\\n' \"$digest\" > \"$staging/digest\" || descriptor_publish_failed\n",
                 "  printf '%s\\n' \"$window\" > \"$staging/window\" || descriptor_publish_failed\n",
+                "  created_at=$(date +%s)\n",
+                "  case \"$created_at\" in ''|*[!0-9]*) descriptor_publish_failed ;; esac\n",
+                "  printf '%s\\n' \"$created_at\" > \"$staging/created-at\" || descriptor_publish_failed\n",
                 "  printf 'prepared\\n' > \"$staging/state\" || descriptor_publish_failed\n",
                 "  if [ -e \"$root\" ] || [ -L \"$root\" ]; then echo AGENTAPP_TMUX_DESCRIPTOR_CAS_CONFLICT >&2; exit 75; fi\n",
                 "  if ! mv -n \"$staging\" \"$root\" 2>/dev/null; then if [ -e \"$root\" ] || [ -L \"$root\" ]; then echo AGENTAPP_TMUX_DESCRIPTOR_CAS_CONFLICT >&2; exit 75; else descriptor_publish_failed; fi; fi\n",
@@ -1356,6 +1621,10 @@ impl TmuxProcessDescriptor {
                 "date +%s > \"$root/lease\"\n",
                 "rm -f \"$root/recovery-required\"\n",
                 "if [ \"$create_watchdog\" -eq 1 ]; then\n",
+                "  printf '%s' {expiry_script} > \"$root/expiry.sh\"\n",
+                "  chmod 700 \"$root/expiry.sh\"\n",
+                "  printf '%s' {terminal_cleanup_script} > \"$root/terminal-cleanup.sh\"\n",
+                "  chmod 700 \"$root/terminal-cleanup.sh\"\n",
                 "  printf '%s' {watchdog_script} > \"$root/watchdog.sh\"\n",
                 "  chmod 700 \"$root/watchdog.sh\"\n",
                 "  agentapp_tmux_create tmux new-window -d -t \"$session:\" -n \"$watchdog_window\" {watchdog_start}\n",
@@ -1458,6 +1727,8 @@ impl TmuxProcessDescriptor {
             acknowledgement_token = shell_quote(&self.acknowledgement_token),
             keeper = shell_quote(&self.bootstrap_keeper_command(BOOTSTRAP_KEEPER_MAX_SECONDS)),
             script = shell_quote(&script),
+            expiry_script = shell_quote(&expiry_script),
+            terminal_cleanup_script = shell_quote(&terminal_cleanup_script),
             watchdog_script = shell_quote(&watchdog_script),
             start = shell_quote(&start_command),
             watchdog_start = shell_quote(&watchdog_command),
@@ -2095,6 +2366,14 @@ impl TmuxProcessDescriptor {
     }
 
     fn confirmed_process_group_termination(&self) -> String {
+        format!(
+            "{}\n{}",
+            self.confirmed_process_group_stop(),
+            self.retire_confirmed_process_windows(true)
+        )
+    }
+
+    fn confirmed_process_group_stop(&self) -> String {
         concat!(
             "process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true)\n",
             "pane_pid=${process_identity%%:*}\n",
@@ -2165,12 +2444,26 @@ impl TmuxProcessDescriptor {
             "  exit 80\n",
             "fi\n",
             "agentapp_termination_probe_group \"$pgid\"\n",
-            "case \"$agentapp_termination_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_PROCESS_GROUP_ALIVE >&2; exit 81 ;; *) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac\n",
-            "if [ \"$window_exists\" -eq 1 ]; then tmux kill-window -t \"$current_window_id\" 2>/dev/null || true; fi\n",
-            "if tmux list-windows -t \"$session\" -F '#{window_name}' 2>/dev/null | grep -Fqx \"$window\"; then echo AGENTAPP_TMUX_TERMINATION_UNCONFIRMED >&2; exit 78; fi\n",
-            "tmux kill-window -t \"$session:$watchdog_window\" 2>/dev/null || true\n",
-            "tmux kill-window -t \"$session:__agentapp_keeper\" 2>/dev/null || true"
-        ).to_string()
+            "case \"$agentapp_termination_group_state\" in dead) ;; alive) echo AGENTAPP_TMUX_PROCESS_GROUP_ALIVE >&2; exit 81 ;; *) echo AGENTAPP_TMUX_PROCESS_GROUP_UNKNOWN >&2; exit 80 ;; esac"
+        )
+        .to_string()
+    }
+
+    fn retire_confirmed_process_windows(&self, retire_watchdog: bool) -> String {
+        let watchdog_retirement = if retire_watchdog {
+            "tmux kill-window -t \"$session:$watchdog_window\" 2>/dev/null || true\n"
+        } else {
+            ""
+        };
+        format!(
+            concat!(
+                "if [ \"$window_exists\" -eq 1 ]; then tmux kill-window -t \"$current_window_id\" 2>/dev/null || true; fi\n",
+                "if tmux list-windows -t \"$session\" -F '#{{window_name}}' 2>/dev/null | grep -Fqx \"$window\"; then echo AGENTAPP_TMUX_TERMINATION_UNCONFIRMED >&2; exit 78; fi\n",
+                "{watchdog_retirement}",
+                "tmux kill-window -t \"$session:__agentapp_keeper\" 2>/dev/null || true"
+            ),
+            watchdog_retirement = watchdog_retirement,
+        )
     }
 
     fn ownership_check(&self) -> String {
@@ -2466,7 +2759,7 @@ fn stale_running_recovery_loss_fragment(agent_id: &str, process_id: &str) -> Str
             "$expected_stale_claim\n",
             "AGENTAPP_STALE_CLAIM_EOF\n",
             "        IFS=$old_ifs\n",
-            "        case \"$claim_kind\" in recovery|bootstrap|interrupt|termination) ;; *) echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79 ;; esac\n",
+            "        case \"$claim_kind\" in recovery|bootstrap|interrupt|termination|expiry) ;; *) echo AGENTAPP_TMUX_TRANSITION_BUSY >&2; exit 79 ;; esac\n",
             "        case \"$claim_nonce\" in ''|*[!0-9a-zA-Z_.-]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
             "        case \"$claim_operation_pid:$claim_operation_pgid\" in *[!0-9:]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
             "        claim_generation=${{claim_controller%%:*}}; claim_controller_id=${{claim_controller#*:}}\n",
@@ -2557,6 +2850,7 @@ fn stale_running_recovery_loss_fragment(agent_id: &str, process_id: &str) -> Str
             "        completed:*[!0-9]*|completed:) terminal_state=recovery-lost; terminal_status=125 ;;\n",
             "        completed:*) terminal_state=completed; terminal_status=$stale_terminal_status ;;\n",
             "        terminated:143) terminal_state=terminated; terminal_status=143 ;;\n",
+            "        expired:|expired:124) terminal_state=expired; terminal_status=124 ;;\n",
             "        recovery-lost:|recovery-lost:125) terminal_state=recovery-lost; terminal_status=125 ;;\n",
             "        launch-interrupted:125) terminal_state=launch-interrupted; terminal_status=125 ;;\n",
             "        :|terminated:) terminal_state=recovery-lost; terminal_status=125 ;;\n",
@@ -2572,6 +2866,7 @@ fn stale_running_recovery_loss_fragment(agent_id: &str, process_id: &str) -> Str
             "      fi\n",
             "      agentapp_require_stale_claim\n",
             "      [ -e \"$root/output\" ] || : > \"$root/output\"\n",
+            "      if [ \"$terminal_state\" = expired ] && [ \"$(cat \"$root/tty\" 2>/dev/null || true)\" != 1 ] && [ ! -f \"$root/output-closed\" ]; then : > \"$root/output-closed.tmp\"; mv \"$root/output-closed.tmp\" \"$root/output-closed\"; fi\n",
             "      agentapp_wait_for_output_drain\n",
             "      agentapp_require_stale_claim\n",
             "      if [ -e \"$root/status\" ]; then\n",
@@ -2687,22 +2982,23 @@ fn exact_reconciliation_command(agent_key: &str, request: &ReconciliationRequest
                 "{prepared_rollback}",
                 "{stale_running_recovery_loss}",
                 "  state=$(cat \"$root/state\" 2>/dev/null || true)\n",
-                "  case \"$state\" in completed|terminated|recovery-lost|launch-interrupted) agentapp_wait_for_output_drain ;; esac\n",
+                "  case \"$state\" in completed|terminated|expired|recovery-lost|launch-interrupted) agentapp_wait_for_output_drain ;; esac\n",
                 "  cursor=$(wc -c < \"$root/output\" 2>/dev/null || printf '0'); cursor=$(printf '%s' \"$cursor\" | tr -d ' ')\n",
                 "  state=$(cat \"$root/state\" 2>/dev/null || true)\n",
                 "  delivery_unknown=0\n",
                 "  terminal_verified_dead=0\n",
                 "  code=$(cat \"$root/status\" 2>/dev/null || printf '-')\n",
-                "  case \"$state\" in completed) recovered=completed ;; terminated) recovered=terminated ;; recovery-lost) recovered=recovery-lost ;; launch-interrupted) recovered=launch-interrupted ;; running) if [ -e \"$root/go\" ]; then recovered=running; else recovered=unknown; fi ;; prepared) if [ -e \"$root/go\" ]; then recovered=running; else recovered=prepared; fi ;; *) recovered=unknown ;; esac\n",
-                "  if [ \"$recovered\" = completed ] || [ \"$recovered\" = terminated ] || [ \"$recovered\" = recovery-lost ] || [ \"$recovered\" = launch-interrupted ]; then\n",
+                "  case \"$state\" in completed) recovered=completed ;; terminated) recovered=terminated ;; expired) recovered=expired ;; recovery-lost) recovered=recovery-lost ;; launch-interrupted) recovered=launch-interrupted ;; running) if [ -e \"$root/go\" ]; then recovered=running; else recovered=unknown; fi ;; prepared) if [ -e \"$root/go\" ]; then recovered=running; else recovered=prepared; fi ;; *) recovered=unknown ;; esac\n",
+                "  if [ \"$recovered\" = completed ] || [ \"$recovered\" = terminated ] || [ \"$recovered\" = expired ] || [ \"$recovered\" = recovery-lost ] || [ \"$recovered\" = launch-interrupted ]; then\n",
                 "    process_identity=$(cat \"$root/process-identity\" 2>/dev/null || true)\n",
                 "    pane_pid=${{process_identity%%:*}}; pgid=${{process_identity#*:}}\n",
                 "    window=$(cat \"$root/window\" 2>/dev/null || true); expected_window=p_{process_id}\n",
                 "    claim_kind=$(cat \"$root/terminal-claim/kind\" 2>/dev/null || true)\n",
                 "    identity_valid=1\n",
                 "    [ \"$window\" = \"$expected_window\" ] || identity_valid=0\n",
-                "    case \"$recovered:$claim_kind\" in completed:completed|terminated:terminated|recovery-lost:recovery-lost|launch-interrupted:launch-interrupted) ;; *) identity_valid=0 ;; esac\n",
+                "    case \"$recovered:$claim_kind\" in completed:completed|terminated:terminated|expired:expired|recovery-lost:recovery-lost|launch-interrupted:launch-interrupted) ;; *) identity_valid=0 ;; esac\n",
                 "    if [ \"$recovered\" = completed ]; then case \"$code\" in ''|*[!0-9-]*) identity_valid=0 ;; esac; fi\n",
+                "    if [ \"$recovered\" = expired ] && [ \"$code\" != 124 ]; then identity_valid=0; fi\n",
                 "    if [ \"$recovered\" = launch-interrupted ] && [ ! -e \"$root/go\" ]; then\n",
                 "      if [ -z \"$process_identity\" ]; then pane_pid=-; pgid=-; else case \"$process_identity\" in *:*:*) identity_valid=0 ;; esac; case \"$pane_pid\" in ''|*[!0-9]*) identity_valid=0 ;; esac; case \"$pgid\" in ''|*[!0-9]*) identity_valid=0 ;; esac; [ \"$pane_pid:$pgid\" = \"$process_identity\" ] || identity_valid=0; fi\n",
                 "    else\n",
@@ -2785,6 +3081,7 @@ fn acknowledgement_keys(acknowledgement: &RecoveredExecutionAcknowledgement) -> 
                     RecoveredExecutionStatus::Terminated => {
                         ("terminated".to_string(), "143".to_string())
                     }
+                    RecoveredExecutionStatus::Expired => ("expired".to_string(), "124".to_string()),
                     RecoveredExecutionStatus::RecoveryLost => {
                         ("recovery-lost".to_string(), "125".to_string())
                     }
@@ -2850,6 +3147,7 @@ fn acknowledgement_command(
                 RecoveredExecutionStatus::Terminated => {
                     ("terminated".to_string(), "143".to_string())
                 }
+                RecoveredExecutionStatus::Expired => ("expired".to_string(), "124".to_string()),
                 RecoveredExecutionStatus::RecoveryLost => {
                     ("recovery-lost".to_string(), "125".to_string())
                 }
@@ -2892,7 +3190,7 @@ fn acknowledgement_command(
             "[ \"$expected_output_sha256\" != - ] || {{ echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78; }}\n",
             "[ \"${{#expected_output_sha256}}\" -eq 64 ] || {{ echo AGENTAPP_TMUX_ACK_PROOF_MALFORMED >&2; exit 78; }}\n",
             "case \"$expected_output_sha256\" in *[!0-9a-f]*) echo AGENTAPP_TMUX_ACK_PROOF_MALFORMED >&2; exit 78 ;; esac\n",
-            "case \"$expected_terminal_state\" in completed|terminated|recovery-lost|launch-interrupted) ;; *) echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78 ;; esac\n",
+            "case \"$expected_terminal_state\" in completed|terminated|expired|recovery-lost|launch-interrupted) ;; *) echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78 ;; esac\n",
             "case \"$expected_exit_code\" in ''|*[!0-9-]*) echo AGENTAPP_TMUX_ACK_PROOF_MISSING >&2; exit 78 ;; *) ;; esac\n",
             "process_id=${{token%%-*}}\n",
             "case \"$process_id\" in ''|*[!0-9a-f]*) echo AGENTAPP_TMUX_ACK_BAD_TOKEN >&2; exit 78 ;; esac\n",
@@ -2920,7 +3218,7 @@ fn acknowledgement_command(
             "  for entry in \"$root\"/* \"$root\"/.[!.]* \"$root\"/..?*; do\n",
             "    {{ [ -e \"$entry\" ] || [ -L \"$entry\" ]; }} || continue\n",
             "    name=${{entry##*/}}\n",
-            "    case \"$name\" in output-closed) [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78; }} ;; output-closed.*) output_receipt_generation=${{name#output-closed.}}; case \"$output_receipt_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78 ;; esac; [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78; }} ;; command.sh|payload.sh|sentinel.sh|watchdog.sh|output|output-pipe-generation|output-pipe-generation.tmp|stdin|go|go.tmp|supervisor-ready|supervisor-ready.tmp|payload-go|payload-go.tmp|payload-ready|payload-ready.tmp|payload-identity|payload-identity.tmp|sentinel-release|sentinel-release.tmp|sentinel-ready|sentinel-ready.tmp|sentinel-identity|sentinel-identity.tmp|release|status|status.tmp|state|state.tmp|owner|identity|thread-id|turn-id|call-id|attempt-generation|session-id|session|tty|acknowledgement-token|digest|window|window-id|window-id.tmp|pane-id|pane-id.tmp|pane-death-status|pane-death-status.tmp|process-identity|process-identity.tmp|controller|controller.tmp|lease|lease.tmp|lease-generation|lease-generation.tmp|recovery-required|recovery-required.tmp|transition-claim|terminal-claim|.transition-candidate.*|transition-claim.quarantine.*) ;; stdin-write-*.claim|stdin-write-*.result|.stdin-write-*) [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_STDIN_ENTRY >&2; exit 78; }} ;; proof-key|.proof-candidate.*) [ \"$root\" = \"$legacy_tombstone\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78; }} ;; *) echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78 ;; esac\n",
+            "    case \"$name\" in output-closed) [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78; }} ;; output-closed.*) output_receipt_generation=${{name#output-closed.}}; case \"$output_receipt_generation\" in ''|*[!0-9]*) echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78 ;; esac; [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_OUTPUT_RECEIPT >&2; exit 78; }} ;; command.sh|payload.sh|sentinel.sh|watchdog.sh|expiry.sh|terminal-cleanup.sh|output|output-pipe-generation|output-pipe-generation.tmp|stdin|go|go.tmp|supervisor-ready|supervisor-ready.tmp|payload-go|payload-go.tmp|payload-ready|payload-ready.tmp|payload-identity|payload-identity.tmp|sentinel-release|sentinel-release.tmp|sentinel-ready|sentinel-ready.tmp|sentinel-identity|sentinel-identity.tmp|release|status|status.tmp|state|state.tmp|owner|identity|thread-id|turn-id|call-id|attempt-generation|session-id|session|tty|acknowledgement-token|digest|window|window-id|window-id.tmp|pane-id|pane-id.tmp|pane-death-status|pane-death-status.tmp|process-identity|process-identity.tmp|controller|controller.tmp|lease|lease.tmp|lease-generation|lease-generation.tmp|created-at|recovery-required|recovery-required.tmp|transition-claim|terminal-claim|.transition-candidate.*|transition-claim.quarantine.*) ;; stdin-write-*.claim|stdin-write-*.result|.stdin-write-*) [ -f \"$entry\" ] && [ ! -L \"$entry\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_STDIN_ENTRY >&2; exit 78; }} ;; proof-key|.proof-candidate.*) [ \"$root\" = \"$legacy_tombstone\" ] || {{ echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78; }} ;; *) echo AGENTAPP_TMUX_ACK_UNEXPECTED_ENTRY >&2; exit 78 ;; esac\n",
             "  done\n",
             "  if [ -d \"$root/terminal-claim\" ]; then\n",
             "    for terminal_entry in \"$root/terminal-claim\"/* \"$root/terminal-claim\"/.[!.]* \"$root/terminal-claim\"/..?*; do\n",
@@ -2936,7 +3234,7 @@ fn acknowledgement_command(
             "}}\n",
             "agentapp_cleanup_ack_tombstone() {{\n",
             "  agentapp_ack_preflight_root\n",
-            "  rm -f \"$root/command.sh\" \"$root/payload.sh\" \"$root/sentinel.sh\" \"$root/watchdog.sh\" \"$root/output\" \"$root/output-closed\" \"$root/output-pipe-generation\" \"$root/output-pipe-generation.tmp\" \"$root/stdin\" \"$root/go\" \"$root/go.tmp\" \"$root/supervisor-ready\" \"$root/supervisor-ready.tmp\" \"$root/payload-go\" \"$root/payload-go.tmp\" \"$root/payload-ready\" \"$root/payload-ready.tmp\" \"$root/payload-identity\" \"$root/payload-identity.tmp\" \"$root/sentinel-release\" \"$root/sentinel-release.tmp\" \"$root/sentinel-ready\" \"$root/sentinel-ready.tmp\" \"$root/sentinel-identity\" \"$root/sentinel-identity.tmp\" \"$root/release\" \"$root/status\" \"$root/status.tmp\" \"$root/state\" \"$root/state.tmp\" \"$root/owner\" \"$root/identity\" \"$root/thread-id\" \"$root/turn-id\" \"$root/call-id\" \"$root/attempt-generation\" \"$root/session-id\" \"$root/tty\" \"$root/acknowledgement-token\" \"$root/digest\" \"$root/window\" \"$root/window-id\" \"$root/window-id.tmp\" \"$root/pane-id\" \"$root/pane-id.tmp\" \"$root/pane-death-status\" \"$root/pane-death-status.tmp\" \"$root/process-identity\" \"$root/process-identity.tmp\" \"$root/controller\" \"$root/controller.tmp\" \"$root/lease\" \"$root/lease.tmp\" \"$root/lease-generation\" \"$root/lease-generation.tmp\" \"$root/recovery-required\" \"$root/recovery-required.tmp\" \"$root/terminal-claim/kind\"\n",
+            "  rm -f \"$root/command.sh\" \"$root/payload.sh\" \"$root/sentinel.sh\" \"$root/watchdog.sh\" \"$root/expiry.sh\" \"$root/terminal-cleanup.sh\" \"$root/output\" \"$root/output-closed\" \"$root/output-pipe-generation\" \"$root/output-pipe-generation.tmp\" \"$root/stdin\" \"$root/go\" \"$root/go.tmp\" \"$root/supervisor-ready\" \"$root/supervisor-ready.tmp\" \"$root/payload-go\" \"$root/payload-go.tmp\" \"$root/payload-ready\" \"$root/payload-ready.tmp\" \"$root/payload-identity\" \"$root/payload-identity.tmp\" \"$root/sentinel-release\" \"$root/sentinel-release.tmp\" \"$root/sentinel-ready\" \"$root/sentinel-ready.tmp\" \"$root/sentinel-identity\" \"$root/sentinel-identity.tmp\" \"$root/release\" \"$root/status\" \"$root/status.tmp\" \"$root/state\" \"$root/state.tmp\" \"$root/owner\" \"$root/identity\" \"$root/thread-id\" \"$root/turn-id\" \"$root/call-id\" \"$root/attempt-generation\" \"$root/session-id\" \"$root/tty\" \"$root/acknowledgement-token\" \"$root/digest\" \"$root/window\" \"$root/window-id\" \"$root/window-id.tmp\" \"$root/pane-id\" \"$root/pane-id.tmp\" \"$root/pane-death-status\" \"$root/pane-death-status.tmp\" \"$root/process-identity\" \"$root/process-identity.tmp\" \"$root/controller\" \"$root/controller.tmp\" \"$root/lease\" \"$root/lease.tmp\" \"$root/lease-generation\" \"$root/lease-generation.tmp\" \"$root/created-at\" \"$root/recovery-required\" \"$root/recovery-required.tmp\" \"$root/terminal-claim/kind\"\n",
             "  rm -f \"$root/session\"\n",
             "  for output_receipt in \"$root\"/output-closed.*; do\n",
             "    {{ [ -e \"$output_receipt\" ] || [ -L \"$output_receipt\" ]; }} || continue\n",
@@ -2988,7 +3286,7 @@ fn acknowledgement_command(
             "  [ \"$(cat \"$root/acknowledgement-token\" 2>/dev/null || true)\" = \"$token\" ] || {{ echo AGENTAPP_TMUX_ACK_CHANGED >&2; exit 78; }}\n",
             "  [ \"$(cat \"$root/owner\" 2>/dev/null || true)\" = {owner} ] || {{ echo AGENTAPP_TMUX_ACK_UNOWNED >&2; exit 78; }}\n",
             "  state=$(cat \"$root/state\" 2>/dev/null || true)\n",
-            "  case \"$state\" in completed|terminated|recovery-lost|launch-interrupted) ;; *) echo AGENTAPP_TMUX_ACK_NONTERMINAL >&2; exit 78 ;; esac\n",
+            "  case \"$state\" in completed|terminated|expired|recovery-lost|launch-interrupted) ;; *) echo AGENTAPP_TMUX_ACK_NONTERMINAL >&2; exit 78 ;; esac\n",
             "  [ \"$state\" = \"$expected_terminal_state\" ] || {{ echo AGENTAPP_TMUX_ACK_TERMINAL_STATUS_CHANGED >&2; exit 78; }}\n",
             "  code=$(cat \"$root/status\" 2>/dev/null || printf '-')\n",
             "  [ \"$code\" = \"$expected_exit_code\" ] || {{ echo AGENTAPP_TMUX_ACK_EXIT_STATUS_CHANGED >&2; exit 78; }}\n",
@@ -3025,7 +3323,7 @@ fn acknowledgement_command(
             "$existing_claim\n",
             "AGENTAPP_TRANSITION_EOF\n",
             "  IFS=$old_ifs\n",
-            "  case \"$claim_kind\" in bootstrap|recovery|termination|adoption|acknowledgement) ;; *) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
+            "  case \"$claim_kind\" in bootstrap|recovery|termination|expiry|adoption|acknowledgement) ;; *) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
             "  case \"$claim_nonce\" in ''|*[!0-9a-zA-Z_.-]*) echo AGENTAPP_TMUX_TRANSITION_CLAIM_MALFORMED >&2; exit 80 ;; esac\n",
             "  claim_generation=${{claim_controller%%:*}}\n",
             "  claim_controller_id=${{claim_controller#*:}}\n",
@@ -3215,6 +3513,7 @@ fn parse_recovered_executions(output: &[u8]) -> Result<Vec<RecoveredExecution>, 
                     })?)
                 }
                 "terminated" => RecoveredExecutionStatus::Terminated,
+                "expired" => RecoveredExecutionStatus::Expired,
                 "recovery-lost" => RecoveredExecutionStatus::RecoveryLost,
                 "unknown" => RecoveredExecutionStatus::Unknown,
                 _ => {

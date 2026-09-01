@@ -2287,6 +2287,7 @@ fn recovered_executions_wait_only_for_terminal_proof(
         match execution.status {
             codex_exec_server::RecoveredExecutionStatus::Exited(_)
             | codex_exec_server::RecoveredExecutionStatus::Terminated
+            | codex_exec_server::RecoveredExecutionStatus::Expired
             | codex_exec_server::RecoveredExecutionStatus::RecoveryLost
             | codex_exec_server::RecoveredExecutionStatus::LaunchInterrupted => {
                 proof_is_pending |= !execution.terminal_verified_dead;
@@ -3324,6 +3325,9 @@ impl Session {
                             RemoteExecutionTerminalStatus::Terminated => {
                                 codex_exec_server::RecoveredExecutionStatus::Terminated
                             }
+                            RemoteExecutionTerminalStatus::Expired => {
+                                codex_exec_server::RecoveredExecutionStatus::Expired
+                            }
                             RemoteExecutionTerminalStatus::RecoveryLost => {
                                 codex_exec_server::RecoveredExecutionStatus::RecoveryLost
                             }
@@ -3624,6 +3628,7 @@ impl Session {
                     }
                     codex_exec_server::RecoveredExecutionStatus::Exited(_)
                     | codex_exec_server::RecoveredExecutionStatus::Terminated
+                    | codex_exec_server::RecoveredExecutionStatus::Expired
                     | codex_exec_server::RecoveredExecutionStatus::RecoveryLost => {
                         if !execution.terminal_verified_dead {
                             return Err(CodexErr::Fatal(format!(
@@ -4082,6 +4087,7 @@ impl Session {
             }
             codex_exec_server::RecoveredExecutionStatus::Exited(_)
             | codex_exec_server::RecoveredExecutionStatus::Terminated
+            | codex_exec_server::RecoveredExecutionStatus::Expired
             | codex_exec_server::RecoveredExecutionStatus::RecoveryLost => {}
             _ => {
                 return Err(CodexErr::Fatal(format!(
@@ -4126,6 +4132,7 @@ impl Session {
         let observed_exit_code = match &execution.status {
             codex_exec_server::RecoveredExecutionStatus::Exited(exit_code) => *exit_code,
             codex_exec_server::RecoveredExecutionStatus::Terminated => 143,
+            codex_exec_server::RecoveredExecutionStatus::Expired => 124,
             codex_exec_server::RecoveredExecutionStatus::RecoveryLost => 125,
             _ => {
                 return Err(CodexErr::Fatal(format!(
@@ -4176,6 +4183,9 @@ impl Session {
             RemoteExecutionTerminalStatus::Terminated => {
                 "Process was terminated during SSH lifecycle recovery; stdin delivery is unknown"
                     .to_string()
+            }
+            RemoteExecutionTerminalStatus::Expired => {
+                codex_exec_server::EXECUTION_EXPIRY_SYSTEM_NOTICE.to_string()
             }
             RemoteExecutionTerminalStatus::RecoveryLost => {
                 "The exact remote process ended during SSH lifecycle recovery, but its exit or signal result and stdin delivery are unknown"
@@ -5121,6 +5131,9 @@ impl Session {
                 if observed_exit_code == 143 =>
             {
                 Some(RemoteExecutionTerminalStatus::Terminated)
+            }
+            codex_exec_server::RecoveredExecutionStatus::Expired if observed_exit_code == 124 => {
+                Some(RemoteExecutionTerminalStatus::Expired)
             }
             codex_exec_server::RecoveredExecutionStatus::RecoveryLost
                 if observed_exit_code == 125 =>

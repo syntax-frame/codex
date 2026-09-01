@@ -164,11 +164,16 @@ pub enum RecoveredExecutionStatus {
     Running,
     Exited(i32),
     Terminated,
+    /// The execution reached the durable maximum lifetime and was closed
+    /// after exact process, output, and terminal-state proof.
+    Expired,
     /// Exact ownership and death were proven, but no trustworthy natural
     /// exit or delivered-signal status survived on the remote host.
     RecoveryLost,
     Unknown,
 }
+
+pub const EXECUTION_EXPIRY_SYSTEM_NOTICE: &str = "System notice: This execution reached its 24-hour limit and was safely closed. Start the task again if it is still needed; a fresh execution environment will be created automatically.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncompleteExecution {
@@ -300,28 +305,29 @@ pub fn select_execution_generation(
         (Prepared | Running, _) => {
             Err("generation zero is live while generation one exists".to_string())
         }
-        (Exited(_) | Terminated | RecoveryLost | LaunchInterrupted, Missing)
+        (Exited(_) | Terminated | Expired | RecoveryLost | LaunchInterrupted, Missing)
             if generation_zero.terminal_verified_dead =>
         {
             Ok(GenerationSelection::Selected(0))
         }
-        (Exited(_) | Terminated | RecoveryLost | LaunchInterrupted, Missing) => {
+        (Exited(_) | Terminated | Expired | RecoveryLost | LaunchInterrupted, Missing) => {
             Ok(GenerationSelection::NeedsTerminalVerification(0))
         }
-        (Exited(_) | Terminated | RecoveryLost | LaunchInterrupted, _)
+        (Exited(_) | Terminated | Expired | RecoveryLost | LaunchInterrupted, _)
             if !generation_zero.terminal_verified_dead =>
         {
             Ok(GenerationSelection::NeedsTerminalVerification(0))
         }
         (
-            Exited(_) | Terminated | RecoveryLost | LaunchInterrupted,
-            Exited(_) | Terminated | RecoveryLost | LaunchInterrupted,
+            Exited(_) | Terminated | Expired | RecoveryLost | LaunchInterrupted,
+            Exited(_) | Terminated | Expired | RecoveryLost | LaunchInterrupted,
         ) if !generation_one.terminal_verified_dead => {
             Ok(GenerationSelection::NeedsTerminalVerification(1))
         }
         (
-            Exited(_) | Terminated | RecoveryLost | LaunchInterrupted,
-            Prepared | Running | Exited(_) | Terminated | RecoveryLost | LaunchInterrupted,
+            Exited(_) | Terminated | Expired | RecoveryLost | LaunchInterrupted,
+            Prepared | Running | Exited(_) | Terminated | Expired | RecoveryLost
+            | LaunchInterrupted,
         ) if generation_one.terminal_verified_dead
             || matches!(generation_one.status, Prepared | Running) =>
         {

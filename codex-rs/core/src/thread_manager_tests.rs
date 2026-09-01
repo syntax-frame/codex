@@ -2150,6 +2150,66 @@ fn recovered_output_is_truthful_and_preserves_exact_bytes() {
 }
 
 #[test]
+fn recovered_expiry_output_is_transport_neutral_and_system_like() {
+    let execution = codex_exec_server::RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: String::new(),
+            call_id: "call-expired".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: None,
+        output: b"captured output\n".to_vec(),
+        status: codex_exec_server::RecoveredExecutionStatus::Expired,
+        terminal_verified_dead: true,
+        session_id: Some(44),
+        committed_output_cursor: 16,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "0123456789abcdef-expired".to_string(),
+        ),
+    };
+
+    let output = format_recovered_execution_output(&execution);
+
+    assert_eq!(
+        output,
+        "System notice: This execution reached its 24-hour limit and was safely closed. Start the task again if it is still needed; a fresh execution environment will be created automatically.\n\
+         Output:\ncaptured output\n"
+    );
+    assert!(!output.to_ascii_lowercase().contains("ssh"));
+    assert!(!output.to_ascii_lowercase().contains("tmux"));
+}
+
+#[test]
+fn recovered_expiry_does_not_duplicate_an_already_persisted_notice() {
+    let notice = codex_exec_server::EXECUTION_EXPIRY_SYSTEM_NOTICE;
+    let execution = codex_exec_server::RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: ThreadId::new().to_string(),
+            turn_id: String::new(),
+            call_id: "call-expired-with-notice".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: None,
+        output: format!("captured output\n\n{notice}\n").into_bytes(),
+        status: codex_exec_server::RecoveredExecutionStatus::Expired,
+        terminal_verified_dead: true,
+        session_id: Some(45),
+        committed_output_cursor: 0,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "0123456789abcdef-expired-notice".to_string(),
+        ),
+    };
+
+    let output = format_recovered_execution_output(&execution);
+
+    assert_eq!(output.matches(notice).count(), 1);
+    assert_eq!(output, format!("Output:\ncaptured output\n\n{notice}\n"));
+}
+
+#[test]
 fn recovered_output_names_unrecoverable_terminal_result_truthfully() {
     let execution = codex_exec_server::RecoveredExecution {
         identity: codex_exec_server::ExecutionIdentity {

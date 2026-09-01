@@ -32,6 +32,7 @@ use codex_code_mode::InProcessCodeModeSessionProvider;
 #[cfg(feature = "code-mode")]
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_core_plugins::PluginsManager;
+use codex_exec_server::EXECUTION_EXPIRY_SYSTEM_NOTICE;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecProcessEvent;
 use codex_exec_server::GenerationSelection;
@@ -2704,6 +2705,9 @@ async fn reconcile_adopted_running_execution(
     ) || matches!(
         &verified.status,
         RecoveredExecutionStatus::Terminated if exit_code == 143
+    ) || matches!(
+        &verified.status,
+        RecoveredExecutionStatus::Expired if exit_code == 124
     );
     if verified.identity != execution.identity
         || !terminal_matches
@@ -2837,6 +2841,7 @@ async fn append_recovered_execution_outputs_to_rollout(
             }
             RecoveredExecutionStatus::Exited(_)
             | RecoveredExecutionStatus::Terminated
+            | RecoveredExecutionStatus::Expired
             | RecoveredExecutionStatus::RecoveryLost => {}
         }
         if acknowledge_after_repair {
@@ -2863,6 +2868,7 @@ fn terminal_acknowledgement_for_recovered_execution(
     let status = match execution.status {
         RecoveredExecutionStatus::Exited(exit_code) => RecoveredExecutionStatus::Exited(exit_code),
         RecoveredExecutionStatus::Terminated => RecoveredExecutionStatus::Terminated,
+        RecoveredExecutionStatus::Expired => RecoveredExecutionStatus::Expired,
         RecoveredExecutionStatus::RecoveryLost => RecoveredExecutionStatus::RecoveryLost,
         RecoveredExecutionStatus::LaunchInterrupted => RecoveredExecutionStatus::LaunchInterrupted,
         _ => {
@@ -3072,6 +3078,7 @@ fn format_recovered_execution_output(execution: &RecoveredExecution) -> String {
                 "Process was terminated during SSH lifecycle recovery".to_string()
             }
         }
+        RecoveredExecutionStatus::Expired => EXECUTION_EXPIRY_SYSTEM_NOTICE.to_string(),
         RecoveredExecutionStatus::RecoveryLost => {
             "The exact remote process ended, but its exit or signal result was not recoverable"
                 .to_string()
@@ -3085,6 +3092,11 @@ fn format_recovered_execution_output(execution: &RecoveredExecution) -> String {
             base64::engine::general_purpose::STANDARD.encode(&execution.output)
         ),
     };
+    if matches!(execution.status, RecoveredExecutionStatus::Expired)
+        && output.ends_with(&format!("\n{EXECUTION_EXPIRY_SYSTEM_NOTICE}\n"))
+    {
+        return format!("Output:\n{output}");
+    }
     format!("{terminal}\nOutput:\n{output}")
 }
 

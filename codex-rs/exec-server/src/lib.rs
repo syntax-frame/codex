@@ -105,6 +105,7 @@ pub use noise_channel::NoiseChannelError;
 pub use noise_channel::NoiseChannelIdentity;
 pub use noise_channel::NoiseChannelPublicKey;
 pub use process::AdoptionRequest;
+pub use process::EXECUTION_EXPIRY_SYSTEM_NOTICE;
 pub use process::ExecBackend;
 pub use process::ExecBackendAcknowledgeFuture;
 pub use process::ExecBackendFuture;

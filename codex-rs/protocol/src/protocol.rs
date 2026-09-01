@@ -3346,6 +3346,7 @@ pub enum RemoteExecutionRejectionReason {
 pub enum RemoteExecutionTerminalStatus {
     Exited(i32),
     Terminated,
+    Expired,
     /// The exact remote process and command window are gone, but the host did
     /// not durably record a trustworthy command exit or signal outcome.
     RecoveryLost,

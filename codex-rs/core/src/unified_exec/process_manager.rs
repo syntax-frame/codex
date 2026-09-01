@@ -507,6 +507,7 @@ impl UnifiedExecProcessManager {
         let exit_code = match &recovered.status {
             codex_exec_server::RecoveredExecutionStatus::Exited(exit_code) => *exit_code,
             codex_exec_server::RecoveredExecutionStatus::Terminated => 143,
+            codex_exec_server::RecoveredExecutionStatus::Expired => 124,
             codex_exec_server::RecoveredExecutionStatus::RecoveryLost => 125,
             _ => {
                 return Err(UnifiedExecError::create_process(format!(

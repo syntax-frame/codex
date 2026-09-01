@@ -15,6 +15,7 @@ use super::shell_quote;
 use super::stable_identifier;
 use super::validate_reconciliation_request;
 use crate::AdoptionRequest;
+use crate::EXECUTION_EXPIRY_SYSTEM_NOTICE;
 use crate::GenerationSelection;
 use crate::IncompleteExecution;
 use crate::PreparedExecution;
@@ -336,7 +337,10 @@ fn bootstrap_compare_and_attach_is_exact_and_generation_fenced() {
     assert!(command.contains("controller-$candidate_controller"));
     assert!(command.contains("agentapp-tmux-v2"));
     assert!(command.contains("watchdog.sh"));
+    assert!(command.contains("expiry.sh"));
+    assert!(command.contains("terminal-cleanup.sh"));
     assert!(command.contains("printf '%s\\n' \"$session\" > \"$staging/session\""));
+    assert!(command.contains("printf '%s\\n' \"$created_at\" > \"$staging/created-at\""));
     assert!(command.contains("AGENTAPP_TMUX_RESOURCE_EXHAUSTED"));
     assert!(command.contains("fork failed: Device not configured"));
     assert!(command.contains("ulimit -S -n \"$desired\""));
@@ -359,6 +363,57 @@ fn bootstrap_compare_and_attach_is_exact_and_generation_fenced() {
         .expect("keeper retirement");
     assert!(command_release < keeper_release);
     assert!(keeper_release < keeper_retirement);
+}
+
+#[test]
+fn durable_expiry_is_fenced_and_uses_a_transport_neutral_notice() {
+    let params = exec_params("process", "sleep 30");
+    let descriptor = TmuxProcessDescriptor::new("agent", "controller", &params);
+    let expiry = descriptor.expiry_script();
+    let terminal_cleanup = descriptor.terminal_cleanup_script();
+    let watchdog = descriptor.watchdog_script();
+
+    assert!(expiry.contains("max_lifetime=86400"));
+    assert!(expiry.contains("created-at"));
+    assert!(expiry.contains("[ \"$session\" = \"$default_session\" ] || exit 0"));
+    assert!(expiry.contains("transition-claim"));
+    assert!(expiry.contains("terminal-claim"));
+    assert!(expiry.contains("printf '124\\n'"));
+    assert!(expiry.contains("printf 'expired\\n'"));
+    assert!(expiry.contains(EXECUTION_EXPIRY_SYSTEM_NOTICE));
+    assert!(expiry.contains("output-closed"));
+    assert!(expiry.contains("agentapp_termination_stop_payload"));
+    let expiry_pipe_close = expiry
+        .find("tmux pipe-pane -t \"$current_pane_id\"")
+        .expect("expiry closes the exact TTY pipe");
+    let expiry_receipt_wait = expiry
+        .rfind("agentapp_wait_for_output_drain")
+        .expect("expiry waits for output closure");
+    assert!(expiry_pipe_close < expiry_receipt_wait);
+    let cleanup_pipe_close = terminal_cleanup
+        .find("tmux pipe-pane -t \"$current_pane_id\"")
+        .expect("terminal cleanup closes the exact TTY pipe");
+    let cleanup_receipt_wait = terminal_cleanup
+        .rfind("agentapp_wait_for_output_drain")
+        .expect("terminal cleanup waits for output closure");
+    assert!(cleanup_pipe_close < cleanup_receipt_wait);
+    assert!(!expiry.contains("rm -rf"));
+    assert!(!expiry.contains("kill-session"));
+    assert!(watchdog.contains("/bin/sh \"$root/expiry.sh\""));
+    assert!(watchdog.contains("/bin/sh \"$root/terminal-cleanup.sh\""));
+    assert!(
+        expiry.find("printf 'expired\\n'").expect("terminal state")
+            < expiry
+                .find("tmux kill-window -t \"$current_window_id\"")
+                .expect("command retirement")
+    );
+    assert_eq!(
+        EXECUTION_EXPIRY_SYSTEM_NOTICE,
+        "System notice: This execution reached its 24-hour limit and was safely closed. Start the task again if it is still needed; a fresh execution environment will be created automatically."
+    );
+    let notice = EXECUTION_EXPIRY_SYSTEM_NOTICE.to_ascii_lowercase();
+    assert!(!notice.contains("ssh"));
+    assert!(!notice.contains("tmux"));
 }
 
 #[test]
@@ -2252,6 +2307,17 @@ fn acknowledgement_resolves_one_descriptor_without_scanning() {
     );
     assert!(terminated_command.contains("expected_terminal_state='terminated'"));
     assert!(terminated_command.contains("expected_exit_code='143'"));
+    let expired_command = acknowledgement_command(
+        "agent",
+        &terminal_acknowledgement_with_status(
+            format!("{process_id}-deadbeef"),
+            RecoveredExecutionStatus::Expired,
+        ),
+    );
+    assert!(expired_command.contains("expected_terminal_state='expired'"));
+    assert!(expired_command.contains("expected_exit_code='124'"));
+    assert!(expired_command.contains("created-at"));
+    assert!(expired_command.contains("expiry.sh"));
     let launch_interrupted_command = acknowledgement_command(
         "agent",
         &terminal_acknowledgement_with_status(
@@ -3219,6 +3285,206 @@ fn real_tmux_terminal_cleanup_retires_only_its_execution_session() {
             .status
             .success(),
         "new executions unexpectedly created a legacy agent-lifetime session"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_short_durable_expiry_closes_the_exact_execution_and_retains_proof() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62601", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "expiry-controller", &params);
+    let bootstrap = descriptor
+        .bootstrap_command(&params)
+        .replacen("max_lifetime=86400", "max_lifetime=1", 1)
+        .replacen("sleep 5\ndone", "sleep 1\ndone", 1);
+    assert_ne!(bootstrap, descriptor.bootstrap_command(&params));
+    let started = fixture.run_shell(bootstrap);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    apply_ready_protocol(&mut descriptor, &started.stdout);
+    let root = fixture.descriptor_root(&descriptor);
+
+    assert!(
+        wait_for_file_value(&root.join("status"), "124\n"),
+        "expiry did not record its terminal status; state={:?}; claim={:?}",
+        fs::read_to_string(root.join("state")),
+        fs::read_to_string(root.join("terminal-claim/kind"))
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("expiry terminal state"),
+        "expired\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("terminal-claim/kind")).expect("expiry terminal claim"),
+        "expired\n"
+    );
+    assert!(
+        root.join("output-closed").is_file(),
+        "expiry did not close the durable output stream"
+    );
+    let expired_output = fs::read_to_string(root.join("output")).expect("expiry output");
+    assert_eq!(
+        expired_output
+            .matches(EXECUTION_EXPIRY_SYSTEM_NOTICE)
+            .count(),
+        1,
+        "expiry notice must be delivered exactly once: {expired_output:?}"
+    );
+    assert!(
+        fixture.wait_for_session_exit(&descriptor.session_name),
+        "expired modern execution session survived retirement"
+    );
+    assert!(root.is_dir(), "expiry discarded its durable descriptor");
+
+    let reconciliation = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "62601".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some(descriptor.command_digest.clone()),
+            expected_session_id: Some(62601),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let reconciled = fixture.run_shell(exact_reconciliation_command(
+        &fixture.agent_key,
+        &reconciliation,
+    ));
+    assert!(
+        reconciled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reconciled.stderr)
+    );
+    let recovered =
+        parse_recovered_executions(&reconciled.stdout).expect("parse expiry reconciliation");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].status, RecoveredExecutionStatus::Expired);
+    assert!(recovered[0].terminal_verified_dead);
+    assert!(
+        root.is_dir(),
+        "reconciliation removed the terminal descriptor"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_short_durable_tty_expiry_waits_for_its_output_close_receipt() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let mut params = exec_params("62603", "sleep 30");
+    params.tty = true;
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "tty-expiry-controller", &params);
+    let bootstrap = descriptor
+        .bootstrap_command(&params)
+        .replacen("max_lifetime=86400", "max_lifetime=1", 1)
+        .replacen("sleep 5\ndone", "sleep 1\ndone", 1)
+        .replacen(
+            "tmux pipe-pane -O -t \"$target\" \"if cat",
+            "tmux pipe-pane -O -t \"$target\" \"sleep 4; if cat",
+            1,
+        );
+    assert_ne!(bootstrap, descriptor.bootstrap_command(&params));
+    let started = fixture.run_shell(bootstrap);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    apply_ready_protocol(&mut descriptor, &started.stdout);
+    let root = fixture.descriptor_root(&descriptor);
+    let output_closed = current_output_closed_path(&root);
+
+    assert!(
+        wait_for_file_value(&root.join("terminal-claim/kind"), "expired\n"),
+        "TTY expiry did not acquire the terminal claim; state={:?}",
+        fs::read_to_string(root.join("state"))
+    );
+    assert!(
+        !root.join("status").exists(),
+        "TTY expiry wrote a terminal status before the durable output-close receipt"
+    );
+    assert!(
+        !output_closed.exists(),
+        "TTY expiry observed a close receipt before the delayed pipe reader ran"
+    );
+    assert!(
+        wait_for_file_value(&output_closed, ""),
+        "TTY expiry did not publish the generation-bound output-close receipt"
+    );
+    assert!(
+        wait_for_file_value(&root.join("status"), "124\n"),
+        "TTY expiry did not record status after its output-close receipt; state={:?}",
+        fs::read_to_string(root.join("state"))
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("TTY expiry state"),
+        "expired\n"
+    );
+    assert!(
+        fs::read_to_string(root.join("output"))
+            .expect("TTY expiry output")
+            .contains(EXECUTION_EXPIRY_SYSTEM_NOTICE)
+    );
+    assert!(
+        fixture.wait_for_session_exit(&descriptor.session_name),
+        "TTY expiry left its modern execution session running"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_natural_terminal_claim_wins_the_expiry_race() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62602", "printf 'natural completion\\n'");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "natural-race-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    assert!(
+        wait_for_file_value(&root.join("status"), "0\n"),
+        "natural execution did not publish terminal status"
+    );
+    let expiry = descriptor
+        .expiry_script()
+        .replacen("max_lifetime=86400", "max_lifetime=0", 1);
+    assert_ne!(expiry, descriptor.expiry_script());
+    let raced = fixture.run_shell(expiry);
+    assert!(
+        raced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raced.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("state")).expect("natural terminal state"),
+        "completed\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("terminal-claim/kind")).expect("natural terminal claim"),
+        "completed\n"
+    );
+    assert!(
+        fixture.wait_for_session_exit(&descriptor.session_name),
+        "watchdog did not automatically retire the normal terminal session"
     );
 }
 
@@ -5258,6 +5524,8 @@ fn generated_remote_shell_is_syntactically_valid() {
         descriptor.payload_script(&params),
         descriptor.group_sentinel_script(),
         descriptor.watchdog_script(),
+        descriptor.expiry_script(),
+        descriptor.terminal_cleanup_script(),
         descriptor.monitor_command(1),
         descriptor.recover_dead_execution_command(),
         descriptor.interrupt_command(),
