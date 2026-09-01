@@ -151,6 +151,181 @@ pub struct NewThread {
     pub session_configured: SessionConfiguredEvent,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteExecutionRecoveryDisposition {
+    /// Preserve ordinary resume semantics: adopt the exact execution and wait
+    /// for its real terminal result.
+    Resume,
+    /// Establish a proof-bound successor boundary: adopt the exact execution,
+    /// terminate it through the backend's fenced protocol, and wait for exact
+    /// terminal proof before repairing the rollout.
+    TerminateForSuccessor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistedRemoteLifecycleHoldReason {
+    BackendUnavailable,
+    ReconciliationDeadline,
+    TerminalProofPending,
+    LiveExecution,
+    PendingWrite,
+    UnknownState,
+    FencingNotProven,
+}
+
+impl PersistedRemoteLifecycleHoldReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendUnavailable => "backend_unavailable",
+            Self::ReconciliationDeadline => "reconciliation_deadline",
+            Self::TerminalProofPending => "terminal_proof_pending",
+            Self::LiveExecution => "live_execution",
+            Self::PendingWrite => "pending_write",
+            Self::UnknownState => "unknown_state",
+            Self::FencingNotProven => "fencing_not_proven",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistedRemoteLifecycleFailureReason {
+    InvalidRollout,
+    DescriptorCount,
+    AuthorityConflict,
+    GenerationConflict,
+}
+
+impl PersistedRemoteLifecycleFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRollout => "invalid_rollout",
+            Self::DescriptorCount => "descriptor_count",
+            Self::AuthorityConflict => "authority_conflict",
+            Self::GenerationConflict => "generation_conflict",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistedRemoteLifecycleOutcome {
+    Recovered,
+    StillHeld(PersistedRemoteLifecycleHoldReason),
+    TerminalFailure(PersistedRemoteLifecycleFailureReason),
+}
+
+fn persisted_remote_lifecycle_preflight(
+    request: &ReconciliationRequest,
+) -> Option<PersistedRemoteLifecycleOutcome> {
+    if !request.pending_writes.is_empty() {
+        return Some(PersistedRemoteLifecycleOutcome::StillHeld(
+            PersistedRemoteLifecycleHoldReason::PendingWrite,
+        ));
+    }
+    request
+        .incomplete_executions
+        .is_empty()
+        .then_some(PersistedRemoteLifecycleOutcome::Recovered)
+}
+
+fn persisted_remote_lifecycle_reconciliation_error(
+    error: RemoteTerminalProofReconciliationError,
+) -> PersistedRemoteLifecycleOutcome {
+    match error {
+        RemoteTerminalProofReconciliationError::Backend(_) => {
+            PersistedRemoteLifecycleOutcome::StillHeld(
+                PersistedRemoteLifecycleHoldReason::BackendUnavailable,
+            )
+        }
+        RemoteTerminalProofReconciliationError::ProofDidNotConverge => {
+            PersistedRemoteLifecycleOutcome::StillHeld(
+                PersistedRemoteLifecycleHoldReason::TerminalProofPending,
+            )
+        }
+        RemoteTerminalProofReconciliationError::DeadlineExceeded => {
+            PersistedRemoteLifecycleOutcome::StillHeld(
+                PersistedRemoteLifecycleHoldReason::ReconciliationDeadline,
+            )
+        }
+        RemoteTerminalProofReconciliationError::DescriptorCount(_) => {
+            PersistedRemoteLifecycleOutcome::TerminalFailure(
+                PersistedRemoteLifecycleFailureReason::DescriptorCount,
+            )
+        }
+    }
+}
+
+fn classify_persisted_remote_lifecycle_reconciliation(
+    request: &ReconciliationRequest,
+    recovered: Vec<RecoveredExecution>,
+) -> PersistedRemoteLifecycleOutcome {
+    if recovered.len() != request.incomplete_executions.len() {
+        return PersistedRemoteLifecycleOutcome::TerminalFailure(
+            PersistedRemoteLifecycleFailureReason::DescriptorCount,
+        );
+    }
+    for incomplete in &request.incomplete_executions {
+        let matches = recovered
+            .iter()
+            .filter(|execution| {
+                execution.identity.thread_id == request.thread_id
+                    && execution.identity.turn_id == incomplete.turn_id
+                    && execution.identity.call_id == incomplete.call_id
+                    && execution.identity.attempt_generation == incomplete.attempt_generation
+            })
+            .collect::<Vec<_>>();
+        let [execution] = matches.as_slice() else {
+            return PersistedRemoteLifecycleOutcome::TerminalFailure(
+                PersistedRemoteLifecycleFailureReason::DescriptorCount,
+            );
+        };
+        if execution.status == RecoveredExecutionStatus::Unknown {
+            return PersistedRemoteLifecycleOutcome::StillHeld(
+                PersistedRemoteLifecycleHoldReason::UnknownState,
+            );
+        }
+        if !crate::session::recovered_execution_matches_reconciliation_slot(
+            execution,
+            &request.thread_id,
+            incomplete,
+        ) {
+            return PersistedRemoteLifecycleOutcome::TerminalFailure(
+                PersistedRemoteLifecycleFailureReason::AuthorityConflict,
+            );
+        }
+    }
+    if recovered.iter().any(|execution| {
+        matches!(
+            execution.status,
+            RecoveredExecutionStatus::Prepared | RecoveredExecutionStatus::Running
+        )
+    }) {
+        return PersistedRemoteLifecycleOutcome::StillHeld(
+            PersistedRemoteLifecycleHoldReason::LiveExecution,
+        );
+    }
+    let v2_proven_calls = request
+        .incomplete_executions
+        .iter()
+        .filter(|execution| {
+            execution.protocol_evidence == RemoteExecutionProtocolEvidence::V2Proven
+                && execution.attempt_generation == 0
+        })
+        .map(|execution| {
+            (
+                request.thread_id.clone(),
+                execution.turn_id.clone(),
+                execution.call_id.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    if select_recovered_execution_rows(recovered, &v2_proven_calls).is_err() {
+        return PersistedRemoteLifecycleOutcome::TerminalFailure(
+            PersistedRemoteLifecycleFailureReason::GenerationConflict,
+        );
+    }
+    PersistedRemoteLifecycleOutcome::Recovered
+}
+
 // TODO(ccunningham): Add an explicit non-interrupting live-turn snapshot once
 // core can represent sampling boundaries directly instead of relying on
 // whichever items happened to be persisted mid-turn.
@@ -918,6 +1093,175 @@ impl ThreadManager {
         Ok(recovered)
     }
 
+    /// Performs the exact remote lifecycle gate for a persisted rollout without
+    /// resuming a thread, appending output, acknowledging evidence, restoring
+    /// pending writes, or submitting model input.
+    pub async fn reconcile_persisted_rollout_lifecycle(
+        &self,
+        rollout_path: PathBuf,
+    ) -> PersistedRemoteLifecycleOutcome {
+        let request = match self
+            .execution_reconciliation_request_from_rollout(rollout_path)
+            .await
+        {
+            Ok(request) => request,
+            Err(_) => {
+                return PersistedRemoteLifecycleOutcome::TerminalFailure(
+                    PersistedRemoteLifecycleFailureReason::InvalidRollout,
+                );
+            }
+        };
+        if let Some(outcome) = persisted_remote_lifecycle_preflight(&request) {
+            return outcome;
+        }
+        let Some(environment) = self.environment_manager().default_environment() else {
+            return PersistedRemoteLifecycleOutcome::StillHeld(
+                PersistedRemoteLifecycleHoldReason::BackendUnavailable,
+            );
+        };
+        let recovered = match reconcile_remote_executions_with_terminal_proof(
+            environment.as_ref(),
+            request.clone(),
+        )
+        .await
+        {
+            Ok(recovered) => recovered,
+            Err(error) => return persisted_remote_lifecycle_reconciliation_error(error),
+        };
+        classify_persisted_remote_lifecycle_reconciliation(&request, recovered)
+    }
+
+    /// Fences exact running remote executions before a host admits a fresh
+    /// successor. This never resumes a thread, restores pending writes, or
+    /// submits model input. When it terminates a live execution, independent
+    /// terminal proof precedes durable output repair and retirement of only
+    /// matching acknowledgement evidence.
+    pub async fn fence_persisted_rollout_for_successor(
+        &self,
+        rollout_path: PathBuf,
+    ) -> PersistedRemoteLifecycleOutcome {
+        let request = match self
+            .execution_reconciliation_request_from_rollout(rollout_path.clone())
+            .await
+        {
+            Ok(request) => request,
+            Err(_) => {
+                return PersistedRemoteLifecycleOutcome::TerminalFailure(
+                    PersistedRemoteLifecycleFailureReason::InvalidRollout,
+                );
+            }
+        };
+        if let Some(outcome) = persisted_remote_lifecycle_preflight(&request) {
+            return outcome;
+        }
+        let Some(environment) = self.environment_manager().default_environment() else {
+            return PersistedRemoteLifecycleOutcome::StillHeld(
+                PersistedRemoteLifecycleHoldReason::BackendUnavailable,
+            );
+        };
+        let recovered = match reconcile_remote_executions_with_terminal_proof(
+            environment.as_ref(),
+            request.clone(),
+        )
+        .await
+        {
+            Ok(recovered) => recovered,
+            Err(error) => return persisted_remote_lifecycle_reconciliation_error(error),
+        };
+        match classify_persisted_remote_lifecycle_reconciliation(&request, recovered.clone()) {
+            PersistedRemoteLifecycleOutcome::Recovered => {
+                return PersistedRemoteLifecycleOutcome::Recovered;
+            }
+            PersistedRemoteLifecycleOutcome::StillHeld(
+                PersistedRemoteLifecycleHoldReason::LiveExecution,
+            ) => {}
+            outcome => return outcome,
+        }
+
+        for execution in recovered
+            .iter()
+            .filter(|execution| execution.status == RecoveredExecutionStatus::Running)
+        {
+            let authority = request.incomplete_executions.iter().find(|incomplete| {
+                execution.identity.thread_id == request.thread_id
+                    && execution.identity.turn_id == incomplete.turn_id
+                    && execution.identity.call_id == incomplete.call_id
+                    && execution.identity.attempt_generation == incomplete.attempt_generation
+            });
+            let Ok(authority) = validated_adopted_running_authority(execution, authority) else {
+                return PersistedRemoteLifecycleOutcome::TerminalFailure(
+                    PersistedRemoteLifecycleFailureReason::AuthorityConflict,
+                );
+            };
+            if authority.protocol_evidence != RemoteExecutionProtocolEvidence::V2Proven {
+                return PersistedRemoteLifecycleOutcome::StillHeld(
+                    PersistedRemoteLifecycleHoldReason::UnknownState,
+                );
+            }
+            if reconcile_adopted_running_execution(
+                execution.clone(),
+                authority,
+                &request.thread_id,
+                self.environment_manager().as_ref(),
+                RemoteExecutionRecoveryDisposition::TerminateForSuccessor,
+            )
+            .await
+            .is_err()
+            {
+                return PersistedRemoteLifecycleOutcome::StillHeld(
+                    PersistedRemoteLifecycleHoldReason::FencingNotProven,
+                );
+            }
+        }
+
+        let recovered = match reconcile_remote_executions_with_terminal_proof(
+            environment.as_ref(),
+            request.clone(),
+        )
+        .await
+        {
+            Ok(recovered) => recovered,
+            Err(error) => return persisted_remote_lifecycle_reconciliation_error(error),
+        };
+        let outcome =
+            classify_persisted_remote_lifecycle_reconciliation(&request, recovered.clone());
+        if outcome != PersistedRemoteLifecycleOutcome::Recovered {
+            return outcome;
+        }
+
+        // A fresh successor never reopens this rollout. Persist recovered
+        // terminal output and retire only its exact proof-bound evidence so the
+        // predecessor cannot leave an unacknowledged descriptor/session behind.
+        // Pending writes were rejected before any remote operation, and this
+        // path never creates a thread or submits model input.
+        let history = match self
+            .initial_history_from_rollout_path(rollout_path.clone())
+            .await
+        {
+            Ok(history) => history,
+            Err(_) => {
+                return PersistedRemoteLifecycleOutcome::TerminalFailure(
+                    PersistedRemoteLifecycleFailureReason::InvalidRollout,
+                );
+            }
+        };
+        if append_recovered_execution_outputs_to_rollout(
+            &rollout_path,
+            &history,
+            recovered,
+            self.environment_manager().as_ref(),
+            RemoteExecutionRecoveryDisposition::Resume,
+        )
+        .await
+        .is_err()
+        {
+            return PersistedRemoteLifecycleOutcome::StillHeld(
+                PersistedRemoteLifecycleHoldReason::FencingNotProven,
+            );
+        }
+        PersistedRemoteLifecycleOutcome::Recovered
+    }
+
     pub(crate) fn scan_active_remote_calls(
         thread_id: String,
         history: &[RolloutItem],
@@ -1505,6 +1849,7 @@ impl ThreadManager {
             &initial_history,
             recovered_executions,
             &self.environment_manager(),
+            RemoteExecutionRecoveryDisposition::Resume,
         )
         .await
         .map_err(|error| {
@@ -2601,6 +2946,7 @@ async fn reconcile_adopted_running_execution(
     launch_authority: &IncompleteExecution,
     conversation_id: &str,
     environment_manager: &EnvironmentManager,
+    recovery_disposition: RemoteExecutionRecoveryDisposition,
 ) -> CodexResult<RecoveredExecution> {
     let started = environment_manager
         .adopt_default_environment_execution(foreground_adoption_request(
@@ -2610,6 +2956,14 @@ async fn reconcile_adopted_running_execution(
         .await
         .map_err(|error| CodexErr::Io(std::io::Error::other(error)))?;
     let mut events = started.process.subscribe_events();
+    if recovery_disposition == RemoteExecutionRecoveryDisposition::TerminateForSuccessor {
+        started.process.terminate().await.map_err(|error| {
+            CodexErr::Fatal(format!(
+                "failed to fence adopted execution for call {}: {error}",
+                execution.identity.call_id
+            ))
+        })?;
+    }
     let mut exit_code = None;
     loop {
         match events.recv().await {
@@ -2728,6 +3082,7 @@ async fn append_recovered_execution_outputs_to_rollout(
     history: &InitialHistory,
     recovered_executions: Vec<RecoveredExecution>,
     environment_manager: &EnvironmentManager,
+    recovery_disposition: RemoteExecutionRecoveryDisposition,
 ) -> CodexResult<bool> {
     let InitialHistory::Resumed(resumed) = history else {
         return Ok(false);
@@ -2825,6 +3180,7 @@ async fn append_recovered_execution_outputs_to_rollout(
                     &authority,
                     &conversation_id,
                     environment_manager,
+                    recovery_disposition,
                 )
                 .await
                 .map_err(|error| {

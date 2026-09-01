@@ -181,9 +181,14 @@ async fn terminal_proof_reconciliation_is_bounded_and_does_not_wait_on_conflicts
     let timeout_environment = timeout_manager
         .get_environment("terminal-proof-timeout")
         .expect("terminal-proof timeout environment");
-    let error = reconcile_remote_execution_with_terminal_proof(
+    let error = reconcile_remote_executions_with_terminal_proof_using_policy(
         timeout_environment.as_ref(),
         terminal_proof_request(),
+        RemoteTerminalProofReconciliationPolicy {
+            max_reconciliations: 5,
+            retry_delay: Duration::from_millis(1),
+            total_timeout: Duration::from_secs(1),
+        },
     )
     .await
     .expect_err("unverified death proof must remain fail-closed");
@@ -191,10 +196,7 @@ async fn terminal_proof_reconciliation_is_bounded_and_does_not_wait_on_conflicts
         error,
         RemoteTerminalProofReconciliationError::ProofDidNotConverge
     ));
-    assert_eq!(
-        timeout_calls.load(std::sync::atomic::Ordering::SeqCst),
-        REMOTE_TERMINAL_PROOF_MAX_RECONCILIATIONS
-    );
+    assert_eq!(timeout_calls.load(std::sync::atomic::Ordering::SeqCst), 5);
 
     let conflict_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let conflict_manager = EnvironmentManager::with_exec_backend_for_tests(
@@ -222,6 +224,43 @@ async fn terminal_proof_reconciliation_is_bounded_and_does_not_wait_on_conflicts
         &request.incomplete_executions[0],
     ));
     assert_eq!(conflict_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn terminal_proof_reconciliation_uses_the_elapsed_window_beyond_one_second() {
+    let reconcile_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let manager = EnvironmentManager::with_exec_backend_for_tests(
+        "terminal-proof-late",
+        Arc::new(TerminalProofBackend {
+            reconcile_calls: Arc::clone(&reconcile_calls),
+            proof_after_reconcile: 7,
+            conflicting_digest: false,
+        }),
+        /*durable_remote_exec_recovery*/ true,
+    );
+    let environment = manager
+        .get_environment("terminal-proof-late")
+        .expect("terminal-proof late environment");
+
+    let started = std::time::Instant::now();
+    let recovered = reconcile_remote_executions_with_terminal_proof_using_policy(
+        environment.as_ref(),
+        terminal_proof_request(),
+        RemoteTerminalProofReconciliationPolicy {
+            max_reconciliations: usize::MAX,
+            retry_delay: Duration::from_millis(200),
+            total_timeout: Duration::from_secs(2),
+        },
+    )
+    .await
+    .expect("proof inside the elapsed window must converge");
+
+    assert!(recovered[0].terminal_verified_dead);
+    assert_eq!(reconcile_calls.load(std::sync::atomic::Ordering::SeqCst), 7);
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "proof must converge after the former one-second fixed-attempt window"
+    );
 }
 
 #[tokio::test]

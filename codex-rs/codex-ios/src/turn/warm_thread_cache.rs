@@ -129,6 +129,18 @@ pub(super) fn take_warm_thread(
     }
 }
 
+/// Removes the cached thread for an exact context home without attempting to
+/// match a turn configuration. Recovery flushes and host-detaches this entry
+/// before inspecting the persisted predecessor so no later turn can bypass the
+/// exact lifecycle gate with stale in-memory state.
+pub(super) fn take_warm_thread_for_recovery(codex_home: &Path) -> Option<WarmThreadEntry> {
+    let Ok(mut cache) = warm_thread_cache().lock() else {
+        tracing::warn!("warm iOS thread cache was poisoned");
+        return None;
+    };
+    cache.remove(codex_home)
+}
+
 pub(super) fn cache_warm_thread(
     codex_home: PathBuf,
     mut entry: WarmThreadEntry,

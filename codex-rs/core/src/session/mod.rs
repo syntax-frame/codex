@@ -2200,7 +2200,6 @@ pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
-const REMOTE_TERMINAL_PROOF_MAX_RECONCILIATIONS: usize = 5;
 const REMOTE_TERMINAL_PROOF_RETRY_DELAY: Duration = Duration::from_millis(250);
 const REMOTE_TERMINAL_PROOF_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -2222,14 +2221,17 @@ struct RemoteTerminalProofReconciliationPolicy {
 impl RemoteTerminalProofReconciliationPolicy {
     fn production() -> Self {
         Self {
-            max_reconciliations: REMOTE_TERMINAL_PROOF_MAX_RECONCILIATIONS,
+            // The elapsed deadline is the production bound. A fixed handful of
+            // fast negative observations used to exhaust in roughly one second,
+            // even though the documented proof window is fifteen seconds.
+            max_reconciliations: usize::MAX,
             retry_delay: REMOTE_TERMINAL_PROOF_RETRY_DELAY,
             total_timeout: REMOTE_TERMINAL_PROOF_TOTAL_TIMEOUT,
         }
     }
 }
 
-fn recovered_execution_matches_reconciliation_slot(
+pub(crate) fn recovered_execution_matches_reconciliation_slot(
     execution: &codex_exec_server::RecoveredExecution,
     thread_id: &str,
     incomplete: &codex_exec_server::IncompleteExecution,
@@ -2334,7 +2336,10 @@ async fn reconcile_remote_executions_with_terminal_proof_using_policy(
         }
         let retry_at = tokio::time::Instant::now() + policy.retry_delay;
         if retry_at >= deadline {
-            return Err(RemoteTerminalProofReconciliationError::DeadlineExceeded);
+            // A responsive backend repeatedly reported only the narrow
+            // terminal-proof-pending state. Preserve that distinction from a
+            // backend call that itself consumed the absolute deadline.
+            return Err(RemoteTerminalProofReconciliationError::ProofDidNotConverge);
         }
         tokio::time::sleep_until(retry_at).await;
     }

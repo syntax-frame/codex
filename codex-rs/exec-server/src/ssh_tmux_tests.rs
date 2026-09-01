@@ -1068,6 +1068,172 @@ fn reconciliation_refuses_legacy_unknown_before_remote_query() {
     assert!(validate_reconciliation_request(&request).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn stale_recovery_markers_require_stable_older_epoch_and_independent_terminal_proof() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("expected-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    let command = exact_reconciliation_command("agent", &request);
+    let agent_id = stable_identifier("agent");
+    let process_id = stable_identifier("thread\0turn\0call\00");
+    let expected_window = format!("p_{process_id}");
+
+    for (name, marker, current_controller, symlink_marker, window_present, expected) in [
+        (
+            "stable-stale",
+            "1:previous-controller",
+            "2:current-controller",
+            false,
+            false,
+            RecoveredExecutionStatus::Exited(0),
+        ),
+        (
+            "stale-without-proof",
+            "1:previous-controller",
+            "2:current-controller",
+            false,
+            true,
+            RecoveredExecutionStatus::Unknown,
+        ),
+        (
+            "equal",
+            "2:current-controller",
+            "2:current-controller",
+            false,
+            false,
+            RecoveredExecutionStatus::Unknown,
+        ),
+        (
+            "future",
+            "3:future-controller",
+            "2:current-controller",
+            false,
+            false,
+            RecoveredExecutionStatus::Unknown,
+        ),
+        (
+            "malformed",
+            "1:previous:controller",
+            "2:current-controller",
+            false,
+            false,
+            RecoveredExecutionStatus::Unknown,
+        ),
+        (
+            "malformed-current-controller",
+            "1:previous-controller",
+            "2:current:controller",
+            false,
+            false,
+            RecoveredExecutionStatus::Unknown,
+        ),
+        (
+            "symlink",
+            "1:previous-controller",
+            "2:current-controller",
+            true,
+            false,
+            RecoveredExecutionStatus::Unknown,
+        ),
+    ] {
+        let home = tempfile::tempdir().expect("temp home");
+        let bin = home.path().join("bin");
+        fs::create_dir(&bin).expect("fake bin");
+        let tmux = bin.join("tmux");
+        fs::write(
+            &tmux,
+            if window_present {
+                format!(
+                    "#!/bin/sh\n[ \"$1\" = list-windows ] && printf '%s\\n' '{expected_window}'\n"
+                )
+            } else {
+                "#!/bin/sh\nexit 0\n".to_string()
+            },
+        )
+        .expect("fake tmux");
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).expect("tmux mode");
+
+        let root = home
+            .path()
+            .join(".agentapp/tmux")
+            .join(&agent_id)
+            .join(&process_id);
+        fs::create_dir_all(root.join("terminal-claim")).expect("descriptor root");
+        for (field, value) in [
+            ("owner", "agentapp-tmux-v2"),
+            ("identity", process_id.as_str()),
+            ("thread-id", "dGhyZWFk"),
+            ("turn-id", "dHVybg=="),
+            ("call-id", "Y2FsbA=="),
+            ("attempt-generation", "0"),
+            ("session-id", "42"),
+            ("tty", "0"),
+            ("digest", "expected-digest"),
+            ("acknowledgement-token", "token"),
+            ("window", expected_window.as_str()),
+            ("process-identity", "2147483646:2147483646"),
+            ("controller", current_controller),
+            ("state", "completed"),
+            ("status", "0"),
+            ("terminal-claim/kind", "completed"),
+            ("output", ""),
+        ] {
+            fs::write(root.join(field), value).expect("descriptor field");
+        }
+        let recovery_marker = root.join("recovery-required");
+        if symlink_marker {
+            let target = root.join("recovery-marker-target");
+            fs::write(&target, marker).expect("marker target");
+            symlink(target, &recovery_marker).expect("marker symlink");
+        } else {
+            fs::write(&recovery_marker, marker).expect("recovery marker");
+        }
+
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("HOME", home.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .expect("run exact reconciliation");
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let recovered =
+            parse_recovered_executions(&output.stdout).expect("parse reconciliation output");
+        assert_eq!(recovered[0].status, expected, "{name}");
+        assert!(
+            recovery_marker.exists() || recovery_marker.is_symlink(),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn reconciliation_refuses_descriptor_self_attested_digest() {
     let request = ReconciliationRequest {

@@ -52,6 +52,32 @@ char *codex_resolve_oauth_defaults_json(const char *access_token,
 void codex_free_string(char *s);
 
 /*
+ * Reconcile one persisted server-mode model context without submitting a model
+ * prompt. `action` is "recheck" for proof-only inspection or
+ * "fence_for_successor" for an explicit proof-bound cancellation before the
+ * host creates a fresh successor context.
+ *
+ * Returns allocated, content-free contract-v1 JSON:
+ *   {"contract_version":1,
+ *    "status":"recovered"|"still_held"|"terminal_failure"|"fresh_authorized",
+ *    "reason":<stable string>}
+ * Release the result with codex_free_string().
+ */
+char *codex_reconcile_persisted_context_server(
+    const char *action,
+    const char *context_home_path,
+    const char *workspace_path,
+    const char *ssh_connection_key,
+    const char *ssh_session_key,
+    const char *ssh_host,
+    uint16_t ssh_port,
+    const char *ssh_user,
+    const char *ssh_auth_method,
+    const char *ssh_secret,
+    const char *ssh_fingerprint,
+    const char *ssh_tmux_mode);
+
+/*
  * Streaming event callback for codex_run_turn_streaming().
  *   ctx         opaque pointer passed through verbatim from the call site.
  *   event_kind  0 = reasoning delta, 1 = text delta, 2 = done, 3 = error,

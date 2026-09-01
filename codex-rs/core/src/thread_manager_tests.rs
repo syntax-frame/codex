@@ -794,11 +794,155 @@ async fn native_resume_preflight_waits_for_terminal_proof_before_generation_sele
     assert!(execution.terminal_verified_dead);
 }
 
+#[test]
+fn proof_only_persisted_lifecycle_recheck_returns_typed_holds_without_repair() {
+    let request = ReconciliationRequest {
+        thread_id: "thread".to_string(),
+        incomplete_executions: vec![IncompleteExecution {
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+            expected_command_digest: Some("command-digest".to_string()),
+            expected_session_id: Some(42),
+            expected_tty: Some(false),
+            protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+        }],
+        pending_writes: Vec::new(),
+    };
+    assert_eq!(
+        persisted_remote_lifecycle_preflight(&ReconciliationRequest {
+            thread_id: "thread".to_string(),
+            incomplete_executions: Vec::new(),
+            pending_writes: vec![codex_exec_server::PendingWriteInteraction {
+                call_id: "write-call".to_string(),
+                turn_id: "turn".to_string(),
+                session_id: 42,
+                input_is_empty: false,
+                pre_send_intent_required: true,
+                pre_send_intent_persisted: true,
+                protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+            }],
+        }),
+        Some(PersistedRemoteLifecycleOutcome::StillHeld(
+            PersistedRemoteLifecycleHoldReason::PendingWrite
+        ))
+    );
+    assert_eq!(
+        persisted_remote_lifecycle_preflight(&ReconciliationRequest {
+            thread_id: "thread".to_string(),
+            incomplete_executions: Vec::new(),
+            pending_writes: Vec::new(),
+        }),
+        Some(PersistedRemoteLifecycleOutcome::Recovered)
+    );
+    assert_eq!(
+        persisted_remote_lifecycle_reconciliation_error(
+            RemoteTerminalProofReconciliationError::ProofDidNotConverge
+        ),
+        PersistedRemoteLifecycleOutcome::StillHeld(
+            PersistedRemoteLifecycleHoldReason::TerminalProofPending
+        )
+    );
+    assert_eq!(
+        persisted_remote_lifecycle_reconciliation_error(
+            RemoteTerminalProofReconciliationError::DescriptorCount(2)
+        ),
+        PersistedRemoteLifecycleOutcome::TerminalFailure(
+            PersistedRemoteLifecycleFailureReason::DescriptorCount
+        )
+    );
+
+    let recovered = RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: Some("command-digest".to_string()),
+        output: Vec::new(),
+        status: RecoveredExecutionStatus::Unknown,
+        terminal_verified_dead: false,
+        session_id: Some(42),
+        committed_output_cursor: 0,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "proof-only".to_string(),
+        ),
+    };
+    assert_eq!(
+        classify_persisted_remote_lifecycle_reconciliation(&request, vec![recovered.clone()]),
+        PersistedRemoteLifecycleOutcome::StillHeld(
+            PersistedRemoteLifecycleHoldReason::UnknownState
+        )
+    );
+    assert_eq!(
+        classify_persisted_remote_lifecycle_reconciliation(
+            &request,
+            vec![RecoveredExecution {
+                status: RecoveredExecutionStatus::Running,
+                ..recovered
+            }],
+        ),
+        PersistedRemoteLifecycleOutcome::StillHeld(
+            PersistedRemoteLifecycleHoldReason::LiveExecution
+        )
+    );
+}
+
 struct PostAdoptionVerificationBackend {
     adopt_calls: Arc<AtomicUsize>,
+    terminate_calls: Arc<AtomicUsize>,
     reconcile_calls: Arc<AtomicUsize>,
     proof_after_reconcile: usize,
     hangs_during_reconciliation: bool,
+}
+
+struct TerminationTrackingProcess {
+    inner: Arc<dyn codex_exec_server::ExecProcess>,
+    terminate_calls: Arc<AtomicUsize>,
+}
+
+impl codex_exec_server::ExecProcess for TerminationTrackingProcess {
+    fn process_id(&self) -> &codex_exec_server::ProcessId {
+        self.inner.process_id()
+    }
+
+    fn subscribe_wake(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.subscribe_wake()
+    }
+
+    fn subscribe_events(&self) -> codex_exec_server::ExecProcessEventReceiver {
+        self.inner.subscribe_events()
+    }
+
+    fn read(
+        &self,
+        after_seq: Option<u64>,
+        max_bytes: Option<usize>,
+        wait_ms: Option<u64>,
+    ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::ReadResponse> {
+        self.inner.read(after_seq, max_bytes, wait_ms)
+    }
+
+    fn write(
+        &self,
+        chunk: Vec<u8>,
+    ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::WriteResponse> {
+        self.inner.write(chunk)
+    }
+
+    fn signal(
+        &self,
+        signal: codex_exec_server::ProcessSignal,
+    ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::ProcessSignalOutcome> {
+        self.inner.signal(signal)
+    }
+
+    fn terminate(&self) -> codex_exec_server::ExecProcessFuture<'_, ()> {
+        self.terminate_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.terminate()
+    }
 }
 
 impl codex_exec_server::ExecBackend for PostAdoptionVerificationBackend {
@@ -818,6 +962,7 @@ impl codex_exec_server::ExecBackend for PostAdoptionVerificationBackend {
         request: codex_exec_server::AdoptionRequest,
     ) -> codex_exec_server::ExecBackendFuture<'_> {
         self.adopt_calls.fetch_add(1, Ordering::SeqCst);
+        let terminate_calls = Arc::clone(&self.terminate_calls);
         Box::pin(async move {
             if request.identity.thread_id != "thread"
                 || request.identity.turn_id != "turn"
@@ -832,13 +977,19 @@ impl codex_exec_server::ExecBackend for PostAdoptionVerificationBackend {
                     "post-adoption fixture received conflicting authority".to_string(),
                 ));
             }
-            codex_exec_server::StartedExecProcess::from_recovered_terminal(
+            let started = codex_exec_server::StartedExecProcess::from_recovered_terminal(
                 42,
                 b"before\nafter\n",
                 7,
                 0,
                 /*tty*/ false,
-            )
+            )?;
+            Ok(codex_exec_server::StartedExecProcess {
+                process: Arc::new(TerminationTrackingProcess {
+                    inner: started.process,
+                    terminate_calls,
+                }),
+            })
         })
     }
 
@@ -936,11 +1087,13 @@ fn post_adoption_launch_authority() -> IncompleteExecution {
 #[tokio::test]
 async fn adopted_running_execution_waits_for_exact_terminal_proof_after_exit() {
     let adopt_calls = Arc::new(AtomicUsize::new(0));
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
     let reconcile_calls = Arc::new(AtomicUsize::new(0));
     let environment_manager = codex_exec_server::EnvironmentManager::with_exec_backend_for_tests(
         "post-adoption",
         Arc::new(PostAdoptionVerificationBackend {
             adopt_calls: Arc::clone(&adopt_calls),
+            terminate_calls: Arc::clone(&terminate_calls),
             reconcile_calls: Arc::clone(&reconcile_calls),
             proof_after_reconcile: 2,
             hangs_during_reconciliation: false,
@@ -953,11 +1106,48 @@ async fn adopted_running_execution_waits_for_exact_terminal_proof_after_exit() {
         &post_adoption_launch_authority(),
         "thread",
         &environment_manager,
+        RemoteExecutionRecoveryDisposition::Resume,
     )
     .await
     .expect("post-adoption terminal proof should converge");
 
     assert_eq!(adopt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(reconcile_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(execution.output, b"before\nafter\n");
+    assert_eq!(execution.status, RecoveredExecutionStatus::Exited(0));
+    assert!(execution.terminal_verified_dead);
+}
+
+#[tokio::test]
+async fn successor_fence_terminates_after_exact_adoption_and_waits_for_terminal_proof() {
+    let adopt_calls = Arc::new(AtomicUsize::new(0));
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
+    let reconcile_calls = Arc::new(AtomicUsize::new(0));
+    let environment_manager = codex_exec_server::EnvironmentManager::with_exec_backend_for_tests(
+        "post-adoption-successor",
+        Arc::new(PostAdoptionVerificationBackend {
+            adopt_calls: Arc::clone(&adopt_calls),
+            terminate_calls: Arc::clone(&terminate_calls),
+            reconcile_calls: Arc::clone(&reconcile_calls),
+            proof_after_reconcile: 2,
+            hangs_during_reconciliation: false,
+        }),
+        /*durable_remote_exec_recovery*/ true,
+    );
+
+    let execution = reconcile_adopted_running_execution(
+        post_adoption_running_execution(),
+        &post_adoption_launch_authority(),
+        "thread",
+        &environment_manager,
+        RemoteExecutionRecoveryDisposition::TerminateForSuccessor,
+    )
+    .await
+    .expect("successor fence should terminate and prove the exact execution");
+
+    assert_eq!(adopt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 1);
     assert_eq!(reconcile_calls.load(Ordering::SeqCst), 2);
     assert_eq!(execution.output, b"before\nafter\n");
     assert_eq!(execution.status, RecoveredExecutionStatus::Exited(0));
@@ -967,11 +1157,13 @@ async fn adopted_running_execution_waits_for_exact_terminal_proof_after_exit() {
 #[tokio::test(start_paused = true)]
 async fn adopted_running_execution_hung_terminal_verification_meets_deadline() {
     let adopt_calls = Arc::new(AtomicUsize::new(0));
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
     let reconcile_calls = Arc::new(AtomicUsize::new(0));
     let environment_manager = codex_exec_server::EnvironmentManager::with_exec_backend_for_tests(
         "post-adoption-hang",
         Arc::new(PostAdoptionVerificationBackend {
             adopt_calls: Arc::clone(&adopt_calls),
+            terminate_calls: Arc::clone(&terminate_calls),
             reconcile_calls: Arc::clone(&reconcile_calls),
             proof_after_reconcile: usize::MAX,
             hangs_during_reconciliation: true,
@@ -984,11 +1176,13 @@ async fn adopted_running_execution_hung_terminal_verification_meets_deadline() {
         &post_adoption_launch_authority(),
         "thread",
         &environment_manager,
+        RemoteExecutionRecoveryDisposition::Resume,
     )
     .await
     .expect_err("hung post-adoption verification must meet the shared deadline");
 
     assert_eq!(adopt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 0);
     assert_eq!(reconcile_calls.load(Ordering::SeqCst), 1);
     assert!(
         error
@@ -1026,6 +1220,7 @@ struct ResumeRepairBackend {
     write_calls: Arc<AtomicUsize>,
     signal_calls: Arc<AtomicUsize>,
     terminate_calls: Arc<AtomicUsize>,
+    fail_termination: bool,
 }
 
 struct ResumeRepairProcess {
@@ -1033,6 +1228,7 @@ struct ResumeRepairProcess {
     write_calls: Arc<AtomicUsize>,
     signal_calls: Arc<AtomicUsize>,
     terminate_calls: Arc<AtomicUsize>,
+    fail_termination: bool,
     wake_tx: tokio::sync::watch::Sender<u64>,
 }
 
@@ -1090,6 +1286,13 @@ impl codex_exec_server::ExecProcess for ResumeRepairProcess {
 
     fn terminate(&self) -> codex_exec_server::ExecProcessFuture<'_, ()> {
         self.terminate_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_termination {
+            return Box::pin(async {
+                Err(codex_exec_server::ExecServerError::Protocol(
+                    "test successor fence rejected termination".to_string(),
+                ))
+            });
+        }
         Box::pin(async { Ok(()) })
     }
 }
@@ -1115,6 +1318,7 @@ impl codex_exec_server::ExecBackend for ResumeRepairBackend {
         let write_calls = Arc::clone(&self.write_calls);
         let signal_calls = Arc::clone(&self.signal_calls);
         let terminate_calls = Arc::clone(&self.terminate_calls);
+        let fail_termination = self.fail_termination;
         Box::pin(async move {
             if request.identity.turn_id != "exec-turn"
                 || request.identity.call_id != "exec-call"
@@ -1135,6 +1339,7 @@ impl codex_exec_server::ExecBackend for ResumeRepairBackend {
                     write_calls,
                     signal_calls,
                     terminate_calls,
+                    fail_termination,
                     wake_tx,
                 }),
             })
@@ -1200,6 +1405,79 @@ impl codex_exec_server::ExecBackend for ResumeRepairBackend {
             }])
         })
     }
+}
+
+#[tokio::test]
+async fn successor_fence_terminates_only_after_exact_adoption() {
+    let reconcile_calls = Arc::new(AtomicUsize::new(0));
+    let start_calls = Arc::new(AtomicUsize::new(0));
+    let adopt_calls = Arc::new(AtomicUsize::new(0));
+    let write_calls = Arc::new(AtomicUsize::new(0));
+    let signal_calls = Arc::new(AtomicUsize::new(0));
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
+    let environment_manager = codex_exec_server::EnvironmentManager::with_exec_backend_for_tests(
+        "successor-fence",
+        Arc::new(ResumeRepairBackend {
+            reconcile_calls: Arc::clone(&reconcile_calls),
+            terminal_proof_after_reconcile: usize::MAX,
+            start_calls: Arc::clone(&start_calls),
+            adopt_calls: Arc::clone(&adopt_calls),
+            write_calls: Arc::clone(&write_calls),
+            signal_calls: Arc::clone(&signal_calls),
+            terminate_calls: Arc::clone(&terminate_calls),
+            fail_termination: true,
+        }),
+        /*durable_remote_exec_recovery*/ true,
+    );
+    let execution = RecoveredExecution {
+        identity: codex_exec_server::ExecutionIdentity {
+            thread_id: "thread".to_string(),
+            turn_id: "exec-turn".to_string(),
+            call_id: "exec-call".to_string(),
+            attempt_generation: 0,
+        },
+        command_digest: Some("command-digest".to_string()),
+        output: b"process running\r\n".to_vec(),
+        status: RecoveredExecutionStatus::Running,
+        terminal_verified_dead: false,
+        session_id: Some(42),
+        committed_output_cursor: 17,
+        delivery_unknown: false,
+        acknowledgement: codex_exec_server::RecoveredExecutionAcknowledgement::new(
+            "successor-fence".to_string(),
+        ),
+    };
+    let authority = IncompleteExecution {
+        turn_id: "exec-turn".to_string(),
+        call_id: "exec-call".to_string(),
+        attempt_generation: 0,
+        expected_command_digest: Some("command-digest".to_string()),
+        expected_session_id: Some(42),
+        expected_tty: Some(true),
+        protocol_evidence: RemoteExecutionProtocolEvidence::V2Proven,
+    };
+
+    let error = reconcile_adopted_running_execution(
+        execution,
+        &authority,
+        "thread",
+        &environment_manager,
+        RemoteExecutionRecoveryDisposition::TerminateForSuccessor,
+    )
+    .await
+    .expect_err("fence must stop when exact termination is not accepted");
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to fence adopted execution")
+    );
+    assert_eq!(adopt_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reconcile_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(write_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(signal_calls.load(Ordering::SeqCst), 0);
 }
 
 fn resume_repair_commit(
@@ -1355,6 +1633,7 @@ async fn receiptless_write_error_is_sealed_without_replaying_stdin() {
         write_calls: Arc::clone(&write_calls),
         signal_calls: Arc::clone(&signal_calls),
         terminate_calls: Arc::clone(&terminate_calls),
+        fail_termination: false,
     });
     let environment_id = "resume-fixture";
     let environment_manager = Arc::new(
@@ -1592,6 +1871,7 @@ async fn prepared_interrupt_rejection_waits_for_terminal_proof_and_preserves_fin
         write_calls: Arc::clone(&write_calls),
         signal_calls: Arc::clone(&signal_calls),
         terminate_calls: Arc::clone(&terminate_calls),
+        fail_termination: false,
     });
     let environment_id = "resume-fixture";
     let environment_manager = Arc::new(

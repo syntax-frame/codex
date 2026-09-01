@@ -33,6 +33,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use codex_core::CodexThread;
+use codex_core::PersistedRemoteLifecycleOutcome;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -89,6 +90,7 @@ use warm_thread_cache::cache_warm_thread;
 use warm_thread_cache::retire_warm_thread;
 use warm_thread_cache::retire_warm_threads_in_background;
 use warm_thread_cache::take_warm_thread;
+use warm_thread_cache::take_warm_thread_for_recovery;
 use warm_thread_cache::warm_thread_fingerprint;
 
 const CONTEXT_LOCK_FILE: &str = ".agentapp-context.lock";
@@ -264,6 +266,92 @@ pub struct ServerMode {
 pub struct ServerFileUpload {
     pub local_path: String,
     pub relative_path: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteLifecycleAction {
+    Recheck,
+    FenceForSuccessor,
+}
+
+impl RemoteLifecycleAction {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "recheck" => Ok(Self::Recheck),
+            "fence_for_successor" => Ok(Self::FenceForSuccessor),
+            _ => Err("unsupported remote lifecycle action".to_string()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteLifecycleBridgeStatus {
+    Recovered,
+    StillHeld,
+    TerminalFailure,
+    FreshAuthorized,
+}
+
+#[derive(Serialize)]
+struct RemoteLifecycleBridgeResult {
+    contract_version: u32,
+    status: RemoteLifecycleBridgeStatus,
+    reason: &'static str,
+}
+
+impl RemoteLifecycleBridgeResult {
+    fn recovered() -> Self {
+        Self {
+            contract_version: 1,
+            status: RemoteLifecycleBridgeStatus::Recovered,
+            reason: "exact_lifecycle_recovered",
+        }
+    }
+
+    fn fresh_authorized() -> Self {
+        Self {
+            contract_version: 1,
+            status: RemoteLifecycleBridgeStatus::FreshAuthorized,
+            reason: "exact_lifecycle_fenced",
+        }
+    }
+
+    fn still_held(reason: &'static str) -> Self {
+        Self {
+            contract_version: 1,
+            status: RemoteLifecycleBridgeStatus::StillHeld,
+            reason,
+        }
+    }
+
+    fn terminal_failure(reason: &'static str) -> Self {
+        Self {
+            contract_version: 1,
+            status: RemoteLifecycleBridgeStatus::TerminalFailure,
+            reason,
+        }
+    }
+}
+
+fn remote_lifecycle_bridge_result(
+    action: RemoteLifecycleAction,
+    outcome: PersistedRemoteLifecycleOutcome,
+) -> RemoteLifecycleBridgeResult {
+    match outcome {
+        PersistedRemoteLifecycleOutcome::Recovered => match action {
+            RemoteLifecycleAction::Recheck => RemoteLifecycleBridgeResult::recovered(),
+            RemoteLifecycleAction::FenceForSuccessor => {
+                RemoteLifecycleBridgeResult::fresh_authorized()
+            }
+        },
+        PersistedRemoteLifecycleOutcome::StillHeld(reason) => {
+            RemoteLifecycleBridgeResult::still_held(reason.as_str())
+        }
+        PersistedRemoteLifecycleOutcome::TerminalFailure(reason) => {
+            RemoteLifecycleBridgeResult::terminal_failure(reason.as_str())
+        }
+    }
 }
 
 /// Environment id under which the SSH server-mode environment is registered and
@@ -592,6 +680,86 @@ async fn read_thread_pointer(codex_home: &Path) -> Result<Option<PathBuf>, Strin
     let relative_path = PathBuf::from(pointer.rollout_path);
     validate_relative_rollout_path(&relative_path)?;
     Ok(Some(codex_home.join(relative_path)))
+}
+
+fn recovery_environment_manager(server: &ServerMode) -> Arc<EnvironmentManager> {
+    Arc::new(EnvironmentManager::ssh_with_config(
+        SERVER_MODE_ENVIRONMENT_ID,
+        SshEnvironmentConfig {
+            connection_key: server.connection_key.clone(),
+            agent_key: server.session_key.clone(),
+            host: server.host.clone(),
+            port: server.port,
+            user: server.user.clone(),
+            authentication: server.authentication.clone(),
+            host_fingerprint: server.host_fingerprint.clone(),
+            tmux_mode: server.tmux_mode,
+        },
+    ))
+}
+
+async fn reconcile_persisted_context_server(
+    action: RemoteLifecycleAction,
+    context_home: String,
+    server: ServerMode,
+    _credential_guard: Option<Arc<tempfile::TempDir>>,
+) -> RemoteLifecycleBridgeResult {
+    if context_home.trim().is_empty() {
+        return RemoteLifecycleBridgeResult::terminal_failure("context_home_missing");
+    }
+    let codex_home = PathBuf::from(context_home);
+    if !codex_home.is_dir() {
+        return RemoteLifecycleBridgeResult::terminal_failure("context_home_missing");
+    }
+    let turn_lock = match context_turn_lock(&codex_home) {
+        Ok(lock) => lock,
+        Err(_) => return RemoteLifecycleBridgeResult::still_held("context_lock_unavailable"),
+    };
+    let _turn_guard = turn_lock.lock_owned().await;
+    let _context_file_lock = match acquire_context_file_lock(&codex_home).await {
+        Ok(lock) => lock,
+        Err(_) => return RemoteLifecycleBridgeResult::still_held("context_lock_unavailable"),
+    };
+
+    // Recovery must reason from one persisted source of truth. Flush and
+    // detach any idle cached predecessor first; host detach preserves durable
+    // remote executions and never submits model input.
+    if let Some(warm) = take_warm_thread_for_recovery(&codex_home) {
+        retire_warm_thread(warm).await;
+    }
+
+    let rollout_path = match read_thread_pointer(&codex_home).await {
+        Ok(Some(path)) => path,
+        Ok(None) | Err(_) => {
+            return RemoteLifecycleBridgeResult::terminal_failure("invalid_context_pointer");
+        }
+    };
+
+    // This auth/provider pair is construction-only. Recovery never submits
+    // model input or performs a provider request; all network activity is
+    // limited to the configured SSH execution environment.
+    let auth = CodexAuth::from_api_key("agentapp-proof-only-recovery");
+    let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    let thread_manager = thread_manager_with_models_provider_and_home(
+        auth,
+        provider,
+        codex_home.clone(),
+        recovery_environment_manager(&server),
+    );
+
+    let outcome = match action {
+        RemoteLifecycleAction::Recheck => {
+            thread_manager
+                .reconcile_persisted_rollout_lifecycle(rollout_path)
+                .await
+        }
+        RemoteLifecycleAction::FenceForSuccessor => {
+            thread_manager
+                .fence_persisted_rollout_for_successor(rollout_path)
+                .await
+        }
+    };
+    remote_lifecycle_bridge_result(action, outcome)
 }
 
 async fn write_thread_pointer(
@@ -1410,6 +1578,137 @@ pub extern "C" fn codex_download_ssh_workspace_file(
             CString::new("ERROR: invalid download result").expect("literal CString")
         })
         .into_raw()
+}
+
+fn remote_lifecycle_result_string(result: RemoteLifecycleBridgeResult) -> *mut c_char {
+    let json = serde_json::to_string(&result).unwrap_or_else(|_| {
+        r#"{"contract_version":1,"status":"terminal_failure","reason":"serialization_failure"}"#
+            .to_string()
+    });
+    CString::new(json)
+        // Every field above is generated from static NUL-free strings. Keep
+        // the FFI fail-closed even if that invariant is accidentally broken.
+        .unwrap_or_default()
+        .into_raw()
+}
+
+/// Reconcile one persisted server-mode context without submitting model input.
+///
+/// `action` is either `recheck` (read/proof-only) or
+/// `fence_for_successor` (explicitly adopt and terminate exact live execution
+/// authority before the host creates a fresh successor). Recheck never resumes
+/// the predecessor, appends output, restores writes, or acknowledges remote
+/// evidence. The fenced action performs output repair and acknowledgement only
+/// after independently exact terminal proof. The returned JSON is content-free
+/// and owned by the caller.
+///
+/// # Safety
+/// Every pointer must address a valid NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn codex_reconcile_persisted_context_server(
+    action: *const c_char,
+    context_home_path: *const c_char,
+    workspace_path: *const c_char,
+    ssh_connection_key: *const c_char,
+    ssh_session_key: *const c_char,
+    ssh_host: *const c_char,
+    ssh_port: u16,
+    ssh_user: *const c_char,
+    ssh_auth_method: *const c_char,
+    ssh_secret: *const c_char,
+    ssh_fingerprint: *const c_char,
+    ssh_tmux_mode: *const c_char,
+) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| -> Result<RemoteLifecycleBridgeResult, String> {
+        let action =
+            RemoteLifecycleAction::parse(&c_str_to_string(action, "remote_lifecycle_action")?)?;
+        let context_home = c_str_to_string(context_home_path, "context_home_path")?;
+        let workspace = if workspace_path.is_null() {
+            String::new()
+        } else {
+            c_str_to_string(workspace_path, "workspace_path")?
+        };
+        let host = c_str_to_string(ssh_host, "ssh_host")?;
+        let user = c_str_to_string(ssh_user, "ssh_user")?;
+        let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
+        let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
+        let connection_key = if ssh_connection_key.is_null() {
+            format!("{user}@{host}:{ssh_port}")
+        } else {
+            let value = c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
+            if value.trim().is_empty() {
+                format!("{user}@{host}:{ssh_port}")
+            } else {
+                value
+            }
+        };
+        let session_key = if ssh_session_key.is_null() {
+            format!("{user}@{host}:{ssh_port}:{workspace}")
+        } else {
+            let value = c_str_to_string(ssh_session_key, "ssh_session_key")?;
+            if value.trim().is_empty() {
+                format!("{user}@{host}:{ssh_port}:{workspace}")
+            } else {
+                value
+            }
+        };
+        let fingerprint = if ssh_fingerprint.is_null() {
+            None
+        } else {
+            let value = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
+            (!value.trim().is_empty()).then_some(value)
+        };
+        let tmux_mode = if ssh_tmux_mode.is_null() {
+            SshTmuxMode::Required
+        } else {
+            parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
+        };
+        let (authentication, credential_guard) = parse_ssh_authentication(&auth_method, secret)?;
+        let server = ServerMode {
+            connection_key,
+            session_key,
+            host,
+            port: ssh_port,
+            user,
+            authentication,
+            host_fingerprint: fingerprint,
+            tmux_mode,
+        };
+        std::thread::Builder::new()
+            .name("codex-lifecycle-recovery".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                turn_runtime().block_on(async move {
+                    match timeout(
+                        Duration::from_secs(120),
+                        reconcile_persisted_context_server(
+                            action,
+                            context_home,
+                            server,
+                            credential_guard.map(Arc::new),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(_) => RemoteLifecycleBridgeResult::still_held("recovery_deadline"),
+                    }
+                })
+            })
+            .map_err(|_| "recovery worker unavailable".to_string())?
+            .join()
+            .map_err(|_| "recovery worker panicked".to_string())
+    });
+    match result {
+        Ok(Ok(outcome)) => remote_lifecycle_result_string(outcome),
+        Ok(Err(_)) => remote_lifecycle_result_string(RemoteLifecycleBridgeResult::still_held(
+            "recovery_worker_unavailable",
+        )),
+        Err(_) => remote_lifecycle_result_string(RemoteLifecycleBridgeResult::still_held(
+            "recovery_worker_panicked",
+        )),
+    }
 }
 
 fn parse_tmux_mode(value: &str) -> Result<SshTmuxMode, String> {

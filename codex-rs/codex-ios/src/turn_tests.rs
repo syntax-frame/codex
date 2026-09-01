@@ -18,6 +18,9 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use codex_core::PersistedRemoteLifecycleFailureReason;
+use codex_core::PersistedRemoteLifecycleHoldReason;
+use codex_core::PersistedRemoteLifecycleOutcome;
 use codex_exec_server::SshAuthentication;
 use codex_exec_server::SshTmuxMode;
 use codex_features::Feature;
@@ -46,6 +49,7 @@ use super::KIND_TURN_READY;
 use super::KIND_TURN_STARTING;
 use super::PersistedThreadPointer;
 use super::ProviderAuthConfig;
+use super::RemoteLifecycleAction;
 use super::ServerFileUpload;
 use super::TURN_RUNTIME_MAX_BLOCKING_THREADS;
 use super::TurnBridge;
@@ -82,6 +86,7 @@ use super::persistent_model_context_storage_error;
 use super::prompt_image_uploads;
 use super::read_thread_pointer;
 use super::register_starting_turn;
+use super::remote_lifecycle_bridge_result;
 use super::resolve_oauth_effort;
 use super::resolve_oauth_preset;
 use super::startup_interrupt_requested;
@@ -118,6 +123,62 @@ fn effort(effort: ReasoningEffort) -> ReasoningEffortPreset {
         effort,
         description: String::new(),
     }
+}
+
+#[test]
+fn proof_only_lifecycle_bridge_keeps_recheck_and_successor_states_distinct() {
+    assert_eq!(
+        serde_json::to_value(remote_lifecycle_bridge_result(
+            RemoteLifecycleAction::Recheck,
+            PersistedRemoteLifecycleOutcome::Recovered,
+        ))
+        .expect("serialize recheck result"),
+        serde_json::json!({
+            "contract_version": 1,
+            "status": "recovered",
+            "reason": "exact_lifecycle_recovered"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(remote_lifecycle_bridge_result(
+            RemoteLifecycleAction::FenceForSuccessor,
+            PersistedRemoteLifecycleOutcome::Recovered,
+        ))
+        .expect("serialize successor result"),
+        serde_json::json!({
+            "contract_version": 1,
+            "status": "fresh_authorized",
+            "reason": "exact_lifecycle_fenced"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(remote_lifecycle_bridge_result(
+            RemoteLifecycleAction::Recheck,
+            PersistedRemoteLifecycleOutcome::StillHeld(
+                PersistedRemoteLifecycleHoldReason::UnknownState
+            ),
+        ))
+        .expect("serialize held result"),
+        serde_json::json!({
+            "contract_version": 1,
+            "status": "still_held",
+            "reason": "unknown_state"
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(remote_lifecycle_bridge_result(
+            RemoteLifecycleAction::Recheck,
+            PersistedRemoteLifecycleOutcome::TerminalFailure(
+                PersistedRemoteLifecycleFailureReason::AuthorityConflict
+            ),
+        ))
+        .expect("serialize failure result"),
+        serde_json::json!({
+            "contract_version": 1,
+            "status": "terminal_failure",
+            "reason": "authority_conflict"
+        })
+    );
 }
 
 #[test]
