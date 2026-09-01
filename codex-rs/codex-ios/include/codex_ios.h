@@ -125,6 +125,37 @@ char *codex_reconcile_persisted_context_server(
 typedef void (*codex_event_callback)(void *ctx, int event_kind, const char *text);
 
 /*
+ * Content-free admission input for the AgentApp-only turn entrypoints.
+ * `semantic_request_prompt` is the immutable work prompt before an optional
+ * generation-one recovery-context prefix. `semantic_request_digest` must be
+ * the canonical lower-case SHA-256 digest of the versioned request envelope;
+ * guarded entrypoints independently derive that envelope from their actual
+ * arguments and reject a mismatch before creating a receipt.
+ * `requested_generation` is 0 for the original call or 1 for its sole
+ * automatic retry. The ticket, digest, receipt root, prompt, credentials, and
+ * provider errors are never returned by the receipt query.
+ */
+typedef struct {
+    const char *agent_inbox_ticket_id;
+    const char *semantic_request_prompt;
+    const char *semantic_request_digest;
+    const char *receipt_root_path;
+    uint32_t requested_generation;
+} codex_agentapp_turn_admission;
+
+/*
+ * Query one receipt without changing it. Returns allocated contract-v1 JSON:
+ * {"contract_version":1,"receipt_version":<number>,"state":<stable string>,
+ *  "generation":<number>,"digest_match":<bool>}.
+ * `state` is one of preparing, persisted_queued, rejected_before_admission,
+ * tool_or_side_effect_possible, model_request_possible, admitted, terminal,
+ * missing, ambiguous, or unavailable. Release the result with
+ * codex_free_string().
+ */
+char *codex_query_agentapp_turn_admission_receipt(
+    const codex_agentapp_turn_admission *admission);
+
+/*
  * Highest payload contract supported for event kind 15. This query is
  * additive: a consumer paired with an older library should treat an absent
  * symbol exactly like version 0 (discovery telemetry unavailable).
@@ -182,6 +213,31 @@ void codex_run_turn_streaming(const char *access_token,
                               codex_event_callback callback);
 
 /*
+ * AgentApp-only OAuth counterpart that requires `admission`. All leading
+ * parameters and callbacks are identical to codex_run_turn_streaming().
+ * Core persists the receipt before context resume or work scheduling, writes
+ * model_request_possible before provider submission, and permits generation 1
+ * only after durable generation-0 rejected_before_admission with a matching
+ * digest.
+ */
+void codex_run_turn_streaming_agentapp(
+    const char *access_token,
+    const char *id_token,
+    const char *account_id,
+    const char *model,
+    const char *reasoning_effort,
+    const char *service_tier,
+    const char *prompt,
+    const char *history_json,
+    const char *context_home_path,
+    const char *workspace_path,
+    const char *dynamic_tools_json,
+    const char *uploads_json,
+    const codex_agentapp_turn_admission *admission,
+    void *ctx,
+    codex_event_callback callback);
+
+/*
  * Generic API-key counterpart of codex_run_turn_streaming(): drive ONE user
  * turn against an API-key endpoint using a plain bearer API key instead of
  * ChatGPT OAuth. Use `wire_api` to select either an OpenAI Responses-compatible
@@ -227,6 +283,24 @@ void codex_run_turn_streaming_apikey(const char *base_url,
                                      void *ctx,
                                      codex_event_callback callback);
 
+/* AgentApp-only API-key counterpart with the same receipt contract. */
+void codex_run_turn_streaming_apikey_agentapp(
+    const char *base_url,
+    const char *api_key,
+    const char *wire_api,
+    const char *model,
+    const char *reasoning_effort,
+    const char *service_tier,
+    const char *prompt,
+    const char *history_json,
+    const char *context_home_path,
+    const char *workspace_path,
+    const char *dynamic_tools_json,
+    const char *uploads_json,
+    const codex_agentapp_turn_admission *admission,
+    void *ctx,
+    codex_event_callback callback);
+
 /*
  * API-key + server-mode counterpart: provider transport and SSH tool routing
  * are independent. Drives ONE turn against an API-key provider while shell/exec
@@ -257,6 +331,37 @@ void codex_run_turn_streaming_apikey_server(const char *base_url,
                                             const char *uploads_json,
                                             void *ctx,
                                             codex_event_callback callback);
+
+/*
+ * AgentApp-only API-key server counterpart. It marks the receipt
+ * tool_or_side_effect_possible before any SSH file upload and advances to
+ * model_request_possible before model submission.
+ */
+void codex_run_turn_streaming_apikey_server_agentapp(
+    const char *base_url,
+    const char *api_key,
+    const char *wire_api,
+    const char *model,
+    const char *reasoning_effort,
+    const char *service_tier,
+    const char *prompt,
+    const char *history_json,
+    const char *context_home_path,
+    const char *workspace_path,
+    const char *dynamic_tools_json,
+    const char *ssh_connection_key,
+    const char *ssh_session_key,
+    const char *ssh_host,
+    uint16_t ssh_port,
+    const char *ssh_user,
+    const char *ssh_auth_method,
+    const char *ssh_secret,
+    const char *ssh_fingerprint,
+    const char *ssh_tmux_mode,
+    const char *uploads_json,
+    const codex_agentapp_turn_admission *admission,
+    void *ctx,
+    codex_event_callback callback);
 
 /*
  * Server-mode counterpart of codex_run_turn_streaming(): drive ONE user turn
@@ -327,6 +432,33 @@ void codex_run_turn_streaming_server(const char *access_token,
                                      const char *uploads_json,
                                      void *ctx,
                                      codex_event_callback callback);
+
+/* AgentApp-only OAuth server counterpart with the same receipt contract. */
+void codex_run_turn_streaming_server_agentapp(
+    const char *access_token,
+    const char *id_token,
+    const char *account_id,
+    const char *model,
+    const char *reasoning_effort,
+    const char *service_tier,
+    const char *prompt,
+    const char *history_json,
+    const char *context_home_path,
+    const char *workspace_path,
+    const char *dynamic_tools_json,
+    const char *ssh_connection_key,
+    const char *ssh_session_key,
+    const char *ssh_host,
+    uint16_t ssh_port,
+    const char *ssh_user,
+    const char *ssh_auth_method,
+    const char *ssh_secret,
+    const char *ssh_fingerprint,
+    const char *ssh_tmux_mode,
+    const char *uploads_json,
+    const codex_agentapp_turn_admission *admission,
+    void *ctx,
+    codex_event_callback callback);
 
 /*
  * Download one regular file from a server-mode agent's SSH workspace to a

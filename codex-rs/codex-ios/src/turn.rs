@@ -81,10 +81,17 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::time::timeout;
 
+mod admission_receipt;
 mod warm_thread_cache;
 
+use admission_receipt::AdmissionError;
+use admission_receipt::AdmissionReceiptQuery;
+use admission_receipt::AdmissionRequest;
+use admission_receipt::TurnAdmission;
 use warm_thread_cache::WarmThreadEntry;
 use warm_thread_cache::cache_warm_thread;
 use warm_thread_cache::retire_warm_thread;
@@ -798,6 +805,120 @@ async fn write_thread_pointer(
 /// verbatim so Swift can recover its closure/context.
 pub type EventCallback = extern "C" fn(ctx: *mut c_void, event_kind: c_int, text: *const c_char);
 
+/// Content-free inputs that bind an AgentApp turn to one durable admission
+/// receipt. The caller owns all string storage for the duration of a guarded
+/// FFI call; the bridge copies and hashes the ticket before it starts work.
+#[repr(C)]
+pub struct AgentAppTurnAdmission {
+    pub agent_inbox_ticket_id: *const c_char,
+    pub semantic_request_prompt: *const c_char,
+    pub semantic_request_digest: *const c_char,
+    pub receipt_root_path: *const c_char,
+    pub requested_generation: u32,
+}
+
+struct ParsedAgentAppTurnAdmission {
+    request: AdmissionRequest,
+    agent_inbox_ticket_id: String,
+    semantic_request_prompt: String,
+    semantic_request_digest: String,
+}
+
+const AGENTAPP_SEMANTIC_REQUEST_VERSION: &str = "agentapp-automatic-context-recovery-v2";
+const AGENTAPP_RECOVERY_PROMPT_DELIMITER: &str = "\n\n[current user request]\n";
+
+struct AgentAppSemanticRequestEnvelope {
+    provider_kind: String,
+    provider_identity: String,
+    provider_wire_api: String,
+    model: String,
+    reasoning_effort: String,
+    service_tier: String,
+    history: String,
+    workspace: String,
+    dynamic_tools: String,
+    uploads: String,
+    server_kind: String,
+    server_connection_key: String,
+    server_session_key: String,
+    server_host: String,
+    server_port: String,
+    server_user: String,
+    server_auth_method: String,
+    server_fingerprint: String,
+    server_tmux_mode: String,
+}
+
+impl AgentAppSemanticRequestEnvelope {
+    fn local(
+        provider_kind: &str,
+        provider_identity: String,
+        provider_wire_api: String,
+        model: String,
+        reasoning_effort: String,
+        service_tier: String,
+        history: String,
+        workspace: String,
+        dynamic_tools: String,
+        uploads: String,
+    ) -> Self {
+        Self {
+            provider_kind: provider_kind.to_string(),
+            provider_identity,
+            provider_wire_api,
+            model,
+            reasoning_effort,
+            service_tier,
+            history,
+            workspace,
+            dynamic_tools,
+            uploads,
+            server_kind: "local".to_string(),
+            server_connection_key: String::new(),
+            server_session_key: String::new(),
+            server_host: String::new(),
+            server_port: String::new(),
+            server_user: String::new(),
+            server_auth_method: String::new(),
+            server_fingerprint: String::new(),
+            server_tmux_mode: String::new(),
+        }
+    }
+
+    fn digest(&self, ticket: &str, semantic_prompt: &str) -> String {
+        let fields = [
+            AGENTAPP_SEMANTIC_REQUEST_VERSION,
+            ticket,
+            semantic_prompt,
+            self.provider_kind.as_str(),
+            self.provider_identity.as_str(),
+            self.provider_wire_api.as_str(),
+            self.model.as_str(),
+            self.reasoning_effort.as_str(),
+            self.service_tier.as_str(),
+            self.history.as_str(),
+            self.workspace.as_str(),
+            self.dynamic_tools.as_str(),
+            self.uploads.as_str(),
+            self.server_kind.as_str(),
+            self.server_connection_key.as_str(),
+            self.server_session_key.as_str(),
+            self.server_host.as_str(),
+            self.server_port.as_str(),
+            self.server_user.as_str(),
+            self.server_auth_method.as_str(),
+            self.server_fingerprint.as_str(),
+            self.server_tmux_mode.as_str(),
+        ];
+        let framed = fields
+            .iter()
+            .map(|field| format!("{}:{field}", field.len()))
+            .collect::<Vec<_>>()
+            .join("|");
+        format!("{:x}", Sha256::digest(framed.as_bytes()))
+    }
+}
+
 fn c_str_to_string(ptr: *const c_char, field: &str) -> Result<String, String> {
     if ptr.is_null() {
         return Err(format!("{field} pointer was null"));
@@ -808,6 +929,400 @@ fn c_str_to_string(ptr: *const c_char, field: &str) -> Result<String, String> {
         .to_str()
         .map(str::to_owned)
         .map_err(|e| format!("{field} was not valid UTF-8: {e}"))
+}
+
+fn optional_c_str_to_string(ptr: *const c_char, field: &str) -> Result<String, String> {
+    if ptr.is_null() {
+        Ok(String::new())
+    } else {
+        c_str_to_string(ptr, field)
+    }
+}
+
+unsafe fn parse_agentapp_turn_admission(
+    admission: *const AgentAppTurnAdmission,
+) -> Result<ParsedAgentAppTurnAdmission, AdmissionError> {
+    if admission.is_null() {
+        return Err(AdmissionError::InvalidRequest);
+    }
+    // SAFETY: the guarded C entrypoints require a valid configuration pointer.
+    let admission = unsafe { &*admission };
+    let agent_inbox_ticket_id =
+        c_str_to_string(admission.agent_inbox_ticket_id, "agent_inbox_ticket_id")
+            .map_err(|_| AdmissionError::InvalidRequest)?;
+    let semantic_request_prompt =
+        c_str_to_string(admission.semantic_request_prompt, "semantic_request_prompt")
+            .map_err(|_| AdmissionError::InvalidRequest)?;
+    let semantic_request_digest =
+        c_str_to_string(admission.semantic_request_digest, "semantic_request_digest")
+            .map_err(|_| AdmissionError::InvalidRequest)?;
+    let receipt_root_path = c_str_to_string(admission.receipt_root_path, "receipt_root_path")
+        .map_err(|_| AdmissionError::InvalidRequest)?;
+    let request = AdmissionRequest::new(
+        agent_inbox_ticket_id.clone(),
+        semantic_request_digest.clone(),
+        receipt_root_path,
+        admission.requested_generation,
+    )?;
+    Ok(ParsedAgentAppTurnAdmission {
+        request,
+        agent_inbox_ticket_id,
+        semantic_request_prompt,
+        semantic_request_digest,
+    })
+}
+
+unsafe fn validate_agentapp_turn_admission(
+    admission: Option<*const AgentAppTurnAdmission>,
+    actual_prompt: *const c_char,
+    envelope: AgentAppSemanticRequestEnvelope,
+) -> Result<Option<AdmissionRequest>, String> {
+    let Some(admission) = admission else {
+        return Ok(None);
+    };
+    // SAFETY: guarded entrypoints require valid pointers for the duration of
+    // the synchronous call. All values are copied before a worker is spawned.
+    let parsed =
+        unsafe { parse_agentapp_turn_admission(admission) }.map_err(|error| error.to_string())?;
+    let actual_prompt = c_str_to_string(actual_prompt, "prompt")?;
+    let prompt_matches = if actual_prompt == parsed.semantic_request_prompt {
+        true
+    } else {
+        let suffix =
+            AGENTAPP_RECOVERY_PROMPT_DELIMITER.to_string() + &parsed.semantic_request_prompt;
+        actual_prompt
+            .strip_suffix(&suffix)
+            .is_some_and(|bootstrap| {
+                bootstrap.starts_with("[recovered model context]")
+                    || bootstrap.starts_with("[forked model context]")
+            })
+    };
+    if !prompt_matches {
+        return Err(
+            "AgentApp turn admission prompt does not match the guarded request.".to_string(),
+        );
+    }
+    let derived = envelope.digest(
+        &parsed.agent_inbox_ticket_id,
+        &parsed.semantic_request_prompt,
+    );
+    if derived != parsed.semantic_request_digest {
+        return Err(
+            "AgentApp turn admission digest does not match the guarded request.".to_string(),
+        );
+    }
+    Ok(Some(parsed.request))
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn validate_agentapp_local_oauth_admission(
+    admission: Option<*const AgentAppTurnAdmission>,
+    account_id: *const c_char,
+    model: *const c_char,
+    reasoning_effort: *const c_char,
+    service_tier: *const c_char,
+    prompt: *const c_char,
+    history_json: *const c_char,
+    workspace_path: *const c_char,
+    dynamic_tools_json: *const c_char,
+    uploads_json: *const c_char,
+) -> Result<Option<AdmissionRequest>, String> {
+    if admission.is_none() {
+        return Ok(None);
+    }
+    let envelope = AgentAppSemanticRequestEnvelope::local(
+        "oauth",
+        c_str_to_string(account_id, "account_id")?,
+        String::new(),
+        c_str_to_string(model, "model")?,
+        optional_c_str_to_string(reasoning_effort, "reasoning_effort")?,
+        optional_c_str_to_string(service_tier, "service_tier")?,
+        optional_c_str_to_string(history_json, "history_json")?,
+        optional_c_str_to_string(workspace_path, "workspace_path")?,
+        optional_c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?,
+        optional_c_str_to_string(uploads_json, "uploads_json")?,
+    );
+    // SAFETY: forwarded from the guarded FFI entrypoint.
+    unsafe { validate_agentapp_turn_admission(admission, prompt, envelope) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn validate_agentapp_local_apikey_admission(
+    admission: Option<*const AgentAppTurnAdmission>,
+    base_url: *const c_char,
+    wire_api: *const c_char,
+    model: *const c_char,
+    reasoning_effort: *const c_char,
+    service_tier: *const c_char,
+    prompt: *const c_char,
+    history_json: *const c_char,
+    workspace_path: *const c_char,
+    dynamic_tools_json: *const c_char,
+    uploads_json: *const c_char,
+) -> Result<Option<AdmissionRequest>, String> {
+    if admission.is_none() {
+        return Ok(None);
+    }
+    let wire_api = if wire_api.is_null() {
+        "responses".to_string()
+    } else {
+        c_str_to_string(wire_api, "wire_api")?
+    };
+    let envelope = AgentAppSemanticRequestEnvelope::local(
+        "api_key",
+        c_str_to_string(base_url, "base_url")?,
+        wire_api,
+        c_str_to_string(model, "model")?,
+        optional_c_str_to_string(reasoning_effort, "reasoning_effort")?,
+        optional_c_str_to_string(service_tier, "service_tier")?,
+        optional_c_str_to_string(history_json, "history_json")?,
+        optional_c_str_to_string(workspace_path, "workspace_path")?,
+        optional_c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?,
+        optional_c_str_to_string(uploads_json, "uploads_json")?,
+    );
+    // SAFETY: forwarded from the guarded FFI entrypoint.
+    unsafe { validate_agentapp_turn_admission(admission, prompt, envelope) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn add_agentapp_server_envelope(
+    mut envelope: AgentAppSemanticRequestEnvelope,
+    ssh_connection_key: *const c_char,
+    ssh_session_key: *const c_char,
+    ssh_host: *const c_char,
+    ssh_port: u16,
+    ssh_user: *const c_char,
+    ssh_auth_method: *const c_char,
+    ssh_fingerprint: *const c_char,
+    ssh_tmux_mode: *const c_char,
+) -> Result<AgentAppSemanticRequestEnvelope, String> {
+    let host = c_str_to_string(ssh_host, "ssh_host")?;
+    let user = c_str_to_string(ssh_user, "ssh_user")?;
+    let workspace = envelope.workspace.clone();
+    let connection_key = optional_c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
+    let session_key = optional_c_str_to_string(ssh_session_key, "ssh_session_key")?;
+    envelope.server_kind = "ssh".to_string();
+    envelope.server_connection_key = if connection_key.trim().is_empty() {
+        format!("{user}@{host}:{ssh_port}")
+    } else {
+        connection_key
+    };
+    envelope.server_session_key = if session_key.trim().is_empty() {
+        format!("{user}@{host}:{ssh_port}:{workspace}")
+    } else {
+        session_key
+    };
+    envelope.server_host = host;
+    envelope.server_port = ssh_port.to_string();
+    envelope.server_user = user;
+    envelope.server_auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
+    envelope.server_fingerprint = optional_c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
+    envelope.server_tmux_mode = if ssh_tmux_mode.is_null() {
+        "required".to_string()
+    } else {
+        c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?
+    };
+    Ok(envelope)
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn validate_agentapp_server_oauth_admission(
+    admission: Option<*const AgentAppTurnAdmission>,
+    account_id: *const c_char,
+    model: *const c_char,
+    reasoning_effort: *const c_char,
+    service_tier: *const c_char,
+    prompt: *const c_char,
+    history_json: *const c_char,
+    workspace_path: *const c_char,
+    dynamic_tools_json: *const c_char,
+    uploads_json: *const c_char,
+    ssh_connection_key: *const c_char,
+    ssh_session_key: *const c_char,
+    ssh_host: *const c_char,
+    ssh_port: u16,
+    ssh_user: *const c_char,
+    ssh_auth_method: *const c_char,
+    ssh_fingerprint: *const c_char,
+    ssh_tmux_mode: *const c_char,
+) -> Result<Option<AdmissionRequest>, String> {
+    if admission.is_none() {
+        return Ok(None);
+    }
+    let local = AgentAppSemanticRequestEnvelope::local(
+        "oauth",
+        c_str_to_string(account_id, "account_id")?,
+        String::new(),
+        c_str_to_string(model, "model")?,
+        optional_c_str_to_string(reasoning_effort, "reasoning_effort")?,
+        optional_c_str_to_string(service_tier, "service_tier")?,
+        optional_c_str_to_string(history_json, "history_json")?,
+        optional_c_str_to_string(workspace_path, "workspace_path")?,
+        optional_c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?,
+        optional_c_str_to_string(uploads_json, "uploads_json")?,
+    );
+    // SAFETY: forwarded from the guarded FFI entrypoint.
+    let envelope = unsafe {
+        add_agentapp_server_envelope(
+            local,
+            ssh_connection_key,
+            ssh_session_key,
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_auth_method,
+            ssh_fingerprint,
+            ssh_tmux_mode,
+        )
+    }?;
+    // SAFETY: forwarded from the guarded FFI entrypoint.
+    unsafe { validate_agentapp_turn_admission(admission, prompt, envelope) }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn validate_agentapp_server_apikey_admission(
+    admission: Option<*const AgentAppTurnAdmission>,
+    base_url: *const c_char,
+    wire_api: *const c_char,
+    model: *const c_char,
+    reasoning_effort: *const c_char,
+    service_tier: *const c_char,
+    prompt: *const c_char,
+    history_json: *const c_char,
+    workspace_path: *const c_char,
+    dynamic_tools_json: *const c_char,
+    uploads_json: *const c_char,
+    ssh_connection_key: *const c_char,
+    ssh_session_key: *const c_char,
+    ssh_host: *const c_char,
+    ssh_port: u16,
+    ssh_user: *const c_char,
+    ssh_auth_method: *const c_char,
+    ssh_fingerprint: *const c_char,
+    ssh_tmux_mode: *const c_char,
+) -> Result<Option<AdmissionRequest>, String> {
+    if admission.is_none() {
+        return Ok(None);
+    }
+    let wire_api = if wire_api.is_null() {
+        "responses".to_string()
+    } else {
+        c_str_to_string(wire_api, "wire_api")?
+    };
+    let local = AgentAppSemanticRequestEnvelope::local(
+        "api_key",
+        c_str_to_string(base_url, "base_url")?,
+        wire_api,
+        c_str_to_string(model, "model")?,
+        optional_c_str_to_string(reasoning_effort, "reasoning_effort")?,
+        optional_c_str_to_string(service_tier, "service_tier")?,
+        optional_c_str_to_string(history_json, "history_json")?,
+        optional_c_str_to_string(workspace_path, "workspace_path")?,
+        optional_c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?,
+        optional_c_str_to_string(uploads_json, "uploads_json")?,
+    );
+    // SAFETY: forwarded from the guarded FFI entrypoint.
+    let envelope = unsafe {
+        add_agentapp_server_envelope(
+            local,
+            ssh_connection_key,
+            ssh_session_key,
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_auth_method,
+            ssh_fingerprint,
+            ssh_tmux_mode,
+        )
+    }?;
+    // SAFETY: forwarded from the guarded FFI entrypoint.
+    unsafe { validate_agentapp_turn_admission(admission, prompt, envelope) }
+}
+
+fn begin_agentapp_turn_admission(
+    admission: Option<AdmissionRequest>,
+) -> Result<Option<TurnAdmission>, TurnFailure> {
+    let Some(request) = admission else {
+        return Ok(None);
+    };
+    TurnAdmission::begin(request)
+        .map(Some)
+        .map_err(|error| TurnFailure::Public(error.to_string()))
+}
+
+fn begin_and_register_agentapp_ffi_turn(
+    admission: Option<AdmissionRequest>,
+    callback: EventCallback,
+    ctx: *mut c_void,
+) -> Option<(u64, RegistryGuard, Option<TurnAdmission>)> {
+    let result = std::panic::catch_unwind(|| {
+        let mut admission = begin_agentapp_turn_admission(admission)?;
+        let (turn_handle, registry_guard) = register_starting_turn(callback, ctx)
+            .map_err(|error| fail_before_model_request(&mut admission, error))?;
+        Ok((turn_handle, registry_guard, admission))
+    });
+    match result {
+        Ok(Ok(registered)) => Some(registered),
+        Ok(Err(TurnFailure::Public(error))) => {
+            emit(callback, ctx, KIND_ERROR, &error);
+            None
+        }
+        Ok(Err(TurnFailure::ProtectedAlreadyReported)) => None,
+        Err(_) => {
+            emit(callback, ctx, KIND_ERROR, "panic during turn");
+            None
+        }
+    }
+}
+
+fn fail_before_model_request(
+    admission: &mut Option<TurnAdmission>,
+    failure: String,
+) -> TurnFailure {
+    if let Some(admission) = admission
+        && admission.is_pre_admission()
+        && let Err(error) = admission.mark_rejected_before_admission()
+    {
+        return TurnFailure::Public(error.to_string());
+    }
+    TurnFailure::Public(failure)
+}
+
+macro_rules! pre_admission_try {
+    ($admission:expr, $operation:expr) => {
+        match $operation {
+            Ok(value) => value,
+            Err(error) => return Err(fail_before_model_request(&mut $admission, error)),
+        }
+    };
+}
+
+/// Read one exact AgentApp admission receipt without exposing ticket, digest,
+/// prompt, provider, or filesystem content. The allocated JSON string is
+/// released with `codex_free_string`.
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn codex_query_agentapp_turn_admission_receipt(
+    admission: *const AgentAppTurnAdmission,
+) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| {
+        let query = unsafe { parse_agentapp_turn_admission(admission) }
+            .map(|parsed| admission_receipt::query(&parsed.request))
+            .unwrap_or_else(|_| AdmissionReceiptQuery::unavailable("unavailable"));
+        serde_json::to_string(&query).unwrap_or_else(|_| {
+            "{\"contract_version\":1,\"receipt_version\":0,\"state\":\"unavailable\",\
+             \"generation\":0,\"digest_match\":false}"
+                .to_string()
+        })
+    });
+    match result {
+        Ok(json) => crate::into_c_string(json),
+        Err(_) => crate::into_c_string(
+            "{\"contract_version\":1,\"receipt_version\":0,\"state\":\"unavailable\",\
+             \"generation\":0,\"digest_match\":false}"
+                .to_string(),
+        ),
+    }
 }
 
 fn parse_server_file_uploads(uploads_json: &str) -> Result<Vec<ServerFileUpload>, String> {
@@ -1799,6 +2314,7 @@ pub(crate) async fn run_turn_async(
     uploads: Vec<ServerFileUpload>,
     server_mode: Option<ServerMode>,
     credential_guard: Option<Arc<tempfile::TempDir>>,
+    mut admission: Option<TurnAdmission>,
     callback: EventCallback,
     ctx: *mut c_void,
 ) -> Result<(), TurnFailure> {
@@ -1812,14 +2328,17 @@ pub(crate) async fn run_turn_async(
         &dynamic_tools_json,
         server_mode.as_ref(),
     );
-    let reasoning_effort = parse_reasoning_effort(&reasoning_effort)?;
+    let reasoning_effort = pre_admission_try!(admission, parse_reasoning_effort(&reasoning_effort));
     let service_tier = match service_tier.trim() {
         "" => None,
         "fast" => Some("priority".to_string()),
         value => Some(value.to_string()),
     };
     let temporary_home = if context_home.trim().is_empty() {
-        Some(tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?)
+        Some(pre_admission_try!(
+            admission,
+            tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))
+        ))
     } else {
         None
     };
@@ -1827,13 +2346,17 @@ pub(crate) async fn run_turn_async(
         .as_ref()
         .map(|home| home.path().to_path_buf())
         .unwrap_or_else(|| PathBuf::from(&context_home));
-    tokio::fs::create_dir_all(&codex_home)
-        .await
-        .map_err(|error| format!("failed to create model-context home: {error}"))?;
-    let turn_lock = context_turn_lock(&codex_home)?;
+    pre_admission_try!(
+        admission,
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .map_err(|error| format!("failed to create model-context home: {error}"))
+    );
+    let turn_lock = pre_admission_try!(admission, context_turn_lock(&codex_home));
     let _turn_guard = turn_lock.lock().await;
-    let _context_file_lock = acquire_context_file_lock(&codex_home).await?;
-    let resume_path = read_thread_pointer(&codex_home).await?;
+    let _context_file_lock =
+        pre_admission_try!(admission, acquire_context_file_lock(&codex_home).await);
+    let resume_path = pre_admission_try!(admission, read_thread_pointer(&codex_home).await);
     let (warm_thread, stale_thread) = if temporary_home.is_none() {
         take_warm_thread(
             &codex_home,
@@ -1866,7 +2389,10 @@ pub(crate) async fn run_turn_async(
                     id_token,
                     account_id,
                 } => {
-                    let auth = build_auth(access_token, id_token, account_id).await?;
+                    let auth = pre_admission_try!(
+                        admission,
+                        build_auth(access_token, id_token, account_id).await
+                    );
                     let _ = tokio::fs::remove_file(codex_home.join("config.toml")).await;
                     // The built-in OpenAI provider with ChatGPT auth resolves its
                     // base_url to `https://chatgpt.com/backend-api/codex` automatically
@@ -1888,7 +2414,10 @@ pub(crate) async fn run_turn_async(
                     // The Config built below must also select a provider with this
                     // base_url. Otherwise the thread starts with the default `openai`
                     // provider and the request falls back to api.openai.com.
-                    write_api_key_provider_config(&codex_home, &base_url, wire_api).await?;
+                    pre_admission_try!(
+                        admission,
+                        write_api_key_provider_config(&codex_home, &base_url, wire_api).await
+                    );
                     let auth = CodexAuth::from_api_key(&api_key);
                     let provider = create_oss_provider_with_base_url(&base_url, wire_api);
                     (auth, provider, Some(IOS_APIKEY_PROVIDER_ID.to_string()))
@@ -1932,43 +2461,46 @@ pub(crate) async fn run_turn_async(
             };
 
             // Minimal Config rooted at the temp home (no on-disk config => defaults).
-            let mut config = ConfigBuilder::default()
-                .codex_home(codex_home.clone())
-                .harness_overrides(ConfigOverrides {
-                    // An empty model means "use the account's current catalog default".
-                    // This keeps the iOS Provider Default option live as models evolve.
-                    model: (!model.trim().is_empty()).then_some(model.clone()),
-                    // Root the turn in the node's workspace dir ("zone") so file tools
-                    // operate inside it.
-                    cwd: if workspace.is_empty() {
-                        None
-                    } else {
-                        Some(std::path::PathBuf::from(&workspace))
-                    },
-                    // The mobile build has no human in the loop to answer approval
-                    // prompts and no OS sandbox: never block on an approval (that would
-                    // hang the turn forever — there is no UI to approve), and treat the
-                    // node's workspace as writable so any write-capable tool proceeds.
-                    approval_policy: Some(AskForApproval::Never),
-                    // In server mode the command runs on a REMOTE machine over SSH, so a
-                    // *local* OS sandbox is meaningless — and iOS has no seatbelt to set
-                    // one up, so trying to sandbox would force an escalation that
-                    // approval=Never auto-denies ("blocked by the execution environment").
-                    // Use DangerFullAccess so exec dispatches straight to the SSH backend;
-                    // the real security boundary is the remote host (key-only SSH).
-                    // Local mode keeps WorkspaceWrite.
-                    sandbox_mode: Some(if server_mode.is_some() {
-                        SandboxMode::DangerFullAccess
-                    } else {
-                        SandboxMode::WorkspaceWrite
-                    }),
-                    model_provider: model_provider_override,
-                    service_tier: service_tier.map(Some),
-                    ..Default::default()
-                })
-                .build()
-                .await
-                .map_err(|e| format!("failed to build config: {e}"))?;
+            let mut config = pre_admission_try!(
+                admission,
+                ConfigBuilder::default()
+                    .codex_home(codex_home.clone())
+                    .harness_overrides(ConfigOverrides {
+                        // An empty model means "use the account's current catalog default".
+                        // This keeps the iOS Provider Default option live as models evolve.
+                        model: (!model.trim().is_empty()).then_some(model.clone()),
+                        // Root the turn in the node's workspace dir ("zone") so file tools
+                        // operate inside it.
+                        cwd: if workspace.is_empty() {
+                            None
+                        } else {
+                            Some(std::path::PathBuf::from(&workspace))
+                        },
+                        // The mobile build has no human in the loop to answer approval
+                        // prompts and no OS sandbox: never block on an approval (that would
+                        // hang the turn forever — there is no UI to approve), and treat the
+                        // node's workspace as writable so any write-capable tool proceeds.
+                        approval_policy: Some(AskForApproval::Never),
+                        // In server mode the command runs on a REMOTE machine over SSH, so a
+                        // *local* OS sandbox is meaningless — and iOS has no seatbelt to set
+                        // one up, so trying to sandbox would force an escalation that
+                        // approval=Never auto-denies ("blocked by the execution environment").
+                        // Use DangerFullAccess so exec dispatches straight to the SSH backend;
+                        // the real security boundary is the remote host (key-only SSH).
+                        // Local mode keeps WorkspaceWrite.
+                        sandbox_mode: Some(if server_mode.is_some() {
+                            SandboxMode::DangerFullAccess
+                        } else {
+                            SandboxMode::WorkspaceWrite
+                        }),
+                        model_provider: model_provider_override,
+                        service_tier: service_tier.map(Some),
+                        ..Default::default()
+                    })
+                    .build()
+                    .await
+                    .map_err(|e| format!("failed to build config: {e}"))
+            );
             emit_debug_stage(callback, ctx, "config_ready");
 
             // An explicit effort comes from the node picker. None means the model
@@ -2018,47 +2550,78 @@ pub(crate) async fn run_turn_async(
             // the fixed browser argument-privacy policy. It is appended even when the
             // Browser Tool setting is Off so stale calls and resumed histories remain
             // protected without restoring any model-visible browser schema.
-            let dynamic_tools = parse_agentapp_dynamic_tools_json(&dynamic_tools_json)?;
+            let dynamic_tools = pre_admission_try!(
+                admission,
+                parse_agentapp_dynamic_tools_json(&dynamic_tools_json)
+            );
 
             let mut resumed = false;
             let new_thread = if let Some(rollout_path) = resume_path {
-                let reconciliation_request = thread_manager
-                    .execution_reconciliation_request_from_rollout(rollout_path.clone())
-                    .await
-                    .map_err(|error| {
-                        persistent_model_context_resume_error("execution_reconciliation", &error)
-                    })?;
+                let reconciliation_request = pre_admission_try!(
+                    admission,
+                    thread_manager
+                        .execution_reconciliation_request_from_rollout(rollout_path.clone())
+                        .await
+                        .map_err(|error| {
+                            persistent_model_context_resume_error(
+                                "execution_reconciliation",
+                                &error,
+                            )
+                        })
+                );
                 let pending_writes = reconciliation_request.pending_writes.clone();
-                let recovered_executions = thread_manager
-                    .reconcile_remote_executions_for_resume(reconciliation_request)
-                    .await
-                    .map_err(|error| {
-                        persistent_model_context_resume_error("execution_reconciliation", &error)
-                    })?;
+                if (!reconciliation_request.incomplete_executions.is_empty()
+                    || !pending_writes.is_empty())
+                    && let Some(admission) = admission.as_mut()
+                    && admission.is_pre_admission()
+                {
+                    admission
+                        .mark_tool_or_side_effect_possible()
+                        .map_err(|error| error.to_string())?;
+                }
+                let recovered_executions = pre_admission_try!(
+                    admission,
+                    thread_manager
+                        .reconcile_remote_executions_for_resume(reconciliation_request)
+                        .await
+                        .map_err(|error| {
+                            persistent_model_context_resume_error(
+                                "execution_reconciliation",
+                                &error,
+                            )
+                        })
+                );
                 emit_debug_stage(callback, ctx, "exact_execution_reconciled");
-                let thread = thread_manager
-                    .resume_thread_from_rollout_with_tools_and_recovered_executions(
-                        config.clone(),
-                        rollout_path.clone(),
-                        thread_manager.auth_manager(),
-                        /*parent_trace*/ None,
-                        /*supports_openai_form_elicitation*/ false,
-                        dynamic_tools.clone(),
-                        recovered_executions,
-                        pending_writes,
-                    )
-                    .await
-                    .map_err(|error| {
-                        persistent_model_context_resume_error("thread_resume", &error)
-                    })?;
+                let thread = pre_admission_try!(
+                    admission,
+                    thread_manager
+                        .resume_thread_from_rollout_with_tools_and_recovered_executions(
+                            config.clone(),
+                            rollout_path.clone(),
+                            thread_manager.auth_manager(),
+                            /*parent_trace*/ None,
+                            /*supports_openai_form_elicitation*/ false,
+                            dynamic_tools.clone(),
+                            recovered_executions,
+                            pending_writes,
+                        )
+                        .await
+                        .map_err(|error| persistent_model_context_resume_error(
+                            "thread_resume",
+                            &error
+                        ))
+                );
                 resumed = true;
                 emit_debug_stage(callback, ctx, "thread_resumed");
                 thread
             } else {
-                thread_manager
-                    .start_thread_with_tools(config, dynamic_tools)
-                    .await
-                    .map_err(|e| format!("failed to start thread: {e}"))?
+                pre_admission_try!(
+                    admission,
+                    thread_manager
+                        .start_thread_with_tools(config, dynamic_tools)
+                        .await
+                        .map_err(|e| format!("failed to start thread: {e}"))
+                )
             };
             (
                 new_thread.thread_id,
@@ -2168,8 +2731,21 @@ pub(crate) async fn run_turn_async(
     // racing after the check is preserved by activate_turn below, after input is
     // already ordered, and is then submitted and drained.
     if startup_interrupt_requested(turn_handle)? {
+        if let Some(admission) = admission.as_mut() {
+            admission.mark_terminal().map_err(|error| error.to_string())?;
+        }
         emit(callback, ctx, KIND_TURN_ABORTED, "");
         return Ok(());
+    }
+    // This is deliberately written before `thread.submit`, which also carries
+    // prompt images to the provider. A storage failure here leaves the receipt
+    // retryable only after the outer boundary durably records its rejection.
+    if let Some(admission) = admission.as_mut()
+        && admission.is_pre_admission()
+    {
+        admission
+            .mark_model_request_possible()
+            .map_err(|error| error.to_string())?;
     }
     let mut submit_timed_out = false;
     let expected_turn_id = if prompt_contains_images {
@@ -2201,6 +2777,11 @@ pub(crate) async fn run_turn_async(
         emit_debug_stage(callback, ctx, "prompt_submit_end");
         Some(turn_id)
     };
+    if expected_turn_id.is_some()
+        && let Some(admission) = admission.as_mut()
+    {
+        admission.mark_admitted().map_err(|error| error.to_string())?;
+    }
     let (mut resp_rx, interrupted_during_submit) = activate_turn(
         turn_handle,
         Arc::clone(&thread),
@@ -2693,6 +3274,18 @@ pub(crate) async fn run_turn_async(
         },
         Err(error) => Err(error),
     };
+    if let Some(admission) = admission.as_mut()
+        && !admission.is_finalized()
+    {
+        let admission_result = if admission.is_pre_admission() && turn_result.is_err() {
+            admission.mark_rejected_before_admission()
+        } else {
+            admission.mark_terminal()
+        };
+        if let Err(error) = admission_result {
+            return Err(TurnFailure::Public(error.to_string()));
+        }
+    }
     finish_turn_after_cleanup(
         callback,
         ctx,
@@ -2788,6 +3381,37 @@ async fn upload_server_files_for_steering(
     Ok(receipts)
 }
 
+async fn upload_server_files_after_admission(
+    admission: &mut Option<TurnAdmission>,
+    server_mode: &ServerMode,
+    workspace: &str,
+    uploads: &[ServerFileUpload],
+    attempt_scope: &str,
+) -> Result<(), TurnFailure> {
+    if uploads.is_empty() {
+        return Ok(());
+    }
+    let mark_possible_result = match admission.as_mut() {
+        Some(admission) => admission.mark_tool_or_side_effect_possible(),
+        None => Ok(()),
+    };
+    if let Err(error) = mark_possible_result {
+        return Err(fail_before_model_request(admission, error.to_string()));
+    }
+    let upload_result =
+        upload_server_files_for_steering(Some(server_mode), workspace, uploads, attempt_scope)
+            .await;
+    if let Err(error) = upload_result {
+        if let Some(admission) = admission.as_mut()
+            && let Err(receipt_error) = admission.mark_terminal()
+        {
+            return Err(TurnFailure::Public(receipt_error.to_string()));
+        }
+        return Err(TurnFailure::Public(error));
+    }
+    Ok(())
+}
+
 async fn rollback_server_file_uploads(
     server_mode: Option<&ServerMode>,
     workspace: &str,
@@ -2839,21 +3463,64 @@ fn steering_user_input(
     Ok(input)
 }
 
-/// Drive ONE user turn through the real Codex turn loop and stream events to
-/// `callback`. Blocks on a tokio runtime built inside the call.
-///
-/// `event_kind`: 0=reasoning_delta, 1=text_delta, 2=done, 3=error.
-///
-/// On a setup failure (bad pointers, auth/config/thread construction) the
-/// callback is invoked once with `event_kind=3` (error) and a message. A panic
-/// anywhere is caught and surfaced as an error event rather than unwinding
-/// across the FFI boundary.
-///
-/// # Safety
-/// All string pointers must be either null or valid NUL-terminated C strings.
-/// `callback` must be a valid function pointer; `ctx` is passed through opaquely.
-#[unsafe(no_mangle)]
-pub extern "C" fn codex_run_turn_streaming(
+macro_rules! agentapp_ffi_entrypoints {
+    (
+        $legacy:ident,
+        $guarded:ident,
+        $inner:ident,
+        ($($argument:ident: $argument_ty:ty),* $(,)?)
+    ) => {
+        #[unsafe(no_mangle)]
+        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        pub extern "C" fn $legacy(
+            $($argument: $argument_ty,)*
+            ctx: *mut c_void,
+            callback: EventCallback,
+        ) {
+            unsafe {
+                $inner($($argument,)* /*agentapp_admission*/ None, ctx, callback);
+            }
+        }
+
+        #[unsafe(no_mangle)]
+        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        pub extern "C" fn $guarded(
+            $($argument: $argument_ty,)*
+            admission: *const AgentAppTurnAdmission,
+            ctx: *mut c_void,
+            callback: EventCallback,
+        ) {
+            unsafe {
+                $inner($($argument,)* Some(admission), ctx, callback);
+            }
+        }
+    };
+}
+
+agentapp_ffi_entrypoints!(
+    codex_run_turn_streaming,
+    codex_run_turn_streaming_agentapp,
+    codex_run_turn_streaming_inner,
+    (
+        access_token: *const c_char,
+        id_token: *const c_char,
+        account_id: *const c_char,
+        model: *const c_char,
+        reasoning_effort: *const c_char,
+        service_tier: *const c_char,
+        prompt: *const c_char,
+        history_json: *const c_char,
+        context_home_path: *const c_char,
+        workspace_path: *const c_char,
+        dynamic_tools_json: *const c_char,
+        uploads_json: *const c_char,
+    )
+);
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn codex_run_turn_streaming_inner(
     access_token: *const c_char,
     id_token: *const c_char,
     account_id: *const c_char,
@@ -2866,59 +3533,114 @@ pub extern "C" fn codex_run_turn_streaming(
     workspace_path: *const c_char,
     dynamic_tools_json: *const c_char,
     uploads_json: *const c_char,
+    agentapp_admission: Option<*const AgentAppTurnAdmission>,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
-    let (turn_handle, _registry_guard) = match register_starting_turn(callback, ctx) {
-        Ok(registered) => registered,
-        Err(message) => {
-            emit(callback, ctx, KIND_ERROR, &message);
+    // SAFETY: all pointers are owned by the synchronous FFI caller. The
+    // validator copies the guarded semantic envelope before any receipt or
+    // native turn is created.
+    let admission_request = match unsafe {
+        validate_agentapp_local_oauth_admission(
+            agentapp_admission,
+            account_id,
+            model,
+            reasoning_effort,
+            service_tier,
+            prompt,
+            history_json,
+            workspace_path,
+            dynamic_tools_json,
+            uploads_json,
+        )
+    } {
+        Ok(request) => request,
+        Err(error) => {
+            emit(callback, ctx, KIND_ERROR, &error);
             return;
         }
     };
+    let Some((turn_handle, _registry_guard, admission)) =
+        begin_and_register_agentapp_ffi_turn(admission_request, callback, ctx)
+    else {
+        return;
+    };
     let result = std::panic::catch_unwind(move || {
+        let mut admission = admission;
         // Parse the C strings on the calling thread (the pointers are only valid
         // for the duration of this call), then move the owned data into a worker.
-        let token = c_str_to_string(access_token, "access_token")?;
-        let id_tok = c_str_to_string(id_token, "id_token")?;
-        let account = c_str_to_string(account_id, "account_id")?;
-        let model = c_str_to_string(model, "model")?;
-        let reasoning_effort = if reasoning_effort.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(reasoning_effort, "reasoning_effort")?
-        };
-        let service_tier = if service_tier.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(service_tier, "service_tier")?
-        };
-        let prompt = c_str_to_string(prompt, "prompt")?;
-        // History is optional: NULL or empty means a fresh conversation.
-        let history = if history_json.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(history_json, "history_json")?
-        };
-        let context_home = c_str_to_string(context_home_path, "context_home_path")?;
-        // Workspace dir to root the turn at (where file tools operate). Optional.
-        let workspace = if workspace_path.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(workspace_path, "workspace_path")?
-        };
-        // Client-supplied dynamic tool specs (JSON array). Optional.
-        let dynamic_tools = if dynamic_tools_json.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
-        };
-        let uploads = if uploads_json.is_null() {
-            Vec::new()
-        } else {
-            parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
-        };
+        let (
+            token,
+            id_tok,
+            account,
+            model,
+            reasoning_effort,
+            service_tier,
+            prompt,
+            history,
+            context_home,
+            workspace,
+            dynamic_tools,
+            uploads,
+        ) = pre_admission_try!(
+            admission,
+            (|| {
+                let token = c_str_to_string(access_token, "access_token")?;
+                let id_tok = c_str_to_string(id_token, "id_token")?;
+                let account = c_str_to_string(account_id, "account_id")?;
+                let model = c_str_to_string(model, "model")?;
+                let reasoning_effort = if reasoning_effort.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(reasoning_effort, "reasoning_effort")?
+                };
+                let service_tier = if service_tier.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(service_tier, "service_tier")?
+                };
+                let prompt = c_str_to_string(prompt, "prompt")?;
+                // History is optional: NULL or empty means a fresh conversation.
+                let history = if history_json.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(history_json, "history_json")?
+                };
+                let context_home = c_str_to_string(context_home_path, "context_home_path")?;
+                // Workspace dir to root the turn at (where file tools operate). Optional.
+                let workspace = if workspace_path.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(workspace_path, "workspace_path")?
+                };
+                // Client-supplied dynamic tool specs (JSON array). Optional.
+                let dynamic_tools = if dynamic_tools_json.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
+                };
+                let uploads = if uploads_json.is_null() {
+                    Vec::new()
+                } else {
+                    parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
+                };
+                Ok((
+                    token,
+                    id_tok,
+                    account,
+                    model,
+                    reasoning_effort,
+                    service_tier,
+                    prompt,
+                    history,
+                    context_home,
+                    workspace,
+                    dynamic_tools,
+                    uploads,
+                ))
+            })()
+        );
 
         // `block_on` drives the main future on the CALLING thread. On iOS the
         // caller is a GCD worker (~512 KiB stack), which Codex's deep async
@@ -2926,7 +3648,8 @@ pub extern "C" fn codex_run_turn_streaming(
         // page). Run the runtime + block_on on a dedicated thread with a large
         // stack instead. (`thread_stack_size` below only covers tokio's own
         // worker threads, not the block_on driver thread.)
-        std::thread::Builder::new()
+        let worker_admission = admission.clone();
+        let worker = match std::thread::Builder::new()
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
             .spawn(move || -> Result<(), TurnFailure> {
@@ -2949,11 +3672,20 @@ pub extern "C" fn codex_run_turn_streaming(
                     uploads,
                     /*server_mode*/ None,
                     /*credential_guard*/ None,
+                    worker_admission,
                     callback,
                     ctx,
                 ))
-            })
-            .map_err(|e| format!("failed to spawn worker thread: {e}"))?
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                return Err(fail_before_model_request(
+                    &mut admission,
+                    format!("failed to spawn worker thread: {error}"),
+                ));
+            }
+        };
+        worker
             .join()
             .map_err(|_| "worker thread panicked".to_string())?
     });
@@ -2961,25 +3693,29 @@ pub extern "C" fn codex_run_turn_streaming(
     emit_turn_result(callback, ctx, result);
 }
 
-/// Generic API-key counterpart of [`codex_run_turn_streaming`]: drives ONE user
-/// turn against ANY OpenAI-Responses-compatible endpoint using a plain bearer
-/// API key instead of ChatGPT OAuth. This is the path for OpenAI proper (with an
-/// API key), a local Ollama / LM Studio server, or any paid compatible provider.
-///
-/// `base_url` is the provider's API root that exposes the Responses API at
-/// `<base_url>/responses` (e.g. `http://localhost:11434/v1` for a local Ollama,
-/// or `https://api.openai.com/v1`). `api_key` is sent as `Authorization: Bearer
-/// <api_key>`; for a local server that ignores auth it can be any non-empty
-/// placeholder.
-///
-/// Local mode only (shell/exec disabled, on-device file tools) — mirrors
-/// [`codex_run_turn_streaming`]. Event kinds and error handling are identical.
-///
-/// # Safety
-/// All string pointers must be either null or valid NUL-terminated C strings.
-/// `callback` must be a valid function pointer; `ctx` is passed through opaquely.
-#[unsafe(no_mangle)]
-pub extern "C" fn codex_run_turn_streaming_apikey(
+// The API-key variants follow the same event and receipt contract as OAuth.
+agentapp_ffi_entrypoints!(
+    codex_run_turn_streaming_apikey,
+    codex_run_turn_streaming_apikey_agentapp,
+    codex_run_turn_streaming_apikey_inner,
+    (
+        base_url: *const c_char,
+        api_key: *const c_char,
+        wire_api: *const c_char,
+        model: *const c_char,
+        reasoning_effort: *const c_char,
+        service_tier: *const c_char,
+        prompt: *const c_char,
+        history_json: *const c_char,
+        context_home_path: *const c_char,
+        workspace_path: *const c_char,
+        dynamic_tools_json: *const c_char,
+        uploads_json: *const c_char,
+    )
+);
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn codex_run_turn_streaming_apikey_inner(
     base_url: *const c_char,
     api_key: *const c_char,
     wire_api: *const c_char,
@@ -2992,66 +3728,121 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
     workspace_path: *const c_char,
     dynamic_tools_json: *const c_char,
     uploads_json: *const c_char,
+    agentapp_admission: Option<*const AgentAppTurnAdmission>,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
-    let (turn_handle, _registry_guard) = match register_starting_turn(callback, ctx) {
-        Ok(registered) => registered,
-        Err(message) => {
-            emit(callback, ctx, KIND_ERROR, &message);
+    // SAFETY: all pointers are owned by the synchronous FFI caller.
+    let admission_request = match unsafe {
+        validate_agentapp_local_apikey_admission(
+            agentapp_admission,
+            base_url,
+            wire_api,
+            model,
+            reasoning_effort,
+            service_tier,
+            prompt,
+            history_json,
+            workspace_path,
+            dynamic_tools_json,
+            uploads_json,
+        )
+    } {
+        Ok(request) => request,
+        Err(error) => {
+            emit(callback, ctx, KIND_ERROR, &error);
             return;
         }
     };
+    let Some((turn_handle, _registry_guard, admission)) =
+        begin_and_register_agentapp_ffi_turn(admission_request, callback, ctx)
+    else {
+        return;
+    };
     let result = std::panic::catch_unwind(move || {
+        let mut admission = admission;
         // Parse the C strings on the calling thread (the pointers are only valid
         // for the duration of this call), then move the owned data into a worker.
-        let base_url = c_str_to_string(base_url, "base_url")?;
-        let api_key = c_str_to_string(api_key, "api_key")?;
-        let wire_api = if wire_api.is_null() {
-            WireApi::Responses
-        } else {
-            parse_wire_api(&c_str_to_string(wire_api, "wire_api")?)?
-        };
-        let model = c_str_to_string(model, "model")?;
-        let reasoning_effort = if reasoning_effort.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(reasoning_effort, "reasoning_effort")?
-        };
-        let service_tier = if service_tier.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(service_tier, "service_tier")?
-        };
-        let prompt = c_str_to_string(prompt, "prompt")?;
-        // History is optional: NULL or empty means a fresh conversation.
-        let history = if history_json.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(history_json, "history_json")?
-        };
-        let context_home = c_str_to_string(context_home_path, "context_home_path")?;
-        // Workspace dir to root the turn at (where file tools operate). Optional.
-        let workspace = if workspace_path.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(workspace_path, "workspace_path")?
-        };
-        // Client-supplied dynamic tool specs (JSON array). Optional.
-        let dynamic_tools = if dynamic_tools_json.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
-        };
-        let uploads = if uploads_json.is_null() {
-            Vec::new()
-        } else {
-            parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
-        };
+        let (
+            base_url,
+            api_key,
+            wire_api,
+            model,
+            reasoning_effort,
+            service_tier,
+            prompt,
+            history,
+            context_home,
+            workspace,
+            dynamic_tools,
+            uploads,
+        ) = pre_admission_try!(
+            admission,
+            (|| {
+                let base_url = c_str_to_string(base_url, "base_url")?;
+                let api_key = c_str_to_string(api_key, "api_key")?;
+                let wire_api = if wire_api.is_null() {
+                    WireApi::Responses
+                } else {
+                    parse_wire_api(&c_str_to_string(wire_api, "wire_api")?)?
+                };
+                let model = c_str_to_string(model, "model")?;
+                let reasoning_effort = if reasoning_effort.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(reasoning_effort, "reasoning_effort")?
+                };
+                let service_tier = if service_tier.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(service_tier, "service_tier")?
+                };
+                let prompt = c_str_to_string(prompt, "prompt")?;
+                // History is optional: NULL or empty means a fresh conversation.
+                let history = if history_json.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(history_json, "history_json")?
+                };
+                let context_home = c_str_to_string(context_home_path, "context_home_path")?;
+                // Workspace dir to root the turn at (where file tools operate). Optional.
+                let workspace = if workspace_path.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(workspace_path, "workspace_path")?
+                };
+                // Client-supplied dynamic tool specs (JSON array). Optional.
+                let dynamic_tools = if dynamic_tools_json.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
+                };
+                let uploads = if uploads_json.is_null() {
+                    Vec::new()
+                } else {
+                    parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
+                };
+                Ok((
+                    base_url,
+                    api_key,
+                    wire_api,
+                    model,
+                    reasoning_effort,
+                    service_tier,
+                    prompt,
+                    history,
+                    context_home,
+                    workspace,
+                    dynamic_tools,
+                    uploads,
+                ))
+            })()
+        );
 
         // Same big-stack worker + multi-thread runtime dance as the OAuth FFI.
-        std::thread::Builder::new()
+        let worker_admission = admission.clone();
+        let worker = match std::thread::Builder::new()
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
             .spawn(move || -> Result<(), TurnFailure> {
@@ -3074,11 +3865,20 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
                     uploads,
                     /*server_mode*/ None,
                     /*credential_guard*/ None,
+                    worker_admission,
                     callback,
                     ctx,
                 ))
-            })
-            .map_err(|e| format!("failed to spawn worker thread: {e}"))?
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                return Err(fail_before_model_request(
+                    &mut admission,
+                    format!("failed to spawn worker thread: {error}"),
+                ));
+            }
+        };
+        worker
             .join()
             .map_err(|_| "worker thread panicked".to_string())?
     });
@@ -3086,16 +3886,37 @@ pub extern "C" fn codex_run_turn_streaming_apikey(
     emit_turn_result(callback, ctx, result);
 }
 
-/// Generic API-key + server-mode counterpart: provider selection and SSH tool
-/// routing are independent. This drives ONE turn against an API-key provider
-/// while shell/exec tools run on the configured SSH host.
-///
-/// # Safety
-/// All string pointers must be either null or valid NUL-terminated C strings.
-/// `callback` must be a valid function pointer; `ctx` is passed through opaquely.
-#[unsafe(no_mangle)]
+agentapp_ffi_entrypoints!(
+    codex_run_turn_streaming_apikey_server,
+    codex_run_turn_streaming_apikey_server_agentapp,
+    codex_run_turn_streaming_apikey_server_inner,
+    (
+        base_url: *const c_char,
+        api_key: *const c_char,
+        wire_api: *const c_char,
+        model: *const c_char,
+        reasoning_effort: *const c_char,
+        service_tier: *const c_char,
+        prompt: *const c_char,
+        history_json: *const c_char,
+        context_home_path: *const c_char,
+        workspace_path: *const c_char,
+        dynamic_tools_json: *const c_char,
+        ssh_connection_key: *const c_char,
+        ssh_session_key: *const c_char,
+        ssh_host: *const c_char,
+        ssh_port: u16,
+        ssh_user: *const c_char,
+        ssh_auth_method: *const c_char,
+        ssh_secret: *const c_char,
+        ssh_fingerprint: *const c_char,
+        ssh_tmux_mode: *const c_char,
+        uploads_json: *const c_char,
+    )
+);
+
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn codex_run_turn_streaming_apikey_server(
+unsafe fn codex_run_turn_streaming_apikey_server_inner(
     base_url: *const c_char,
     api_key: *const c_char,
     wire_api: *const c_char,
@@ -3117,116 +3938,189 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
     ssh_fingerprint: *const c_char,
     ssh_tmux_mode: *const c_char,
     uploads_json: *const c_char,
+    agentapp_admission: Option<*const AgentAppTurnAdmission>,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
-    let (turn_handle, _registry_guard) = match register_starting_turn(callback, ctx) {
-        Ok(registered) => registered,
-        Err(message) => {
-            emit(callback, ctx, KIND_ERROR, &message);
+    // SAFETY: all pointers are owned by the synchronous FFI caller.
+    let admission_request = match unsafe {
+        validate_agentapp_server_apikey_admission(
+            agentapp_admission,
+            base_url,
+            wire_api,
+            model,
+            reasoning_effort,
+            service_tier,
+            prompt,
+            history_json,
+            workspace_path,
+            dynamic_tools_json,
+            uploads_json,
+            ssh_connection_key,
+            ssh_session_key,
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_auth_method,
+            ssh_fingerprint,
+            ssh_tmux_mode,
+        )
+    } {
+        Ok(request) => request,
+        Err(error) => {
+            emit(callback, ctx, KIND_ERROR, &error);
             return;
         }
     };
+    let Some((turn_handle, _registry_guard, admission)) =
+        begin_and_register_agentapp_ffi_turn(admission_request, callback, ctx)
+    else {
+        return;
+    };
     let result = std::panic::catch_unwind(move || {
-        let base_url = c_str_to_string(base_url, "base_url")?;
-        let api_key = c_str_to_string(api_key, "api_key")?;
-        let wire_api = if wire_api.is_null() {
-            WireApi::Responses
-        } else {
-            parse_wire_api(&c_str_to_string(wire_api, "wire_api")?)?
-        };
-        let model = c_str_to_string(model, "model")?;
-        let reasoning_effort = if reasoning_effort.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(reasoning_effort, "reasoning_effort")?
-        };
-        let service_tier = if service_tier.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(service_tier, "service_tier")?
-        };
-        let prompt = c_str_to_string(prompt, "prompt")?;
-        let history = if history_json.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(history_json, "history_json")?
-        };
-        let context_home = c_str_to_string(context_home_path, "context_home_path")?;
-        let workspace = if workspace_path.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(workspace_path, "workspace_path")?
-        };
-        let dynamic_tools = if dynamic_tools_json.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
-        };
-        let uploads = if uploads_json.is_null() {
-            Vec::new()
-        } else {
-            parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
-        };
+        let mut admission = admission;
+        let (
+            base_url,
+            api_key,
+            wire_api,
+            model,
+            reasoning_effort,
+            service_tier,
+            prompt,
+            history,
+            context_home,
+            workspace,
+            dynamic_tools,
+            uploads,
+            server_mode,
+            credential_guard,
+        ) = pre_admission_try!(
+            admission,
+            (|| {
+                let base_url = c_str_to_string(base_url, "base_url")?;
+                let api_key = c_str_to_string(api_key, "api_key")?;
+                let wire_api = if wire_api.is_null() {
+                    WireApi::Responses
+                } else {
+                    parse_wire_api(&c_str_to_string(wire_api, "wire_api")?)?
+                };
+                let model = c_str_to_string(model, "model")?;
+                let reasoning_effort = if reasoning_effort.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(reasoning_effort, "reasoning_effort")?
+                };
+                let service_tier = if service_tier.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(service_tier, "service_tier")?
+                };
+                let prompt = c_str_to_string(prompt, "prompt")?;
+                let history = if history_json.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(history_json, "history_json")?
+                };
+                let context_home = c_str_to_string(context_home_path, "context_home_path")?;
+                let workspace = if workspace_path.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(workspace_path, "workspace_path")?
+                };
+                let dynamic_tools = if dynamic_tools_json.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
+                };
+                let uploads = if uploads_json.is_null() {
+                    Vec::new()
+                } else {
+                    parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
+                };
 
-        let host = c_str_to_string(ssh_host, "ssh_host")?;
-        let user = c_str_to_string(ssh_user, "ssh_user")?;
-        let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
-        let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
-        let connection_key = if ssh_connection_key.is_null() {
-            format!("{user}@{host}:{ssh_port}")
-        } else {
-            let value = c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
-            if value.trim().is_empty() {
-                format!("{user}@{host}:{ssh_port}")
-            } else {
-                value
-            }
-        };
-        let session_key = if ssh_session_key.is_null() {
-            format!("{user}@{host}:{ssh_port}:{workspace}")
-        } else {
-            let s = c_str_to_string(ssh_session_key, "ssh_session_key")?;
-            if s.trim().is_empty() {
-                format!("{user}@{host}:{ssh_port}:{workspace}")
-            } else {
-                s
-            }
-        };
-        let fingerprint = if ssh_fingerprint.is_null() {
-            None
-        } else {
-            let s = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
-            if s.trim().is_empty() { None } else { Some(s) }
-        };
-        let tmux_mode = if ssh_tmux_mode.is_null() {
-            SshTmuxMode::Required
-        } else {
-            parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
-        };
-        let (authentication, secret_guard) = parse_ssh_authentication(&auth_method, secret)?;
-        let credential_guard = secret_guard.map(Arc::new);
+                let host = c_str_to_string(ssh_host, "ssh_host")?;
+                let user = c_str_to_string(ssh_user, "ssh_user")?;
+                let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
+                let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
+                let connection_key = if ssh_connection_key.is_null() {
+                    format!("{user}@{host}:{ssh_port}")
+                } else {
+                    let value = c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
+                    if value.trim().is_empty() {
+                        format!("{user}@{host}:{ssh_port}")
+                    } else {
+                        value
+                    }
+                };
+                let session_key = if ssh_session_key.is_null() {
+                    format!("{user}@{host}:{ssh_port}:{workspace}")
+                } else {
+                    let session_key = c_str_to_string(ssh_session_key, "ssh_session_key")?;
+                    if session_key.trim().is_empty() {
+                        format!("{user}@{host}:{ssh_port}:{workspace}")
+                    } else {
+                        session_key
+                    }
+                };
+                let fingerprint = if ssh_fingerprint.is_null() {
+                    None
+                } else {
+                    let fingerprint = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
+                    if fingerprint.trim().is_empty() {
+                        None
+                    } else {
+                        Some(fingerprint)
+                    }
+                };
+                let tmux_mode = if ssh_tmux_mode.is_null() {
+                    SshTmuxMode::Required
+                } else {
+                    parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
+                };
+                let (authentication, secret_guard) =
+                    parse_ssh_authentication(&auth_method, secret)?;
+                let credential_guard = secret_guard.map(Arc::new);
+                let server_mode = ServerMode {
+                    connection_key,
+                    session_key,
+                    host,
+                    port: ssh_port,
+                    user,
+                    authentication,
+                    host_fingerprint: fingerprint,
+                    tmux_mode,
+                };
+                Ok((
+                    base_url,
+                    api_key,
+                    wire_api,
+                    model,
+                    reasoning_effort,
+                    service_tier,
+                    prompt,
+                    history,
+                    context_home,
+                    workspace,
+                    dynamic_tools,
+                    uploads,
+                    server_mode,
+                    credential_guard,
+                ))
+            })()
+        );
 
-        let server_mode = ServerMode {
-            connection_key,
-            session_key,
-            host,
-            port: ssh_port,
-            user,
-            authentication,
-            host_fingerprint: fingerprint,
-            tmux_mode,
-        };
-
-        std::thread::Builder::new()
+        let worker_admission = admission.clone();
+        let worker = match std::thread::Builder::new()
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
             .spawn(move || -> Result<(), TurnFailure> {
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(async move {
-                    let _receipts = upload_server_files_for_steering(
-                        Some(&server_mode),
+                    let mut admission = worker_admission;
+                    upload_server_files_after_admission(
+                        &mut admission,
+                        &server_mode,
                         &workspace,
                         &uploads,
                         &format!("turn-{turn_handle}"),
@@ -3251,13 +4145,22 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
                         uploads,
                         Some(server_mode),
                         credential_guard,
+                        admission,
                         callback,
                         ctx,
                     )
                     .await
                 })
-            })
-            .map_err(|e| format!("failed to spawn worker thread: {e}"))?
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                return Err(fail_before_model_request(
+                    &mut admission,
+                    format!("failed to spawn worker thread: {error}"),
+                ));
+            }
+        };
+        worker
             .join()
             .map_err(|_| "worker thread panicked".to_string())?
     });
@@ -3265,29 +4168,37 @@ pub extern "C" fn codex_run_turn_streaming_apikey_server(
     emit_turn_result(callback, ctx, result);
 }
 
-/// Server-mode counterpart of [`codex_run_turn_streaming`]: drives ONE user
-/// turn whose shell/exec tools run on a remote SSH host instead of being
-/// disabled. Takes the same params as [`codex_run_turn_streaming`] PLUS the SSH
-/// connection settings.
-///
-/// `workspace_path` here is the cwd ON THE SERVER (it must exist on the remote
-/// host); the turn is rooted there.
-///
-/// `ssh_key_pem` is the OpenSSH PRIVATE KEY CONTENTS (PEM text), NOT a path. It
-/// is written to a chmod-600 file inside an ephemeral temp dir for the duration
-/// of the call (and deleted afterward); nothing is persisted.
-///
-/// `ssh_fingerprint` is the expected server host-key fingerprint in OpenSSH
-/// `SHA256:...` form. When null or empty, host-key pinning is disabled
-/// (permissive). When set, the SSH connection is rejected unless the server's
-/// host key matches.
-///
-/// # Safety
-/// All string pointers must be either null or valid NUL-terminated C strings.
-/// `callback` must be a valid function pointer; `ctx` is passed through opaquely.
-#[unsafe(no_mangle)]
+agentapp_ffi_entrypoints!(
+    codex_run_turn_streaming_server,
+    codex_run_turn_streaming_server_agentapp,
+    codex_run_turn_streaming_server_inner,
+    (
+        access_token: *const c_char,
+        id_token: *const c_char,
+        account_id: *const c_char,
+        model: *const c_char,
+        reasoning_effort: *const c_char,
+        service_tier: *const c_char,
+        prompt: *const c_char,
+        history_json: *const c_char,
+        context_home_path: *const c_char,
+        workspace_path: *const c_char,
+        dynamic_tools_json: *const c_char,
+        ssh_connection_key: *const c_char,
+        ssh_session_key: *const c_char,
+        ssh_host: *const c_char,
+        ssh_port: u16,
+        ssh_user: *const c_char,
+        ssh_auth_method: *const c_char,
+        ssh_secret: *const c_char,
+        ssh_fingerprint: *const c_char,
+        ssh_tmux_mode: *const c_char,
+        uploads_json: *const c_char,
+    )
+);
+
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn codex_run_turn_streaming_server(
+unsafe fn codex_run_turn_streaming_server_inner(
     access_token: *const c_char,
     id_token: *const c_char,
     account_id: *const c_char,
@@ -3309,120 +4220,192 @@ pub extern "C" fn codex_run_turn_streaming_server(
     ssh_fingerprint: *const c_char,
     ssh_tmux_mode: *const c_char,
     uploads_json: *const c_char,
+    agentapp_admission: Option<*const AgentAppTurnAdmission>,
     ctx: *mut c_void,
     callback: EventCallback,
 ) {
     let ctx_addr = ctx as usize;
-    let (turn_handle, _registry_guard) = match register_starting_turn(callback, ctx) {
-        Ok(registered) => registered,
-        Err(message) => {
-            emit(callback, ctx, KIND_ERROR, &message);
+    // SAFETY: all pointers are owned by the synchronous FFI caller.
+    let admission_request = match unsafe {
+        validate_agentapp_server_oauth_admission(
+            agentapp_admission,
+            account_id,
+            model,
+            reasoning_effort,
+            service_tier,
+            prompt,
+            history_json,
+            workspace_path,
+            dynamic_tools_json,
+            uploads_json,
+            ssh_connection_key,
+            ssh_session_key,
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_auth_method,
+            ssh_fingerprint,
+            ssh_tmux_mode,
+        )
+    } {
+        Ok(request) => request,
+        Err(error) => {
+            emit(callback, ctx, KIND_ERROR, &error);
             return;
         }
     };
+    let Some((turn_handle, _registry_guard, admission)) =
+        begin_and_register_agentapp_ffi_turn(admission_request, callback, ctx)
+    else {
+        return;
+    };
     let result = std::panic::catch_unwind(move || {
+        let mut admission = admission;
         // Parse the C strings on the calling thread (the pointers are only valid
         // for the duration of this call), then move the owned data into a worker.
-        let token = c_str_to_string(access_token, "access_token")?;
-        let id_tok = c_str_to_string(id_token, "id_token")?;
-        let account = c_str_to_string(account_id, "account_id")?;
-        let model = c_str_to_string(model, "model")?;
-        let reasoning_effort = if reasoning_effort.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(reasoning_effort, "reasoning_effort")?
-        };
-        let service_tier = if service_tier.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(service_tier, "service_tier")?
-        };
-        let prompt = c_str_to_string(prompt, "prompt")?;
-        // History is optional: NULL or empty means a fresh conversation.
-        let history = if history_json.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(history_json, "history_json")?
-        };
-        let context_home = c_str_to_string(context_home_path, "context_home_path")?;
-        // Workspace dir to root the turn at (on the SERVER). Optional.
-        let workspace = if workspace_path.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(workspace_path, "workspace_path")?
-        };
-        // Client-supplied dynamic tool specs (JSON array). Optional.
-        let dynamic_tools = if dynamic_tools_json.is_null() {
-            String::new()
-        } else {
-            c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
-        };
-        let uploads = if uploads_json.is_null() {
-            Vec::new()
-        } else {
-            parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
-        };
+        let (
+            token,
+            id_tok,
+            account,
+            model,
+            reasoning_effort,
+            service_tier,
+            prompt,
+            history,
+            context_home,
+            workspace,
+            dynamic_tools,
+            uploads,
+            server_mode,
+            credential_guard,
+        ) = pre_admission_try!(
+            admission,
+            (|| {
+                let token = c_str_to_string(access_token, "access_token")?;
+                let id_tok = c_str_to_string(id_token, "id_token")?;
+                let account = c_str_to_string(account_id, "account_id")?;
+                let model = c_str_to_string(model, "model")?;
+                let reasoning_effort = if reasoning_effort.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(reasoning_effort, "reasoning_effort")?
+                };
+                let service_tier = if service_tier.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(service_tier, "service_tier")?
+                };
+                let prompt = c_str_to_string(prompt, "prompt")?;
+                // History is optional: NULL or empty means a fresh conversation.
+                let history = if history_json.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(history_json, "history_json")?
+                };
+                let context_home = c_str_to_string(context_home_path, "context_home_path")?;
+                // Workspace dir to root the turn at (on the SERVER). Optional.
+                let workspace = if workspace_path.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(workspace_path, "workspace_path")?
+                };
+                // Client-supplied dynamic tool specs (JSON array). Optional.
+                let dynamic_tools = if dynamic_tools_json.is_null() {
+                    String::new()
+                } else {
+                    c_str_to_string(dynamic_tools_json, "dynamic_tools_json")?
+                };
+                let uploads = if uploads_json.is_null() {
+                    Vec::new()
+                } else {
+                    parse_server_file_uploads(&c_str_to_string(uploads_json, "uploads_json")?)?
+                };
 
-        // SSH connection settings.
-        let host = c_str_to_string(ssh_host, "ssh_host")?;
-        let user = c_str_to_string(ssh_user, "ssh_user")?;
-        let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
-        let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
-        let connection_key = if ssh_connection_key.is_null() {
-            format!("{user}@{host}:{ssh_port}")
-        } else {
-            let value = c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
-            if value.trim().is_empty() {
-                format!("{user}@{host}:{ssh_port}")
-            } else {
-                value
-            }
-        };
-        let session_key = if ssh_session_key.is_null() {
-            format!("{user}@{host}:{ssh_port}:{workspace}")
-        } else {
-            let s = c_str_to_string(ssh_session_key, "ssh_session_key")?;
-            if s.trim().is_empty() {
-                format!("{user}@{host}:{ssh_port}:{workspace}")
-            } else {
-                s
-            }
-        };
-        // Fingerprint is optional: null/empty => no host-key pinning.
-        let fingerprint = if ssh_fingerprint.is_null() {
-            None
-        } else {
-            let s = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
-            if s.trim().is_empty() { None } else { Some(s) }
-        };
-        let tmux_mode = if ssh_tmux_mode.is_null() {
-            SshTmuxMode::Required
-        } else {
-            parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
-        };
-        let (authentication, secret_guard) = parse_ssh_authentication(&auth_method, secret)?;
-        let credential_guard = secret_guard.map(Arc::new);
-
-        let server_mode = ServerMode {
-            connection_key,
-            session_key,
-            host,
-            port: ssh_port,
-            user,
-            authentication,
-            host_fingerprint: fingerprint,
-            tmux_mode,
-        };
+                // SSH connection settings.
+                let host = c_str_to_string(ssh_host, "ssh_host")?;
+                let user = c_str_to_string(ssh_user, "ssh_user")?;
+                let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
+                let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
+                let connection_key = if ssh_connection_key.is_null() {
+                    format!("{user}@{host}:{ssh_port}")
+                } else {
+                    let value = c_str_to_string(ssh_connection_key, "ssh_connection_key")?;
+                    if value.trim().is_empty() {
+                        format!("{user}@{host}:{ssh_port}")
+                    } else {
+                        value
+                    }
+                };
+                let session_key = if ssh_session_key.is_null() {
+                    format!("{user}@{host}:{ssh_port}:{workspace}")
+                } else {
+                    let session_key = c_str_to_string(ssh_session_key, "ssh_session_key")?;
+                    if session_key.trim().is_empty() {
+                        format!("{user}@{host}:{ssh_port}:{workspace}")
+                    } else {
+                        session_key
+                    }
+                };
+                // Fingerprint is optional: null/empty => no host-key pinning.
+                let fingerprint = if ssh_fingerprint.is_null() {
+                    None
+                } else {
+                    let fingerprint = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
+                    if fingerprint.trim().is_empty() {
+                        None
+                    } else {
+                        Some(fingerprint)
+                    }
+                };
+                let tmux_mode = if ssh_tmux_mode.is_null() {
+                    SshTmuxMode::Required
+                } else {
+                    parse_tmux_mode(&c_str_to_string(ssh_tmux_mode, "ssh_tmux_mode")?)?
+                };
+                let (authentication, secret_guard) =
+                    parse_ssh_authentication(&auth_method, secret)?;
+                let credential_guard = secret_guard.map(Arc::new);
+                let server_mode = ServerMode {
+                    connection_key,
+                    session_key,
+                    host,
+                    port: ssh_port,
+                    user,
+                    authentication,
+                    host_fingerprint: fingerprint,
+                    tmux_mode,
+                };
+                Ok((
+                    token,
+                    id_tok,
+                    account,
+                    model,
+                    reasoning_effort,
+                    service_tier,
+                    prompt,
+                    history,
+                    context_home,
+                    workspace,
+                    dynamic_tools,
+                    uploads,
+                    server_mode,
+                    credential_guard,
+                ))
+            })()
+        );
 
         // Same big-stack worker + multi-thread runtime dance as the local FFI.
-        std::thread::Builder::new()
+        let worker_admission = admission.clone();
+        let worker = match std::thread::Builder::new()
             .name("codex-turn".to_string())
             .stack_size(32 * 1024 * 1024)
             .spawn(move || -> Result<(), TurnFailure> {
                 let ctx = ctx_addr as *mut c_void;
                 turn_runtime().block_on(async move {
-                    let _receipts = upload_server_files_for_steering(
-                        Some(&server_mode),
+                    let mut admission = worker_admission;
+                    upload_server_files_after_admission(
+                        &mut admission,
+                        &server_mode,
                         &workspace,
                         &uploads,
                         &format!("turn-{turn_handle}"),
@@ -3447,13 +4430,22 @@ pub extern "C" fn codex_run_turn_streaming_server(
                         uploads,
                         /*server_mode*/ Some(server_mode),
                         credential_guard,
+                        admission,
                         callback,
                         ctx,
                     )
                     .await
                 })
-            })
-            .map_err(|e| format!("failed to spawn worker thread: {e}"))?
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                return Err(fail_before_model_request(
+                    &mut admission,
+                    format!("failed to spawn worker thread: {error}"),
+                ));
+            }
+        };
+        worker
             .join()
             .map_err(|_| "worker thread panicked".to_string())?
     });
@@ -3523,6 +4515,7 @@ pub unsafe fn run_turn_streaming(
                     uploads,
                     server_mode,
                     /*credential_guard*/ None,
+                    /*admission*/ None,
                     callback,
                     ctx,
                 ))

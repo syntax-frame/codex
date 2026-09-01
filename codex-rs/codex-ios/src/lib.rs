@@ -28,12 +28,18 @@ use http::HeaderName;
 use http::HeaderValue;
 
 mod turn;
+pub use turn::AgentAppTurnAdmission;
 pub use turn::EventCallback;
 pub use turn::ServerFileUpload;
 pub use turn::ServerMode;
 pub use turn::codex_interrupt_turn;
+pub use turn::codex_query_agentapp_turn_admission_receipt;
 pub use turn::codex_reconcile_persisted_context_server;
 pub use turn::codex_run_turn_streaming;
+pub use turn::codex_run_turn_streaming_agentapp;
+pub use turn::codex_run_turn_streaming_apikey_agentapp;
+pub use turn::codex_run_turn_streaming_apikey_server_agentapp;
+pub use turn::codex_run_turn_streaming_server_agentapp;
 pub use turn::codex_steer_turn;
 pub use turn::run_turn_streaming;
 

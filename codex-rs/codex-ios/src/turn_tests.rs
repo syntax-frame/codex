@@ -37,6 +37,8 @@ use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 
 use super::AGENTAPP_BROWSER_TOOL_NAMES;
+use super::AgentAppSemanticRequestEnvelope;
+use super::AgentAppTurnAdmission;
 use super::CONTEXT_LOCK_FILE;
 use super::CONTEXT_POINTER_FILE;
 use super::KIND_CONTEXT_COMPACTION_STARTED;
@@ -61,7 +63,9 @@ use super::build_turn_runtime;
 use super::claim_turn_exit_disposition;
 use super::codex_interrupt_turn;
 use super::codex_ios_tool_discovery_contract_version;
+use super::codex_query_agentapp_turn_admission_receipt;
 use super::codex_run_turn_streaming_apikey;
+use super::codex_run_turn_streaming_apikey_agentapp;
 use super::codex_steer_turn;
 use super::codex_steer_turn_with_uploads;
 use super::disable_upstream_multi_agent;
@@ -669,6 +673,194 @@ fn run_apikey_turn_against(context_home: &Path, base_url: &str) -> Vec<(c_int, S
     );
 
     events
+}
+
+#[test]
+fn guarded_ffi_persists_pre_submit_rejection_before_emitting_the_failure() {
+    let context_home = tempfile::tempdir().expect("context home");
+    let receipt_root = tempfile::tempdir().expect("receipt root");
+    let base_url = CString::new("http://127.0.0.1:1/v1").expect("base URL");
+    let api_key = CString::new("test-key").expect("API key");
+    let wire_api = CString::new("responses").expect("wire API");
+    let model = CString::new("gpt-5.4").expect("model");
+    let prompt = CString::new("test prompt").expect("prompt");
+    let context_home =
+        CString::new(context_home.path().to_string_lossy().as_bytes()).expect("context home");
+    let dynamic_tools = CString::new(r#"{"not":"an array"}"#).expect("dynamic tools");
+    let ticket = CString::new("agent-inbox-ticket").expect("ticket");
+    let semantic_prompt = CString::new("test prompt").expect("semantic prompt");
+    let semantic_digest = CString::new(
+        AgentAppSemanticRequestEnvelope::local(
+            "api_key",
+            "http://127.0.0.1:1/v1".to_string(),
+            "responses".to_string(),
+            "gpt-5.4".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            r#"{"not":"an array"}"#.to_string(),
+            String::new(),
+        )
+        .digest("agent-inbox-ticket", "test prompt"),
+    )
+    .expect("digest");
+    let receipt_root =
+        CString::new(receipt_root.path().to_string_lossy().as_bytes()).expect("receipt root");
+    let admission = AgentAppTurnAdmission {
+        agent_inbox_ticket_id: ticket.as_ptr(),
+        semantic_request_prompt: semantic_prompt.as_ptr(),
+        semantic_request_digest: semantic_digest.as_ptr(),
+        receipt_root_path: receipt_root.as_ptr(),
+        requested_generation: 0,
+    };
+    let mut events: Vec<(c_int, String)> = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+
+    codex_run_turn_streaming_apikey_agentapp(
+        base_url.as_ptr(),
+        api_key.as_ptr(),
+        wire_api.as_ptr(),
+        model.as_ptr(),
+        /*reasoning_effort*/ std::ptr::null(),
+        /*service_tier*/ std::ptr::null(),
+        prompt.as_ptr(),
+        /*history_json*/ std::ptr::null(),
+        context_home.as_ptr(),
+        /*workspace_path*/ std::ptr::null(),
+        dynamic_tools.as_ptr(),
+        /*uploads_json*/ std::ptr::null(),
+        &admission,
+        ctx,
+        capture_event,
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|(kind, message)| *kind == KIND_ERROR && message.contains("dynamic_tools_json"))
+    );
+    assert!(!events.iter().any(|(kind, _)| *kind == KIND_TURN_READY));
+
+    let query_ptr = codex_query_agentapp_turn_admission_receipt(&admission);
+    let query = unsafe { CStr::from_ptr(query_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    crate::codex_free_string(query_ptr);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&query).expect("receipt JSON"),
+        serde_json::json!({
+            "contract_version": 1,
+            "receipt_version": 1,
+            "state": "rejected_before_admission",
+            "generation": 0,
+            "digest_match": true,
+        })
+    );
+}
+
+#[test]
+fn guarded_ffi_rejects_changed_payload_before_creating_a_receipt() {
+    let context_home = tempfile::tempdir().expect("context home");
+    let receipt_root = tempfile::tempdir().expect("receipt root");
+    let claimed_base_url = "http://127.0.0.1:1/v1";
+    let actual_base_url = CString::new("http://127.0.0.1:2/v1").expect("base URL");
+    let api_key = CString::new("test-key").expect("API key");
+    let wire_api = CString::new("responses").expect("wire API");
+    let model = CString::new("gpt-5.4").expect("model");
+    let prompt = CString::new("test prompt").expect("prompt");
+    let context_home =
+        CString::new(context_home.path().to_string_lossy().as_bytes()).expect("context home");
+    let dynamic_tools = CString::new("[]").expect("dynamic tools");
+    let ticket = CString::new("changed-payload-ticket").expect("ticket");
+    let semantic_prompt = CString::new("test prompt").expect("semantic prompt");
+    let semantic_digest = CString::new(
+        AgentAppSemanticRequestEnvelope::local(
+            "api_key",
+            claimed_base_url.to_string(),
+            "responses".to_string(),
+            "gpt-5.4".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "[]".to_string(),
+            String::new(),
+        )
+        .digest("changed-payload-ticket", "test prompt"),
+    )
+    .expect("digest");
+    let receipt_root =
+        CString::new(receipt_root.path().to_string_lossy().as_bytes()).expect("receipt root");
+    let admission = AgentAppTurnAdmission {
+        agent_inbox_ticket_id: ticket.as_ptr(),
+        semantic_request_prompt: semantic_prompt.as_ptr(),
+        semantic_request_digest: semantic_digest.as_ptr(),
+        receipt_root_path: receipt_root.as_ptr(),
+        requested_generation: 0,
+    };
+    let mut events: Vec<(c_int, String)> = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+
+    codex_run_turn_streaming_apikey_agentapp(
+        actual_base_url.as_ptr(),
+        api_key.as_ptr(),
+        wire_api.as_ptr(),
+        model.as_ptr(),
+        /*reasoning_effort*/ std::ptr::null(),
+        /*service_tier*/ std::ptr::null(),
+        prompt.as_ptr(),
+        /*history_json*/ std::ptr::null(),
+        context_home.as_ptr(),
+        /*workspace_path*/ std::ptr::null(),
+        dynamic_tools.as_ptr(),
+        /*uploads_json*/ std::ptr::null(),
+        &admission,
+        ctx,
+        capture_event,
+    );
+
+    assert!(events.iter().any(|(kind, message)| {
+        *kind == KIND_ERROR && message.contains("digest does not match")
+    }));
+    assert!(!events.iter().any(|(kind, _)| *kind == KIND_TURN_STARTING));
+
+    let query_ptr = codex_query_agentapp_turn_admission_receipt(&admission);
+    let query = unsafe { CStr::from_ptr(query_ptr) }
+        .to_string_lossy()
+        .into_owned();
+    crate::codex_free_string(query_ptr);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&query).expect("receipt JSON"),
+        serde_json::json!({
+            "contract_version": 1,
+            "receipt_version": 0,
+            "state": "missing",
+            "generation": 0,
+            "digest_match": false,
+        })
+    );
+}
+
+#[test]
+fn agentapp_semantic_request_digest_has_a_stable_cross_language_vector() {
+    let envelope = AgentAppSemanticRequestEnvelope::local(
+        "api_key",
+        "https://example.test/v1".to_string(),
+        "responses".to_string(),
+        "gpt-5.4".to_string(),
+        "high".to_string(),
+        "default".to_string(),
+        String::new(),
+        "/workspace".to_string(),
+        "[]".to_string(),
+        "[]".to_string(),
+    );
+
+    assert_eq!(
+        envelope.digest("ticket", "hello"),
+        "506d43115c65d4163ce55562fe817c82d7ebf4769e22208b6faa627f6fd0fdac"
+    );
 }
 
 struct RejectingResponsesServer {
