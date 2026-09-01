@@ -9,6 +9,7 @@ use super::acknowledgement_command;
 use super::acknowledgement_release_command;
 use super::exact_reconciliation_command;
 use super::interrupt_outcome_from_control_result;
+use super::orphaned_execution_session_reaper_command;
 use super::parse_monitor_exit_classification;
 use super::parse_recovered_executions;
 use super::shell_quote;
@@ -191,13 +192,22 @@ fn adoption_is_exact_fenced_and_only_rolls_forward_a_committed_stale_launch() {
         "supervisor-ready",
         "payload-go",
         "resume_stale_termination",
+        "session_created",
+        "created-at",
+        "expiry.sh",
+        "terminal-cleanup.sh",
+        "upgrade_watchdog_window",
     ] {
         assert!(command.contains(proof), "missing adoption proof: {proof}");
     }
     assert!(!command.contains("adoption-claim"));
-    assert!(!command.contains("new-window"));
+    assert_eq!(command.matches("tmux new-window").count(), 1);
+    assert!(
+        !command.contains("tmux new-window -d -t \"$expected_session:\" -n \"$expected_window\"")
+    );
     assert!(!command.contains("touch \"$root/go\""));
     assert!(!command.contains("command.sh"));
+    assert!(!command.contains("kill-session"));
 }
 
 #[test]
@@ -359,7 +369,7 @@ fn bootstrap_compare_and_attach_is_exact_and_generation_fenced() {
         .find("mv \"$root/keeper-release.tmp\" \"$root/keeper-release\"")
         .expect("keeper release");
     let keeper_retirement = command
-        .find("tmux kill-window -t \"$session:__agentapp_keeper\"")
+        .rfind("tmux kill-window -t \"$session:__agentapp_keeper\"")
         .expect("keeper retirement");
     assert!(command_release < keeper_release);
     assert!(keeper_release < keeper_retirement);
@@ -414,6 +424,27 @@ fn durable_expiry_is_fenced_and_uses_a_transport_neutral_notice() {
     let notice = EXECUTION_EXPIRY_SYSTEM_NOTICE.to_ascii_lowercase();
     assert!(!notice.contains("ssh"));
     assert!(!notice.contains("tmux"));
+}
+
+#[test]
+fn bootstrap_reaps_only_old_dead_acknowledged_modern_sessions_in_bounded_batches() {
+    let params = exec_params("process", "sleep 30");
+    let descriptor = TmuxProcessDescriptor::new("agent", "controller", &params);
+    let reaper = orphaned_execution_session_reaper_command();
+    let bootstrap = descriptor.bootstrap_command(&params);
+
+    assert!(bootstrap.contains("agentapp_reap_acknowledged_sessions"));
+    assert!(reaper.contains(".orphan-session-reaper"));
+    assert!(reaper.contains("session_created"));
+    assert!(reaper.contains("reaped\" -lt 128"));
+    assert!(reaper.contains("now - created_at"));
+    assert!(reaper.contains("-ge 86400"));
+    assert!(reaper.contains("[ ! -e \"$root\" ] && [ ! -L \"$root\" ]"));
+    assert!(reaper.contains("tmux list-panes -s -t \"$candidate\""));
+    assert!(reaper.contains("[ \"$orphan_dead\" = 1 ]"));
+    assert!(reaper.contains("tmux kill-window -t \"$orphan_window_id\""));
+    assert!(!reaper.contains("tmux kill-session"));
+    assert!(!reaper.contains("rm -rf"));
 }
 
 #[test]
@@ -506,12 +537,13 @@ fn bootstrap_initializes_descriptor_before_atomic_publication() {
         .expect("atomic descriptor publication");
     assert!(stage < final_metadata);
     assert!(final_metadata < publish);
-    assert!(!command.contains("> \"$root/owner\""));
-    assert!(!command.contains("> \"$root/identity\""));
-    assert!(!command.contains("> \"$root/digest\""));
-    assert!(!command.contains("> \"$root/window\""));
-    assert!(!command.contains("> \"$root/output\""));
-    assert!(!command.contains("> \"$root/state\""));
+    let before_publish = &command[..publish];
+    assert!(!before_publish.contains("> \"$root/owner\""));
+    assert!(!before_publish.contains("> \"$root/identity\""));
+    assert!(!before_publish.contains("> \"$root/digest\""));
+    assert!(!before_publish.contains("> \"$root/window\""));
+    assert!(!before_publish.contains("> \"$root/output\""));
+    assert!(!before_publish.contains("> \"$root/state\""));
 }
 
 #[cfg(unix)]
@@ -570,6 +602,7 @@ fn bootstrap_interruption_before_publication_leaves_retryable_descriptor_path() 
             "acknowledgement-token",
             "attempt-generation",
             "call-id",
+            "created-at",
             "digest",
             "identity",
             "output",
@@ -3449,6 +3482,76 @@ fn real_tmux_short_durable_tty_expiry_waits_for_its_output_close_receipt() {
 
 #[cfg(unix)]
 #[test]
+fn real_tmux_expiry_resumes_after_crash_once_its_terminal_claim_is_durable() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62604", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "expiry-resume-controller", &params);
+    let bootstrap =
+        descriptor
+            .bootstrap_command(&params)
+            .replacen("sleep 5\ndone", "sleep 1\ndone", 1);
+    assert_ne!(bootstrap, descriptor.bootstrap_command(&params));
+    let started = fixture.run_shell(bootstrap);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    apply_ready_protocol(&mut descriptor, &started.stdout);
+    let root = fixture.descriptor_root(&descriptor);
+
+    let resume_point = concat!(
+        "require_expiry_claim\n",
+        "if [ \"$(cat \"$root/tty\" 2>/dev/null || true)\" = 1 ]; then\n"
+    );
+    let crash_script = descriptor
+        .expiry_script()
+        .replacen("max_lifetime=86400", "max_lifetime=0", 1)
+        .replacen(
+            resume_point,
+            concat!(
+                "require_expiry_claim\n",
+                "exit 91\n",
+                "if [ \"$(cat \"$root/tty\" 2>/dev/null || true)\" = 1 ]; then\n"
+            ),
+            1,
+        );
+    assert_ne!(crash_script, descriptor.expiry_script());
+    fs::write(root.join("expiry.sh"), crash_script).expect("install crashing expiry script");
+
+    assert!(
+        wait_for_file_value(&root.join("terminal-claim/kind"), "expired\n"),
+        "expiry did not durably claim the execution before the injected crash"
+    );
+    assert!(
+        !root.join("status").exists(),
+        "injected expiry crash unexpectedly published terminal status"
+    );
+
+    let resumed_script =
+        descriptor
+            .expiry_script()
+            .replacen("max_lifetime=86400", "max_lifetime=0", 1);
+    fs::write(root.join("expiry.sh"), resumed_script).expect("install resumable expiry script");
+    assert!(
+        wait_for_file_value(&root.join("status"), "124\n"),
+        "expiry did not resume from its durable terminal claim"
+    );
+    let output = fs::read_to_string(root.join("output")).expect("resumed expiry output");
+    assert_eq!(output.matches(EXECUTION_EXPIRY_SYSTEM_NOTICE).count(), 1);
+    assert!(
+        fixture.wait_for_session_exit(&descriptor.session_name),
+        "resumed expiry left its modern execution session running"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn real_tmux_natural_terminal_claim_wins_the_expiry_race() {
     use std::fs;
 
@@ -3485,6 +3588,107 @@ fn real_tmux_natural_terminal_claim_wins_the_expiry_race() {
     assert!(
         fixture.wait_for_session_exit(&descriptor.session_name),
         "watchdog did not automatically retire the normal terminal session"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_orphan_reaper_removes_only_dead_acknowledged_modern_sessions() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let orphan_agent = "1111111111111111";
+    let orphan_process = "2222222222222222";
+    let orphan_session = format!("agentapp_{orphan_agent}_{orphan_process}");
+    let orphan_window = format!("p_{orphan_process}");
+    let retained_agent = "3333333333333333";
+    let retained_process = "4444444444444444";
+    let retained_session = format!("agentapp_{retained_agent}_{retained_process}");
+    let retained_window = format!("p_{retained_process}");
+    let live_agent = "5555555555555555";
+    let live_process = "6666666666666666";
+    let live_session = format!("agentapp_{live_agent}_{live_process}");
+    let live_window = format!("p_{live_process}");
+
+    for (session, window) in [
+        (&orphan_session, &orphan_window),
+        (&retained_session, &retained_window),
+        (&live_session, &live_window),
+    ] {
+        let created = fixture.tmux(&["new-session", "-d", "-s", session, "-n", window, "sleep 30"]);
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let retained = fixture.tmux(&["set-option", "-w", "-t", session, "remain-on-exit", "on"]);
+        assert!(
+            retained.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retained.stderr)
+        );
+    }
+
+    for session in [&orphan_session, &retained_session] {
+        let stopped = fixture.tmux(&["send-keys", "-t", session, "C-c"]);
+        assert!(
+            stopped.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+        let mut dead = false;
+        for _ in 0..50 {
+            let observed = fixture.tmux(&["display-message", "-p", "-t", session, "#{pane_dead}"]);
+            if observed.status.success() && String::from_utf8_lossy(&observed.stdout).trim() == "1"
+            {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(dead, "{session} did not become a retained dead pane");
+    }
+
+    fs::create_dir_all(
+        fixture
+            .home
+            .path()
+            .join(".agentapp/tmux")
+            .join(retained_agent)
+            .join(retained_process),
+    )
+    .expect("retained descriptor root");
+
+    let reaper = orphaned_execution_session_reaper_command().replacen("-ge 86400", "-ge 0", 1);
+    assert_ne!(reaper, orphaned_execution_session_reaper_command());
+    let reaped = fixture.run_shell(reaper);
+    assert!(
+        reaped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reaped.stderr)
+    );
+    assert!(
+        !fixture
+            .tmux(&["has-session", "-t", &orphan_session])
+            .status
+            .success(),
+        "acknowledged dead modern session was not reaped"
+    );
+    assert!(
+        fixture
+            .tmux(&["has-session", "-t", &retained_session])
+            .status
+            .success(),
+        "session with a durable descriptor was reaped"
+    );
+    assert!(
+        fixture
+            .tmux(&["has-session", "-t", &live_session])
+            .status
+            .success(),
+        "live session was reaped"
     );
 }
 
@@ -3900,6 +4104,111 @@ fn real_tmux_adoption_rolls_forward_a_sigkill_stale_bootstrap_claim() {
         "running\n"
     );
     assert!(!root.join("transition-claim").exists());
+
+    let termination = fixture.run_shell(adopter.termination_command());
+    assert!(
+        termination.status.success(),
+        "{}",
+        String::from_utf8_lossy(&termination.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_tmux_adoption_upgrades_a_running_modern_session_to_durable_expiry() {
+    use std::fs;
+
+    let Some(fixture) = RealTmuxFixture::new() else {
+        return;
+    };
+    let params = exec_params("62603", "sleep 30");
+    let mut descriptor =
+        TmuxProcessDescriptor::new(&fixture.agent_key, "pre-expiry-controller", &params);
+    fixture.bootstrap(&mut descriptor, &params);
+    let root = fixture.descriptor_root(&descriptor);
+    fs::remove_file(root.join("created-at")).expect("remove simulated legacy created-at");
+    fs::remove_file(root.join("expiry.sh")).expect("remove simulated legacy expiry script");
+    fs::remove_file(root.join("terminal-cleanup.sh"))
+        .expect("remove simulated legacy cleanup script");
+    fs::write(root.join("watchdog.sh"), "#!/bin/sh\nexit 99\n")
+        .expect("simulate legacy watchdog script");
+
+    let adoption = AdoptionRequest {
+        identity: params
+            .execution_identity
+            .clone()
+            .expect("execution identity"),
+        expected_command_digest: descriptor.command_digest.clone(),
+        original_session_id: Some(62603),
+        committed_output_cursor: 0,
+        tty: false,
+    };
+    let mut adopter =
+        TmuxProcessDescriptor::from_adoption(&fixture.agent_key, "expiry-upgrade", &adoption);
+    let adopted = fixture.run_shell(adopter.adoption_command());
+    assert!(
+        adopted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&adopted.stderr)
+    );
+    apply_adopted_protocol(&mut adopter, &adopted.stdout);
+
+    let observed_created = fixture.tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        &adopter.session_name,
+        "#{session_created}",
+    ]);
+    assert!(
+        observed_created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observed_created.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("created-at"))
+            .expect("migrated created-at")
+            .trim(),
+        String::from_utf8(observed_created.stdout)
+            .expect("session creation timestamp")
+            .trim()
+    );
+    assert!(
+        fs::read_to_string(root.join("expiry.sh"))
+            .expect("migrated expiry script")
+            .contains(EXECUTION_EXPIRY_SYSTEM_NOTICE)
+    );
+    assert!(
+        fs::read_to_string(root.join("terminal-cleanup.sh"))
+            .expect("migrated cleanup script")
+            .contains("completed:completed")
+    );
+    assert!(
+        fs::read_to_string(root.join("watchdog.sh"))
+            .expect("migrated watchdog script")
+            .contains("/bin/sh \"$root/expiry.sh\"")
+    );
+    let windows = fixture.tmux(&[
+        "list-windows",
+        "-t",
+        &adopter.session_name,
+        "-F",
+        "#{window_name}",
+    ]);
+    assert!(
+        windows.status.success(),
+        "{}",
+        String::from_utf8_lossy(&windows.stderr)
+    );
+    let windows = String::from_utf8(windows.stdout).expect("window listing");
+    assert_eq!(
+        windows
+            .lines()
+            .filter(|window| *window == adopter.watchdog_window_name)
+            .count(),
+        1
+    );
+    assert!(!windows.lines().any(|window| window.starts_with("u_")));
 
     let termination = fixture.run_shell(adopter.termination_command());
     assert!(
@@ -5526,6 +5835,7 @@ fn generated_remote_shell_is_syntactically_valid() {
         descriptor.watchdog_script(),
         descriptor.expiry_script(),
         descriptor.terminal_cleanup_script(),
+        orphaned_execution_session_reaper_command(),
         descriptor.monitor_command(1),
         descriptor.recover_dead_execution_command(),
         descriptor.interrupt_command(),
