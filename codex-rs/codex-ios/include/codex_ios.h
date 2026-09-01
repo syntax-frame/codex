@@ -154,7 +154,12 @@ typedef struct {
 /*
  * Query one receipt without changing it. Returns allocated contract-v1 JSON:
  * {"contract_version":1,"receipt_version":<number>,"state":<stable string>,
- *  "generation":<number>,"digest_match":<bool>}.
+ *  "generation":<number>,"digest_match":<bool>,
+ *  "authorizes_generation_one_start":<bool>}.
+ * `digest_match` proves an exact generation/semantic/execution match.
+ * `authorizes_generation_one_start` is true only for a generation-one query
+ * against the matching semantic digest of a generation-zero receipt that was
+ * durably rejected before admission; its new execution digest is expected.
  * `state` is one of preparing, persisted_queued, rejected_before_admission,
  * tool_or_side_effect_possible, model_request_possible, admitted, terminal,
  * missing, ambiguous, or unavailable. Release the result with
