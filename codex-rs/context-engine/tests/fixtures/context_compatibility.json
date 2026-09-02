@@ -1,0 +1,96 @@
+{
+  "scenarios": [
+    {
+      "name": "text_continuation",
+      "target": { "lineage": { "provider": "openai", "protocol": "responses", "lineage_id": "openai-a" }, "model": "gpt-test", "max_context_tokens": 200000, "supported": [] },
+      "events": [
+        { "id": "text-1", "conversation_id": "text", "turn_id": "turn-1", "sequence": 1, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "First prompt" }] } } },
+        { "id": "text-2", "conversation_id": "text", "turn_id": "turn-1", "sequence": 2, "payload": { "type": "message", "payload": { "role": "assistant", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "First response" }] } } },
+        { "id": "text-3", "conversation_id": "text", "turn_id": "turn-2", "sequence": 3, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Continue" }] } } }
+      ],
+      "fork_request": null,
+      "expected": { "transcript_event_ids": ["text-1", "text-2", "text-3"], "model_item_ids": ["text-1", "text-2", "text-3"] }
+    },
+    {
+      "name": "encrypted_reasoning",
+      "target": { "lineage": { "provider": "openai", "protocol": "responses", "lineage_id": "openai-a" }, "model": "gpt-test", "max_context_tokens": 200000, "supported": ["opaque_reasoning"] },
+      "events": [
+        { "id": "reason-1", "conversation_id": "reason", "turn_id": "turn-1", "sequence": 1, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Solve this" }] } } },
+        { "id": "reason-2", "conversation_id": "reason", "turn_id": "turn-1", "sequence": 2, "payload": { "type": "provider_opaque", "payload": { "lineage": { "provider": "openai", "protocol": "responses", "lineage_id": "openai-a" }, "provider_item_id": "rs_fake", "kind": "encrypted_reasoning", "payload": [102,97,107,101,45,101,110,99,114,121,112,116,101,100,45,114,101,97,115,111,110,105,110,103] } } },
+        { "id": "reason-3", "conversation_id": "reason", "turn_id": "turn-1", "sequence": 3, "payload": { "type": "message", "payload": { "role": "assistant", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Result" }] } } }
+      ],
+      "fork_request": null,
+      "expected": { "transcript_event_ids": ["reason-1", "reason-3"], "model_item_ids": ["reason-1", "reason-2", "reason-3"] }
+    },
+    {
+      "name": "automatic_compaction",
+      "target": { "lineage": { "provider": "openai", "protocol": "responses", "lineage_id": "openai-a" }, "model": "gpt-test", "max_context_tokens": 200000, "supported": ["native_compaction"] },
+      "events": [
+        { "id": "compact-1", "conversation_id": "compact", "turn_id": "turn-1", "sequence": 1, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Old prompt one" }] } } },
+        { "id": "compact-2", "conversation_id": "compact", "turn_id": "turn-1", "sequence": 2, "payload": { "type": "message", "payload": { "role": "assistant", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Old answer one" }] } } },
+        { "id": "compact-3", "conversation_id": "compact", "turn_id": "turn-2", "sequence": 3, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Old prompt two" }] } } },
+        { "id": "compact-4", "conversation_id": "compact", "turn_id": "turn-2", "sequence": 4, "payload": { "type": "message", "payload": { "role": "assistant", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Old answer two" }] } } },
+        { "id": "compact-5", "conversation_id": "compact", "turn_id": null, "sequence": 5, "payload": { "type": "compaction", "payload": { "id": "checkpoint-1", "conversation_id": "compact", "through_sequence": 4, "lineage": null, "mode": "semantic", "replacement": [{ "id": "summary-window-1", "source_sequence": null, "payload": { "type": "message", "payload": { "role": "developer", "visibility": "model_only", "content": [{ "type": "text", "text": "Summary of events one through four" }] } } }] } } },
+        { "id": "compact-6", "conversation_id": "compact", "turn_id": "turn-3", "sequence": 6, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Newest prompt" }] } } }
+      ],
+      "fork_request": null,
+      "expected": { "transcript_event_ids": ["compact-1", "compact-2", "compact-3", "compact-4", "compact-6"], "model_item_ids": ["summary-window-1", "compact-6"] }
+    },
+    {
+      "name": "image_input_and_view_image",
+      "target": { "lineage": { "provider": "openai", "protocol": "responses", "lineage_id": "openai-a" }, "model": "gpt-vision-test", "max_context_tokens": 200000, "supported": ["image_input"] },
+      "events": [
+        { "id": "image-1", "conversation_id": "image", "turn_id": "turn-1", "sequence": 1, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Describe this image" }, { "type": "attachment", "attachment_id": "upload-1", "media_type": "image/png", "kind": "image" }] } } },
+        { "id": "image-2", "conversation_id": "image", "turn_id": "turn-1", "sequence": 2, "payload": { "type": "tool", "payload": { "call_id": "call-view-1", "name": "view_image", "phase": "completed", "data": { "image_content_ref": "upload-1" } } } }
+      ],
+      "tools": [{ "name": "view_image", "execution": { "type": "local_dynamic" } }],
+      "fork_request": null,
+      "expected": { "transcript_event_ids": ["image-1"], "model_item_ids": ["image-1", "image-2"], "active_tool_names": ["view_image"] }
+    },
+    {
+      "name": "hosted_web_search",
+      "target": { "lineage": { "provider": "openai", "protocol": "responses", "lineage_id": "openai-a" }, "model": "gpt-search-test", "max_context_tokens": 200000, "supported": ["hosted_web_search"] },
+      "events": [
+        { "id": "search-1", "conversation_id": "search", "turn_id": "turn-1", "sequence": 1, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Find the source" }] } } },
+        { "id": "search-2", "conversation_id": "search", "turn_id": "turn-1", "sequence": 2, "payload": { "type": "tool", "payload": { "call_id": "call-search-1", "name": "web_search", "phase": "completed", "data": { "query": "source", "results": [{ "title": "Example", "url": "https://example.test" }] } } } }
+      ],
+      "tools": [{ "name": "web_search", "execution": { "type": "provider_hosted", "capability": "hosted_web_search" } }, { "name": "exec_command", "execution": { "type": "local_dynamic" } }],
+      "fork_request": null,
+      "expected": { "transcript_event_ids": ["search-1"], "model_item_ids": ["search-1", "search-2"], "active_tool_names": ["web_search", "exec_command"] }
+    },
+    {
+      "name": "local_dynamic_tools",
+      "target": { "lineage": { "provider": "other", "protocol": "messages", "lineage_id": "other-a" }, "model": "other-test", "max_context_tokens": 100000, "supported": [] },
+      "events": [
+        { "id": "dynamic-1", "conversation_id": "dynamic", "turn_id": "turn-1", "sequence": 1, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "List uploads" }] } } },
+        { "id": "dynamic-2", "conversation_id": "dynamic", "turn_id": "turn-1", "sequence": 2, "payload": { "type": "tool", "payload": { "call_id": "call-list-1", "name": "list_uploads", "phase": "completed", "data": { "files": ["upload-1"] } } } }
+      ],
+      "tools": [{ "name": "list_uploads", "execution": { "type": "local_dynamic" } }, { "name": "view_image", "execution": { "type": "local_dynamic" } }],
+      "fork_request": null,
+      "expected": { "transcript_event_ids": ["dynamic-1"], "model_item_ids": ["dynamic-1", "dynamic-2"], "active_tool_names": ["list_uploads", "view_image"] }
+    },
+    {
+      "name": "fork_resume",
+      "target": { "lineage": { "provider": "openai", "protocol": "responses", "lineage_id": "openai-a" }, "model": "gpt-test", "max_context_tokens": 200000, "supported": ["opaque_reasoning"] },
+      "events": [
+        { "id": "fork-1", "conversation_id": "source", "turn_id": "turn-1", "sequence": 1, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Original request" }] } } },
+        { "id": "fork-2", "conversation_id": "source", "turn_id": "turn-1", "sequence": 2, "payload": { "type": "provider_opaque", "payload": { "lineage": { "provider": "openai", "protocol": "responses", "lineage_id": "openai-a" }, "provider_item_id": "rs_fork", "kind": "encrypted_reasoning", "payload": [102,111,114,107] } } },
+        { "id": "fork-3", "conversation_id": "source", "turn_id": "turn-1", "sequence": 3, "payload": { "type": "message", "payload": { "role": "assistant", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Original response" }] } } }
+      ],
+      "fork_request": { "source_conversation_id": "source", "target_conversation_id": "forked", "through_sequence": 3 },
+      "expected": { "transcript_event_ids": ["fork-1", "fork-3"], "model_item_ids": ["fork-1", "fork-2", "fork-3"], "fork_transcript_event_ids": ["fork-1", "fork-3"], "fork_model_item_ids": ["fork-1", "fork-2", "fork-3"] }
+    },
+    {
+      "name": "model_switch",
+      "target": { "lineage": { "provider": "other", "protocol": "messages", "lineage_id": "other-a" }, "model": "other-test", "max_context_tokens": 100000, "supported": [] },
+      "events": [
+        { "id": "switch-1", "conversation_id": "switch", "turn_id": "turn-1", "sequence": 1, "payload": { "type": "message", "payload": { "role": "user", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Before switch" }] } } },
+        { "id": "switch-2", "conversation_id": "switch", "turn_id": "turn-1", "sequence": 2, "payload": { "type": "provider_opaque", "payload": { "lineage": { "provider": "openai", "protocol": "responses", "lineage_id": "openai-a" }, "provider_item_id": "rs_switch", "kind": "encrypted_reasoning", "payload": [115,119,105,116,99,104] } } },
+        { "id": "switch-3", "conversation_id": "switch", "turn_id": "turn-1", "sequence": 3, "payload": { "type": "message", "payload": { "role": "assistant", "visibility": "transcript_and_model", "content": [{ "type": "text", "text": "Visible answer" }] } } }
+      ],
+      "tools": [{ "name": "web_search", "execution": { "type": "provider_hosted", "capability": "hosted_web_search" } }, { "name": "exec_command", "execution": { "type": "local_dynamic" } }],
+      "fork_request": null,
+      "expected": { "transcript_event_ids": ["switch-1", "switch-3"], "model_item_ids": ["switch-1", "switch-3"], "excluded_opaque_event_ids": ["switch-2"], "active_tool_names": ["exec_command"] }
+    }
+  ]
+}

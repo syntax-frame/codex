@@ -2624,6 +2624,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-context-engine"
+version = "0.145.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "codex-context-fragments"
 version = "0.145.0"
 dependencies = [
