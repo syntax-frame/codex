@@ -63,3 +63,29 @@ pub enum CodexAdapterError {
     #[error("a compaction event must have a positive sequence")]
     InvalidCompactionSequence,
 }
+
+impl CodexAdapterError {
+    pub(crate) fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedRole { .. } => "unsupported_role",
+            Self::UnresolvedAttachment { .. } => "unresolved_attachment",
+            Self::EmptyAttachmentField { .. } => "empty_attachment_field",
+            Self::MissingAttachmentMaterializer { .. } => "missing_attachment_materializer",
+            Self::UnmaterializedAttachment { .. } => "unmaterialized_attachment",
+            Self::EmptyMaterializedAttachment => "empty_materialized_attachment",
+            Self::UnsupportedAttachment { .. } => "unsupported_attachment",
+            Self::MissingCallId { .. } => "missing_call_id",
+            Self::MissingRouteRecipient { .. } => "missing_route_recipient",
+            Self::UnsupportedRoutedContent { .. } => "unsupported_routed_content",
+            Self::UnsupportedToolRecord { .. } => "unsupported_tool_record",
+            Self::InvalidToolData { .. } => "invalid_tool_data",
+            Self::IncompatibleLineage { .. } => "incompatible_lineage",
+            Self::OpaqueKindMismatch { .. } => "opaque_kind_mismatch",
+            Self::RawTransportRequired { .. } => "raw_transport_required",
+            Self::RawPayloadMismatch => "raw_payload_mismatch",
+            Self::RawPayloadRequired { .. } => "raw_payload_required",
+            Self::ProviderJson { .. } => "provider_json",
+            Self::InvalidCompactionSequence => "invalid_compaction_sequence",
+        }
+    }
+}

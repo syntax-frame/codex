@@ -441,6 +441,8 @@ fn shadow_audit_classifies_lossy_reasoning_without_exposing_it() {
         report.failures[0].stage,
         crate::CodexInputParityStage::Import
     );
+    assert_eq!(report.failures[0].item_kind, "reasoning");
+    assert_eq!(report.failures[0].reason_code, "raw_payload_required");
     let debug = format!("{report:?}");
     assert!(!debug.contains("private thought"));
     assert!(!debug.contains("ciphertext"));

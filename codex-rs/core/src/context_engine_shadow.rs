@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::sync::LazyLock;
@@ -9,6 +10,7 @@ use codex_context_engine::ProviderLineage;
 use codex_context_engine_codex::AttachmentMaterializer;
 use codex_context_engine_codex::AttachmentResolver;
 use codex_context_engine_codex::CodexContextAdapter;
+use codex_context_engine_codex::CodexInputParityReport;
 use codex_context_engine_codex::CodexInputParityStage;
 use codex_context_engine_codex::MaterializedAttachment;
 use codex_context_engine_codex::ResolvedAttachment;
@@ -20,6 +22,16 @@ use tracing::warn;
 
 const PARITY_REPORT_FILENAME: &str = ".agentapp-context-parity-v1.json";
 const ROUTE_ENVIRONMENT_VARIABLE: &str = "CODEX_CONTEXT_ENGINE_ROUTE";
+const MAX_FAILURE_CLASSIFICATIONS: usize = 32;
+const RESERVED_FAILURE_STAGE_ROLLUPS: usize = 3;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct ContextEngineFailureClassification {
+    stage: String,
+    item_kind: String,
+    reason_code: String,
+    count: usize,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct ContextEngineParityReport {
@@ -34,6 +46,7 @@ struct ContextEngineParityReport {
     comparison_failures: usize,
     route_status: String,
     route_failures: usize,
+    failure_classifications: Vec<ContextEngineFailureClassification>,
 }
 
 static SHADOW_ENABLED: LazyLock<bool> = LazyLock::new(|| {
@@ -76,6 +89,7 @@ pub(crate) fn prepare_model_input(
     let export_failures = report.failure_count(CodexInputParityStage::Export);
     let comparison_failures = report.failure_count(CodexInputParityStage::Compare);
     let equivalent = report.is_equivalent();
+    let failure_classifications = failure_classifications(&report);
     let (routed_input, route_status, route_failures) = if !*ROUTE_ENABLED {
         (None, "disabled", 0)
     } else if !equivalent {
@@ -87,7 +101,7 @@ pub(crate) fn prepare_model_input(
         }
     };
     let persisted_report = ContextEngineParityReport {
-        schema_version: 2,
+        schema_version: 3,
         generated_at_unix_ms: unix_time_millis(),
         equivalent,
         source_items: report.source_items,
@@ -98,6 +112,7 @@ pub(crate) fn prepare_model_input(
         comparison_failures,
         route_status: route_status.to_string(),
         route_failures,
+        failure_classifications,
     };
     if let Err(error) = write_parity_report(codex_home, &persisted_report) {
         warn!(
@@ -138,6 +153,69 @@ pub(crate) fn prepare_model_input(
     }
 
     routed_input.unwrap_or(input)
+}
+
+fn failure_classifications(
+    report: &CodexInputParityReport,
+) -> Vec<ContextEngineFailureClassification> {
+    let mut counts = BTreeMap::<(&str, &str, &str), usize>::new();
+    for failure in &report.failures {
+        let key = (
+            failure.stage.as_str(),
+            failure.item_kind,
+            failure.reason_code,
+        );
+        let count = counts.entry(key).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    let mut ranked = counts.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|(left_key, left_count), (right_key, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_key.cmp(right_key))
+    });
+    if ranked.len() <= MAX_FAILURE_CLASSIFICATIONS {
+        return ranked
+            .into_iter()
+            .map(
+                |((stage, item_kind, reason_code), count)| ContextEngineFailureClassification {
+                    stage: stage.to_string(),
+                    item_kind: item_kind.to_string(),
+                    reason_code: reason_code.to_string(),
+                    count,
+                },
+            )
+            .collect();
+    }
+
+    let direct_limit = MAX_FAILURE_CLASSIFICATIONS - RESERVED_FAILURE_STAGE_ROLLUPS;
+    let omitted = ranked.split_off(direct_limit);
+    let mut omitted_by_stage = BTreeMap::<&str, usize>::new();
+    for ((stage, _, _), count) in omitted {
+        let stage_count = omitted_by_stage.entry(stage).or_default();
+        *stage_count = stage_count.saturating_add(count);
+    }
+    let mut classifications = ranked
+        .into_iter()
+        .map(
+            |((stage, item_kind, reason_code), count)| ContextEngineFailureClassification {
+                stage: stage.to_string(),
+                item_kind: item_kind.to_string(),
+                reason_code: reason_code.to_string(),
+                count,
+            },
+        )
+        .collect::<Vec<_>>();
+    classifications.extend(omitted_by_stage.into_iter().map(|(stage, count)| {
+        ContextEngineFailureClassification {
+            stage: stage.to_string(),
+            item_kind: "other".to_string(),
+            reason_code: "classification_limit".to_string(),
+            count,
+        }
+    }));
+    classifications
 }
 
 fn unix_time_millis() -> i64 {
@@ -203,12 +281,13 @@ impl AttachmentMaterializer for EphemeralShadowAttachments {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_context_engine_codex::CodexInputParityFailure;
 
     #[test]
     fn parity_report_is_atomic_and_content_free() {
         let home = tempfile::tempdir().expect("temporary Codex home");
         let report = ContextEngineParityReport {
-            schema_version: 2,
+            schema_version: 3,
             generated_at_unix_ms: 1_725_000_000_000,
             equivalent: true,
             source_items: 8,
@@ -219,6 +298,7 @@ mod tests {
             comparison_failures: 0,
             route_status: "used".to_string(),
             route_failures: 0,
+            failure_classifications: Vec::new(),
         };
 
         write_parity_report(home.path(), &report).expect("write parity report");
@@ -229,8 +309,46 @@ mod tests {
         assert_eq!(decoded, report);
         let object =
             serde_json::from_slice::<serde_json::Value>(&bytes).expect("decode JSON object");
-        assert_eq!(object.as_object().map(|value| value.len()), Some(11));
+        assert_eq!(object.as_object().map(serde_json::Map::len), Some(12));
         assert!(!String::from_utf8_lossy(&bytes).contains("conversation"));
         assert!(!String::from_utf8_lossy(&bytes).contains("provider"));
+    }
+
+    #[test]
+    fn failure_classification_excludes_dynamic_reason_text() {
+        let report = CodexInputParityReport {
+            source_items: 2,
+            compared_items: 0,
+            ignored_items: 0,
+            failures: vec![
+                CodexInputParityFailure {
+                    index: 0,
+                    stage: CodexInputParityStage::Import,
+                    item_kind: "reasoning",
+                    reason_code: "raw_payload_required",
+                    reason: "private provider detail A".to_string(),
+                },
+                CodexInputParityFailure {
+                    index: 1,
+                    stage: CodexInputParityStage::Import,
+                    item_kind: "reasoning",
+                    reason_code: "raw_payload_required",
+                    reason: "private provider detail B".to_string(),
+                },
+            ],
+        };
+
+        let classifications = failure_classifications(&report);
+        assert_eq!(
+            classifications,
+            vec![ContextEngineFailureClassification {
+                stage: "import".to_string(),
+                item_kind: "reasoning".to_string(),
+                reason_code: "raw_payload_required".to_string(),
+                count: 2,
+            }]
+        );
+        let encoded = serde_json::to_string(&classifications).expect("encode classifications");
+        assert!(!encoded.contains("private provider detail"));
     }
 }

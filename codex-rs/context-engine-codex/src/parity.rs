@@ -6,6 +6,7 @@ use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ResponseItem;
 
 use crate::AdaptedRolloutItem;
+use crate::CodexAdapterError;
 use crate::CodexContextAdapter;
 use crate::EventMetadata;
 use crate::PreparedCodexInputItem;
@@ -21,6 +22,10 @@ pub enum CodexInputParityStage {
 pub struct CodexInputParityFailure {
     pub index: usize,
     pub stage: CodexInputParityStage,
+    /// Stable provider-item classification. Prompt contents are never included.
+    pub item_kind: &'static str,
+    /// Stable content-free failure classification.
+    pub reason_code: &'static str,
     /// Adapter classification only. Prompt contents are never included.
     pub reason: String,
 }
@@ -44,6 +49,16 @@ impl CodexInputParityReport {
             .iter()
             .filter(|failure| failure.stage == stage)
             .count()
+    }
+}
+
+impl CodexInputParityStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Import => "import",
+            Self::Export => "export",
+            Self::Compare => "compare",
+        }
     }
 }
 
@@ -78,11 +93,12 @@ impl CodexContextAdapter<'_> {
             let adapted = match self.adapt_response_item(metadata, source, None) {
                 Ok(adapted) => adapted,
                 Err(error) => {
-                    report.failures.push(CodexInputParityFailure {
+                    report.failures.push(adapter_failure(
                         index,
-                        stage: CodexInputParityStage::Import,
-                        reason: error.to_string(),
-                    });
+                        CodexInputParityStage::Import,
+                        source,
+                        error,
+                    ));
                     continue;
                 }
             };
@@ -94,11 +110,12 @@ impl CodexContextAdapter<'_> {
             let prepared = match self.prepare_model_input_item(&model_item) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    report.failures.push(CodexInputParityFailure {
+                    report.failures.push(adapter_failure(
                         index,
-                        stage: CodexInputParityStage::Export,
-                        reason: error.to_string(),
-                    });
+                        CodexInputParityStage::Export,
+                        source,
+                        error,
+                    ));
                     continue;
                 }
             };
@@ -106,6 +123,8 @@ impl CodexContextAdapter<'_> {
                 report.failures.push(CodexInputParityFailure {
                     index,
                     stage: CodexInputParityStage::Export,
+                    item_kind: response_item_kind(source),
+                    reason_code: "raw_transport_required",
                     reason: "raw Codex request transport required".to_string(),
                 });
                 continue;
@@ -127,6 +146,8 @@ impl CodexContextAdapter<'_> {
                 report.failures.push(CodexInputParityFailure {
                     index,
                     stage: CodexInputParityStage::Compare,
+                    item_kind: response_item_kind(source),
+                    reason_code: "projection_mismatch",
                     reason: format!(
                         "{} item changed across the neutral projection",
                         response_item_kind(source)
@@ -175,11 +196,12 @@ impl CodexContextAdapter<'_> {
             let adapted = match self.adapt_response_item(metadata, source, None) {
                 Ok(adapted) => adapted,
                 Err(error) => {
-                    report.failures.push(CodexInputParityFailure {
+                    report.failures.push(adapter_failure(
                         index,
-                        stage: CodexInputParityStage::Import,
-                        reason: error.to_string(),
-                    });
+                        CodexInputParityStage::Import,
+                        source,
+                        error,
+                    ));
                     continue;
                 }
             };
@@ -202,6 +224,8 @@ impl CodexContextAdapter<'_> {
                 report.failures.push(CodexInputParityFailure {
                     index: event_source_indices.first().copied().unwrap_or(0),
                     stage: CodexInputParityStage::Export,
+                    item_kind: "context",
+                    reason_code: "projection_failed",
                     reason: format!("neutral context projection failed: {error}"),
                 });
                 return Err(report);
@@ -214,6 +238,8 @@ impl CodexContextAdapter<'_> {
             report.failures.push(CodexInputParityFailure {
                 index: event_source_indices.first().copied().unwrap_or(0),
                 stage: CodexInputParityStage::Export,
+                item_kind: "context",
+                reason_code: "projection_changed_input_set",
                 reason: "neutral context projection changed the exact input set".to_string(),
             });
             return Err(report);
@@ -229,6 +255,8 @@ impl CodexContextAdapter<'_> {
                 report.failures.push(CodexInputParityFailure {
                     index: source_index,
                     stage: CodexInputParityStage::Export,
+                    item_kind: response_item_kind(&items[source_index]),
+                    reason_code: "projection_changed_ordering",
                     reason: "neutral context projection changed input ordering".to_string(),
                 });
                 continue;
@@ -237,11 +265,12 @@ impl CodexContextAdapter<'_> {
             let prepared = match self.prepare_model_input_item(model_item) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    report.failures.push(CodexInputParityFailure {
-                        index: source_index,
-                        stage: CodexInputParityStage::Export,
-                        reason: error.to_string(),
-                    });
+                    report.failures.push(adapter_failure(
+                        source_index,
+                        CodexInputParityStage::Export,
+                        source,
+                        error,
+                    ));
                     continue;
                 }
             };
@@ -249,6 +278,8 @@ impl CodexContextAdapter<'_> {
                 report.failures.push(CodexInputParityFailure {
                     index: source_index,
                     stage: CodexInputParityStage::Export,
+                    item_kind: response_item_kind(source),
+                    reason_code: "raw_transport_required",
                     reason: "raw Codex request transport required".to_string(),
                 });
                 continue;
@@ -267,6 +298,8 @@ impl CodexContextAdapter<'_> {
                 report.failures.push(CodexInputParityFailure {
                     index: source_index,
                     stage: CodexInputParityStage::Compare,
+                    item_kind: response_item_kind(source),
+                    reason_code: "reconstruction_mismatch",
                     reason: format!(
                         "{} item was not exactly reconstructable",
                         response_item_kind(source)
@@ -281,6 +314,21 @@ impl CodexContextAdapter<'_> {
             return Err(report);
         }
         Ok(rebuilt_items.into_iter().flatten().collect())
+    }
+}
+
+fn adapter_failure(
+    index: usize,
+    stage: CodexInputParityStage,
+    source: &ResponseItem,
+    error: CodexAdapterError,
+) -> CodexInputParityFailure {
+    CodexInputParityFailure {
+        index,
+        stage,
+        item_kind: response_item_kind(source),
+        reason_code: error.diagnostic_code(),
+        reason: error.to_string(),
     }
 }
 
