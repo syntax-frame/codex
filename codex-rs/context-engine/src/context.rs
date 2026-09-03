@@ -65,6 +65,28 @@ pub enum MessageVisibility {
     ModelOnly,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDelivery {
+    QueueOnly,
+    TriggerTurn,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MessageRoute {
+    pub author: String,
+    pub recipients: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<MessageDelivery>,
+}
+
 impl MessageVisibility {
     fn includes_transcript(&self) -> bool {
         matches!(self, Self::TranscriptAndModel | Self::TranscriptOnly)
@@ -101,6 +123,10 @@ pub struct Message {
     pub role: MessageRole,
     pub visibility: MessageVisibility,
     pub content: Vec<ContentPart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<MessagePhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<MessageRoute>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

@@ -33,6 +33,7 @@ members = [
     "connectors",
     "config",
     "context-engine",
+    "context-engine-codex",
     "context-fragments",
     "shell-command",
     "shell-escalation",
@@ -172,6 +173,7 @@ codex-websocket-client = { path = "websocket-client" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }
 codex-context-engine = { path = "context-engine" }
+codex-context-engine-codex = { path = "context-engine-codex" }
 codex-agent-extension = { path = "ext/agent" }
 codex-connectors-extension = { path = "ext/connectors" }
 codex-context-fragments = { path = "context-fragments" }

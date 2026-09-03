@@ -20,6 +20,8 @@ to provider adapters; they do not select persistence, local tools, or UI state.
   provider or to an incompatible model excludes them without deleting them.
 - Attachments remain application-owned references. Provider adapters decide how
   supported models receive their bytes.
+- Message phase and child/parent routing are semantic context. They remain
+  portable instead of being inferred again from provider-specific envelopes.
 - Local dynamic tools are independent from authentication and provider choice.
   Hosted tools are finalized from the selected model's capabilities for every
   turn, including after a model swap. An application-owned web-search backend

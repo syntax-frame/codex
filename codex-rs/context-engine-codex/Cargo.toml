@@ -1,0 +1,23 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-context-engine-codex"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "codex_context_engine_codex"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-context-engine = { workspace = true }
+codex-protocol = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
