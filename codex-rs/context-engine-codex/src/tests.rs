@@ -155,7 +155,7 @@ fn preserves_hosted_web_search_as_exact_lineage_bound_state() {
 }
 
 #[test]
-fn requires_raw_json_when_canonical_serialization_would_drop_reasoning_fields() {
+fn omits_local_only_reasoning_from_the_neutral_provider_payload() {
     let item = ResponseItem::Reasoning {
         id: None,
         summary: vec![ReasoningItemReasoningSummary::SummaryText {
@@ -168,11 +168,54 @@ fn requires_raw_json_when_canonical_serialization_would_drop_reasoning_fields() 
         internal_chat_message_metadata_passthrough: None,
     };
 
+    let event = expect_event(
+        adapter()
+            .adapt_response_item(metadata("event-2", 2), &item, None)
+            .expect("adapt reasoning without persisting local text"),
+    );
+    let ContextEventPayload::ProviderOpaque(opaque) = event.payload else {
+        panic!("expected opaque reasoning");
+    };
+    let decoded: ResponseItem =
+        serde_json::from_slice(opaque.payload.as_bytes()).expect("decode provider payload");
+    let ResponseItem::Reasoning {
+        content,
+        encrypted_content,
+        ..
+    } = decoded
+    else {
+        panic!("expected reasoning payload");
+    };
+    assert_eq!(content, None);
+    assert_eq!(encrypted_content.as_deref(), Some("ciphertext"));
+    assert!(!String::from_utf8_lossy(opaque.payload.as_bytes()).contains("provider-only thought"));
+}
+
+#[test]
+fn keeps_noncanonical_message_text_shape_provider_opaque() {
+    let item = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "assistant input text".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let event = expect_event(
+        adapter()
+            .adapt_response_item(metadata("message", 3), &item, None)
+            .expect("adapt noncanonical message"),
+    );
+    let ContextEventPayload::ProviderOpaque(opaque) = event.payload else {
+        panic!("expected provider-opaque message");
+    };
+    assert_eq!(opaque.kind, "codex.message");
     assert_eq!(
-        adapter().adapt_response_item(metadata("event-2", 2), &item, None),
-        Err(CodexAdapterError::RawPayloadRequired {
-            kind: "codex.reasoning",
-        })
+        serde_json::from_slice::<ResponseItem>(opaque.payload.as_bytes())
+            .expect("decode opaque message"),
+        item
     );
 }
 

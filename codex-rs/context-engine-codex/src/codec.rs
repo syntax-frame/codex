@@ -3,6 +3,7 @@ use codex_context_engine::MessageRole;
 use codex_context_engine::ModelContextItem;
 use codex_context_engine::ModelContextPayload;
 use codex_context_engine::ToolPhase;
+use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
 use serde::Serialize;
 use serde_json::Value;
@@ -56,6 +57,7 @@ pub(crate) fn output_phase(success: Option<bool>) -> ToolPhase {
 pub(crate) fn opaque_kind(item: &ResponseItem) -> &'static str {
     match item {
         ResponseItem::AdditionalTools { .. } => "codex.additional_tools",
+        ResponseItem::Message { .. } => "codex.message",
         ResponseItem::AgentMessage { .. } => "codex.agent_message.encrypted",
         ResponseItem::Reasoning { .. } => "codex.reasoning",
         ResponseItem::ToolSearchCall { .. } => "codex.tool_search_call",
@@ -65,8 +67,7 @@ pub(crate) fn opaque_kind(item: &ResponseItem) -> &'static str {
         ResponseItem::Compaction { .. } => "codex.compaction",
         ResponseItem::ContextCompaction { .. } => "codex.context_compaction",
         ResponseItem::Other => "codex.unknown_response_item",
-        ResponseItem::Message { .. }
-        | ResponseItem::LocalShellCall { .. }
+        ResponseItem::LocalShellCall { .. }
         | ResponseItem::FunctionCall { .. }
         | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCall { .. }
@@ -75,6 +76,50 @@ pub(crate) fn opaque_kind(item: &ResponseItem) -> &'static str {
             unreachable!("semantic and request-control items are handled before opaque mapping")
         }
     }
+}
+
+/// Returns the typed value represented by Codex's provider serializer.
+///
+/// Codex deliberately omits locally retained reasoning text from provider
+/// input. Keep that omission explicit so a lossless provider payload does not
+/// require persisting the decrypted local-only field.
+pub(crate) fn provider_serialization_view(item: &ResponseItem) -> ResponseItem {
+    let mut view = item.clone();
+    if let ResponseItem::Reasoning { content, .. } = &mut view
+        && reasoning_content_is_omitted(content)
+    {
+        *content = None;
+    }
+    view
+}
+
+/// Restores fields intentionally excluded from provider serialization.
+///
+/// This is a transient exact-route sidecar: the values come from the current
+/// in-memory source item and never enter the neutral event or its diagnostics.
+pub(crate) fn restore_local_only_fields(source: &ResponseItem, rebuilt: &mut ResponseItem) {
+    if let (
+        ResponseItem::Reasoning {
+            content: source_content,
+            ..
+        },
+        ResponseItem::Reasoning {
+            content: rebuilt_content,
+            ..
+        },
+    ) = (source, rebuilt)
+        && reasoning_content_is_omitted(source_content)
+    {
+        *rebuilt_content = source_content.clone();
+    }
+}
+
+fn reasoning_content_is_omitted(content: &Option<Vec<ReasoningItemContent>>) -> bool {
+    content.as_ref().is_some_and(|content| {
+        !content
+            .iter()
+            .any(|part| matches!(part, ReasoningItemContent::ReasoningText { .. }))
+    })
 }
 
 pub(crate) fn to_value<T: Serialize>(

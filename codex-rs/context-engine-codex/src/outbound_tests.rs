@@ -399,7 +399,7 @@ fn exact_route_projects_model_items_and_reinserts_request_controls() {
 }
 
 #[test]
-fn exact_route_fails_closed_for_a_semantically_lossy_item() {
+fn exact_route_preserves_noncanonical_message_text_shape() {
     let source = vec![ResponseItem::Message {
         id: None,
         role: "assistant".to_string(),
@@ -410,20 +410,14 @@ fn exact_route_fails_closed_for_a_semantically_lossy_item() {
         internal_chat_message_metadata_passthrough: None,
     }];
 
-    let report = adapter()
+    let rebuilt = adapter()
         .rebuild_response_items_exact("conversation-1", &source)
-        .expect_err("detail cannot be reconstructed yet");
-    assert_eq!(report.source_items, 1);
-    assert_eq!(
-        report.failure_count(crate::CodexInputParityStage::Compare),
-        1
-    );
-    let debug = format!("{report:?}");
-    assert!(!debug.contains("private assistant text"));
+        .expect("noncanonical message should round-trip opaquely");
+    assert_eq!(rebuilt, source);
 }
 
 #[test]
-fn shadow_audit_classifies_lossy_reasoning_without_exposing_it() {
+fn exact_route_restores_local_only_reasoning_after_provider_round_trip() {
     let source = vec![ResponseItem::Reasoning {
         id: None,
         summary: Vec::new(),
@@ -434,15 +428,14 @@ fn shadow_audit_classifies_lossy_reasoning_without_exposing_it() {
         internal_chat_message_metadata_passthrough: None,
     }];
 
+    let rebuilt = adapter()
+        .rebuild_response_items_exact("conversation-1", &source)
+        .expect("reasoning should retain its in-memory representation");
+    assert_eq!(rebuilt, source);
+
     let report = adapter().audit_response_items("conversation-1", &source);
-    assert!(!report.is_equivalent());
-    assert_eq!(report.failures.len(), 1);
-    assert_eq!(
-        report.failures[0].stage,
-        crate::CodexInputParityStage::Import
-    );
-    assert_eq!(report.failures[0].item_kind, "reasoning");
-    assert_eq!(report.failures[0].reason_code, "raw_payload_required");
+    assert!(report.is_equivalent());
+    assert!(report.failures.is_empty());
     let debug = format!("{report:?}");
     assert!(!debug.contains("private thought"));
     assert!(!debug.contains("ciphertext"));

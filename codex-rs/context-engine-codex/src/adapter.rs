@@ -40,6 +40,7 @@ use crate::codec::from_slice;
 use crate::codec::message_role;
 use crate::codec::opaque_kind;
 use crate::codec::output_phase;
+use crate::codec::provider_serialization_view;
 use crate::codec::to_value;
 use crate::codec::to_vec;
 
@@ -177,7 +178,12 @@ impl<'a> CodexContextAdapter<'a> {
                 content,
                 phase,
                 ..
-            } => ContextEventPayload::Message(self.message(role, content, phase.as_ref(), None)?),
+            } if message_has_portable_shape(role, content) => {
+                ContextEventPayload::Message(self.message(role, content, phase.as_ref(), None)?)
+            }
+            item @ ResponseItem::Message { .. } => ContextEventPayload::ProviderOpaque(
+                self.opaque_response_item(item, raw_json, fallback_id, opaque_kind(item))?,
+            ),
             ResponseItem::AgentMessage {
                 author,
                 recipient,
@@ -480,7 +486,7 @@ impl<'a> CodexContextAdapter<'a> {
         let payload = match raw_json {
             Some(bytes) => {
                 let decoded: ResponseItem = from_slice(bytes, "decode raw response item")?;
-                if &decoded != item {
+                if decoded != provider_serialization_view(item) {
                     return Err(CodexAdapterError::RawPayloadMismatch);
                 }
                 bytes.to_vec()
@@ -491,7 +497,7 @@ impl<'a> CodexContextAdapter<'a> {
             None => {
                 let bytes = to_vec(item, "serialize response item")?;
                 let decoded: ResponseItem = from_slice(&bytes, "verify response item")?;
-                if &decoded != item {
+                if decoded != provider_serialization_view(item) {
                     return Err(CodexAdapterError::RawPayloadRequired { kind });
                 }
                 bytes
@@ -520,4 +526,13 @@ impl<'a> CodexContextAdapter<'a> {
             payload: OpaquePayload::new(to_vec(value, "serialize opaque rollout item")?),
         })
     }
+}
+
+fn message_has_portable_shape(role: &str, content: &[ContentItem]) -> bool {
+    matches!(role, "user" | "assistant" | "developer" | "system")
+        && content.iter().all(|part| match part {
+            ContentItem::InputText { .. } => role != "assistant",
+            ContentItem::OutputText { .. } => role == "assistant",
+            ContentItem::InputImage { .. } | ContentItem::InputAudio { .. } => true,
+        })
 }

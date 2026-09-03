@@ -10,6 +10,7 @@ use crate::CodexAdapterError;
 use crate::CodexContextAdapter;
 use crate::EventMetadata;
 use crate::PreparedCodexInputItem;
+use crate::codec::restore_local_only_fields;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CodexInputParityStage {
@@ -119,7 +120,7 @@ impl CodexContextAdapter<'_> {
                     continue;
                 }
             };
-            let Some(rebuilt) = prepared.response_item() else {
+            let Some(mut rebuilt) = prepared.response_item().cloned() else {
                 report.failures.push(CodexInputParityFailure {
                     index,
                     stage: CodexInputParityStage::Export,
@@ -129,6 +130,7 @@ impl CodexContextAdapter<'_> {
                 });
                 continue;
             };
+            restore_local_only_fields(source, &mut rebuilt);
             report.compared_items = report.compared_items.saturating_add(1);
 
             let equivalent = if matches!(
@@ -138,9 +140,9 @@ impl CodexContextAdapter<'_> {
                     ..
                 }
             ) {
-                source == rebuilt
+                source == &rebuilt
             } else {
-                normalize_semantic(source.clone()) == normalize_semantic(rebuilt.clone())
+                normalize_semantic(source.clone()) == normalize_semantic(rebuilt)
             };
             if !equivalent {
                 report.failures.push(CodexInputParityFailure {
@@ -284,6 +286,11 @@ impl CodexContextAdapter<'_> {
                 });
                 continue;
             };
+
+            // Codex keeps decrypted reasoning text in memory but deliberately
+            // excludes it from provider serialization. Restore that transient
+            // field only after the neutral provider payload has round-tripped.
+            restore_local_only_fields(source, &mut rebuilt);
 
             // Provider item ids and Codex's internal turn marker are transport
             // metadata, not portable conversation semantics. Keep them from
