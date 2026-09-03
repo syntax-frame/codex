@@ -1,5 +1,6 @@
 use codex_context_engine::AttachmentKind;
 use codex_context_engine::ContentPart;
+use codex_context_engine::ImageDetail as ContextImageDetail;
 use codex_context_engine::Message;
 use codex_context_engine::MessagePhase;
 use codex_context_engine::MessageRole;
@@ -28,12 +29,26 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use crate::AttachmentMaterializer;
+use crate::AttachmentResolver;
 use crate::CodexAdapterError;
 use crate::CodexContextAdapter;
 use crate::MaterializedAttachment;
 use crate::PreparedCodexInputItem;
+use crate::ResolvedAttachment;
 
 struct TestMaterializer;
+
+impl AttachmentResolver for TestMaterializer {
+    fn resolve(&self, source: &str, kind: &AttachmentKind) -> Option<ResolvedAttachment> {
+        match (source, kind) {
+            ("data:image/png;base64,cGl4ZWxz", AttachmentKind::Image) => Some(ResolvedAttachment {
+                attachment_id: "photo-1".to_string(),
+                media_type: "image/png".to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
 
 impl AttachmentMaterializer for TestMaterializer {
     fn materialize(
@@ -66,6 +81,7 @@ fn prepares_semantic_messages_and_materializes_images_per_request() {
                 attachment_id: "photo-1".to_string(),
                 media_type: "image/png".to_string(),
                 kind: AttachmentKind::Image,
+                image_detail: Some(ContextImageDetail::High),
             },
         ],
         phase: Some(MessagePhase::Commentary),
@@ -83,7 +99,7 @@ fn prepares_semantic_messages_and_materializes_images_per_request() {
                 },
                 ContentItem::InputImage {
                     image_url: "data:image/png;base64,cGl4ZWxz".to_string(),
-                    detail: None,
+                    detail: Some(codex_protocol::models::ImageDetail::High),
                 },
             ],
             phase: Some(CodexMessagePhase::Commentary),
@@ -304,6 +320,7 @@ fn missing_attachment_materializer_fails_without_exposing_stored_bytes() {
             attachment_id: "photo-1".to_string(),
             media_type: "image/png".to_string(),
             kind: AttachmentKind::Image,
+            image_detail: None,
         }],
         phase: None,
         route: None,
@@ -414,6 +431,44 @@ fn exact_route_preserves_noncanonical_message_text_shape() {
         .rebuild_response_items_exact("conversation-1", &source)
         .expect("noncanonical message should round-trip opaquely");
     assert_eq!(rebuilt, source);
+}
+
+#[test]
+fn exact_route_preserves_image_detail_and_custom_tool_status() {
+    let attachments = TestMaterializer;
+    let adapter = adapter()
+        .with_attachment_resolver(&attachments)
+        .with_attachment_materializer(&attachments);
+    let source = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "data:image/png;base64,cGl4ZWxz".to_string(),
+                detail: Some(codex_protocol::models::ImageDetail::High),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: Some("completed".to_string()),
+            call_id: "custom-call-1".to_string(),
+            name: "render".to_string(),
+            namespace: Some("visual".to_string()),
+            input: "private tool input".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+
+    let rebuilt = adapter
+        .rebuild_response_items_exact("conversation-1", &source)
+        .expect("provider fields should round-trip through the neutral contract");
+    assert_eq!(rebuilt, source);
+
+    let report = adapter.audit_response_items("conversation-1", &source);
+    assert!(report.is_equivalent());
+    assert!(!format!("{report:?}").contains("private tool input"));
 }
 
 #[test]

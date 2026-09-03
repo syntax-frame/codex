@@ -3,6 +3,7 @@ use codex_context_engine::CompactionMode;
 use codex_context_engine::ContentPart;
 use codex_context_engine::ContextEvent;
 use codex_context_engine::ContextEventPayload;
+use codex_context_engine::ImageDetail as ContextImageDetail;
 use codex_context_engine::MessageDelivery;
 use codex_context_engine::MessagePhase;
 use codex_context_engine::MessageVisibility;
@@ -80,6 +81,7 @@ fn maps_messages_and_replaces_provider_media_urls_with_attachment_ids() {
                 attachment_id: "attachment-photo".to_string(),
                 media_type: "image/png".to_string(),
                 kind: AttachmentKind::Image,
+                image_detail: Some(ContextImageDetail::High),
             },
         ]
     );

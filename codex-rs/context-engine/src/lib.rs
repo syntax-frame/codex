@@ -25,6 +25,7 @@ pub use context::ContextEventPayload;
 pub use context::ContextProjection;
 pub use context::ForkRequest;
 pub use context::ForkSeed;
+pub use context::ImageDetail;
 pub use context::Message;
 pub use context::MessageDelivery;
 pub use context::MessagePhase;

@@ -1,5 +1,6 @@
 use codex_context_engine::AttachmentKind;
 use codex_context_engine::ContentPart;
+use codex_context_engine::ImageDetail as ContextImageDetail;
 use codex_context_engine::Message;
 use codex_context_engine::MessagePhase;
 use codex_context_engine::MessageRole;
@@ -117,6 +118,7 @@ impl CodexContextAdapter<'_> {
                 attachment_id,
                 media_type,
                 kind,
+                image_detail,
             } => {
                 if matches!(kind, AttachmentKind::File) {
                     return Err(CodexAdapterError::UnsupportedAttachment { kind: kind.clone() });
@@ -135,7 +137,7 @@ impl CodexContextAdapter<'_> {
                 match kind {
                     AttachmentKind::Image => Ok(ContentItem::InputImage {
                         image_url: materialized.source,
-                        detail: None,
+                        detail: image_detail.map(codex_image_detail),
                     }),
                     AttachmentKind::Audio => Ok(ContentItem::InputAudio {
                         audio_url: materialized.source,
@@ -159,7 +161,7 @@ impl CodexContextAdapter<'_> {
             }),
             ("custom", ToolPhase::Requested) => Ok(ResponseItem::CustomToolCall {
                 id: None,
-                status: None,
+                status: optional_string_field(tool, "status")?,
                 call_id: tool.call_id.clone(),
                 name: tool.name.clone(),
                 namespace: optional_string_field(tool, "namespace")?,
@@ -252,6 +254,15 @@ impl CodexContextAdapter<'_> {
             item: response_item,
             original_json: Some(OpaquePayload::new(opaque.payload.as_bytes().to_vec())),
         })
+    }
+}
+
+fn codex_image_detail(detail: ContextImageDetail) -> codex_protocol::models::ImageDetail {
+    match detail {
+        ContextImageDetail::Auto => codex_protocol::models::ImageDetail::Auto,
+        ContextImageDetail::Low => codex_protocol::models::ImageDetail::Low,
+        ContextImageDetail::High => codex_protocol::models::ImageDetail::High,
+        ContextImageDetail::Original => codex_protocol::models::ImageDetail::Original,
     }
 }
 

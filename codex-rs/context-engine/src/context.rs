@@ -105,6 +105,15 @@ pub enum AttachmentKind {
     File,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    Auto,
+    Low,
+    High,
+    Original,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
@@ -115,6 +124,8 @@ pub enum ContentPart {
         attachment_id: String,
         media_type: String,
         kind: AttachmentKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_detail: Option<ImageDetail>,
     },
 }
 

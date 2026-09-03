@@ -4,6 +4,7 @@ use codex_context_engine::ContentPart;
 use codex_context_engine::ContextCheckpoint;
 use codex_context_engine::ContextEvent;
 use codex_context_engine::ContextEventPayload;
+use codex_context_engine::ImageDetail as ContextImageDetail;
 use codex_context_engine::Message;
 use codex_context_engine::MessageDelivery;
 use codex_context_engine::MessagePhase;
@@ -267,6 +268,7 @@ impl<'a> CodexContextAdapter<'a> {
                 }),
             }),
             ResponseItem::CustomToolCall {
+                status,
                 call_id,
                 name,
                 namespace,
@@ -278,6 +280,7 @@ impl<'a> CodexContextAdapter<'a> {
                 phase: ToolPhase::Requested,
                 data: json!({
                     "kind": "custom",
+                    "status": status,
                     "namespace": namespace,
                     "input": input,
                 }),
@@ -341,11 +344,13 @@ impl<'a> CodexContextAdapter<'a> {
             ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                 Ok(ContentPart::Text { text: text.clone() })
             }
-            ContentItem::InputImage { image_url, .. } => {
-                self.attachment_part(image_url, AttachmentKind::Image)
-            }
+            ContentItem::InputImage { image_url, detail } => self.attachment_part(
+                image_url,
+                AttachmentKind::Image,
+                detail.map(context_image_detail),
+            ),
             ContentItem::InputAudio { audio_url } => {
-                self.attachment_part(audio_url, AttachmentKind::Audio)
+                self.attachment_part(audio_url, AttachmentKind::Audio, /*image_detail*/ None)
             }
         }
     }
@@ -354,6 +359,7 @@ impl<'a> CodexContextAdapter<'a> {
         &self,
         source: &str,
         kind: AttachmentKind,
+        image_detail: Option<ContextImageDetail>,
     ) -> Result<ContentPart, CodexAdapterError> {
         let resolved = self
             .attachments
@@ -373,6 +379,7 @@ impl<'a> CodexContextAdapter<'a> {
             attachment_id: resolved.attachment_id,
             media_type: resolved.media_type,
             kind,
+            image_detail,
         })
     }
 
@@ -525,6 +532,15 @@ impl<'a> CodexContextAdapter<'a> {
             kind: kind.to_string(),
             payload: OpaquePayload::new(to_vec(value, "serialize opaque rollout item")?),
         })
+    }
+}
+
+fn context_image_detail(detail: codex_protocol::models::ImageDetail) -> ContextImageDetail {
+    match detail {
+        codex_protocol::models::ImageDetail::Auto => ContextImageDetail::Auto,
+        codex_protocol::models::ImageDetail::Low => ContextImageDetail::Low,
+        codex_protocol::models::ImageDetail::High => ContextImageDetail::High,
+        codex_protocol::models::ImageDetail::Original => ContextImageDetail::Original,
     }
 }
 
