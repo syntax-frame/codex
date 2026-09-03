@@ -348,6 +348,52 @@ fn shadow_audit_reports_equivalence_without_returning_prompt_content() {
 }
 
 #[test]
+fn exact_route_reconstructs_payload_and_retains_transport_envelope() {
+    let source = vec![ResponseItem::Message {
+        id: Some(ResponseItemId::from_server("msg_exact".to_string())),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "private prompt text".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: Some(
+            codex_protocol::models::InternalChatMessageMetadataPassthrough {
+                turn_id: Some("turn-exact".to_string()),
+            },
+        ),
+    }];
+
+    let rebuilt = adapter()
+        .rebuild_response_items_exact("conversation-1", &source)
+        .expect("exact route");
+    assert_eq!(rebuilt, source);
+}
+
+#[test]
+fn exact_route_fails_closed_for_a_semantically_lossy_item() {
+    let source = vec![ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "private assistant text".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+
+    let report = adapter()
+        .rebuild_response_items_exact("conversation-1", &source)
+        .expect_err("detail cannot be reconstructed yet");
+    assert_eq!(report.source_items, 1);
+    assert_eq!(
+        report.failure_count(crate::CodexInputParityStage::Compare),
+        1
+    );
+    let debug = format!("{report:?}");
+    assert!(!debug.contains("private assistant text"));
+}
+
+#[test]
 fn shadow_audit_classifies_lossy_reasoning_without_exposing_it() {
     let source = vec![ResponseItem::Reasoning {
         id: None,

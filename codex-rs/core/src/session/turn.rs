@@ -271,12 +271,12 @@ pub(crate) async fn run_turn(
             }
             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
             .await;
-            crate::context_engine_shadow::audit_model_input(
+            let sampling_request_input = crate::context_engine_shadow::prepare_model_input(
                 turn_context.config.codex_home.as_path(),
                 &sess.thread_id.to_string(),
                 turn_context.provider.info().name.as_str(),
                 &turn_context.model_info.slug,
-                &sampling_request_input,
+                sampling_request_input,
             );
 
             let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(

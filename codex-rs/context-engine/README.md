@@ -1,9 +1,11 @@
 # Context Engine Contract
 
 This crate is the extraction boundary for AgentApp's durable conversation
-history and bounded model context. The current Codex runtime can exercise the
-contract through an opt-in, read-only parity shadow, but its existing history
-and rollout storage remain authoritative.
+history and bounded model context. The current Codex runtime exercises the
+contract through an opt-in parity pass and exact request reconstruction, but
+its existing history and rollout storage remain authoritative. Reconstructed
+input is used only when every item is exactly equal to the current Codex input;
+otherwise the complete untouched Codex vector is used.
 
 Authentication is outside this boundary. OAuth and API keys supply credentials
 to provider adapters; they do not select persistence, local tools, or UI state.
@@ -64,3 +66,24 @@ contract; the existing runtime remains the behavioral oracle during extraction.
    add other provider adapters.
 5. Package the proven boundary as a modern 64-bit Apple library. The current
    CodexCore artifact remains pinned until parity is demonstrated.
+
+## Current routing checkpoint
+
+The first half of extraction step 2 is active behind
+`CODEX_CONTEXT_ENGINE_ROUTE`:
+
+- Current in-memory Codex input is imported into the neutral contract and
+  reconstructed immediately before provider sampling.
+- Request-control records stay verbatim because they are runtime controls, not
+  durable conversation context.
+- Provider item IDs and internal turn IDs remain transient rollout-owned
+  envelope metadata during this migration phase.
+- The reconstructed vector replaces the current vector only after exact
+  item-for-item equality. Any unsupported or lossy item falls back to the
+  complete original vector; partial routing is forbidden.
+- The parity file keeps its historical filename for compatibility and now uses
+  report schema 2. It contains aggregate counts and route status only.
+
+This checkpoint does not change append, resume, compaction, fork, transcript,
+or persistence authority. Moving those operations into the Context Engine
+remains separate work after production route/fallback evidence is observed.
