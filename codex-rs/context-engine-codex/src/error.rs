@@ -1,4 +1,6 @@
 use codex_context_engine::AttachmentKind;
+use codex_context_engine::ProviderLineage;
+use codex_context_engine::ToolPhase;
 use thiserror::Error;
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -9,8 +11,46 @@ pub enum CodexAdapterError {
     UnresolvedAttachment { kind: AttachmentKind },
     #[error("resolved attachment {field} must not be empty")]
     EmptyAttachmentField { field: &'static str },
+    #[error("no attachment materializer is configured for {kind:?} content")]
+    MissingAttachmentMaterializer { kind: AttachmentKind },
+    #[error("could not materialize application-owned attachment {attachment_id}")]
+    UnmaterializedAttachment { attachment_id: String },
+    #[error("materialized attachment source must not be empty")]
+    EmptyMaterializedAttachment,
+    #[error("Codex does not support portable {kind:?} attachments in message content")]
+    UnsupportedAttachment { kind: AttachmentKind },
     #[error("{kind} requires a call id or response item id")]
     MissingCallId { kind: &'static str },
+    #[error("routed message {item_id} has no recipient")]
+    MissingRouteRecipient { item_id: String },
+    #[error("routed message {item_id} contains non-text content")]
+    UnsupportedRoutedContent { item_id: String },
+    #[error("tool record {call_id} ({name}, {phase:?}) is not representable by Codex")]
+    UnsupportedToolRecord {
+        call_id: String,
+        name: String,
+        phase: ToolPhase,
+    },
+    #[error("tool record {call_id} has invalid {field}: {message}")]
+    InvalidToolData {
+        call_id: String,
+        field: &'static str,
+        message: String,
+    },
+    #[error("opaque item {item_id} belongs to an incompatible provider lineage")]
+    IncompatibleLineage {
+        item_id: String,
+        expected: ProviderLineage,
+        actual: ProviderLineage,
+    },
+    #[error("opaque item {item_id} says it is {declared_kind}, but contains {actual_kind}")]
+    OpaqueKindMismatch {
+        item_id: String,
+        declared_kind: String,
+        actual_kind: String,
+    },
+    #[error("opaque item {item_id} requires the raw Codex request transport")]
+    RawTransportRequired { item_id: String },
     #[error("raw JSON does not decode to the supplied response item")]
     RawPayloadMismatch,
     #[error("raw JSON is required to preserve {kind} without loss")]

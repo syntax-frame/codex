@@ -29,10 +29,12 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::AdaptedRolloutItem;
+use crate::AttachmentMaterializer;
 use crate::AttachmentResolver;
 use crate::CodexAdapterError;
 use crate::EventMetadata;
 use crate::IgnoredRolloutItem;
+use crate::PreparedCodexInputItem;
 use crate::codec::event_payload_to_model;
 use crate::codec::from_slice;
 use crate::codec::message_role;
@@ -42,8 +44,9 @@ use crate::codec::to_value;
 use crate::codec::to_vec;
 
 pub struct CodexContextAdapter<'a> {
-    lineage: ProviderLineage,
+    pub(crate) lineage: ProviderLineage,
     attachments: Option<&'a dyn AttachmentResolver>,
+    pub(crate) attachment_materializer: Option<&'a dyn AttachmentMaterializer>,
 }
 
 impl<'a> CodexContextAdapter<'a> {
@@ -51,6 +54,7 @@ impl<'a> CodexContextAdapter<'a> {
         Self {
             lineage,
             attachments: None,
+            attachment_materializer: None,
         }
     }
 
@@ -59,8 +63,42 @@ impl<'a> CodexContextAdapter<'a> {
         self
     }
 
+    pub fn with_attachment_materializer(
+        mut self,
+        materializer: &'a dyn AttachmentMaterializer,
+    ) -> Self {
+        self.attachment_materializer = Some(materializer);
+        self
+    }
+
     pub fn lineage(&self) -> &ProviderLineage {
         &self.lineage
+    }
+
+    /// Prepares provider input while retaining original opaque JSON alongside
+    /// typed records supported by the current Codex request path.
+    pub fn prepare_model_input(
+        &self,
+        items: &[ModelContextItem],
+    ) -> Result<Vec<PreparedCodexInputItem>, CodexAdapterError> {
+        items
+            .iter()
+            .map(|item| self.prepare_model_input_item(item))
+            .collect()
+    }
+
+    /// Produces input for the current typed Codex request path.
+    ///
+    /// Unknown future provider records require a raw request transport and are
+    /// rejected here instead of degrading to `ResponseItem::Other`.
+    pub fn prepare_response_items(
+        &self,
+        items: &[ModelContextItem],
+    ) -> Result<Vec<ResponseItem>, CodexAdapterError> {
+        self.prepare_model_input(items)?
+            .into_iter()
+            .map(PreparedCodexInputItem::into_response_item)
+            .collect()
     }
 
     /// Adapts a provider response item. Supplying the original JSON preserves
@@ -189,7 +227,10 @@ impl<'a> CodexContextAdapter<'a> {
                     LocalShellStatus::Completed => ToolPhase::Completed,
                     LocalShellStatus::Incomplete => ToolPhase::Failed,
                 },
-                data: json!({ "action": to_value(action, "serialize local shell action")? }),
+                data: json!({
+                    "kind": "local_shell",
+                    "action": to_value(action, "serialize local shell action")?,
+                }),
             }),
             ResponseItem::FunctionCall {
                 name,

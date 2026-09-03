@@ -41,6 +41,8 @@ codex-code-mode = { workspace = true, optional = true }
 codex-code-mode-protocol = { workspace = true }
 codex-connectors = { workspace = true }
 codex-context-fragments = { workspace = true }
+codex-context-engine = { workspace = true }
+codex-context-engine-codex = { workspace = true }
 codex-config = { workspace = true }
 codex-core-plugins = { workspace = true }
 codex-core-skills = { workspace = true }

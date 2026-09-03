@@ -1,8 +1,9 @@
 # Context Engine Contract
 
 This crate is the extraction boundary for AgentApp's durable conversation
-history and bounded model context. It is intentionally not connected to the
-current Codex runtime yet.
+history and bounded model context. The current Codex runtime can exercise the
+contract through an opt-in, read-only parity shadow, but its existing history
+and rollout storage remain authoritative.
 
 Authentication is outside this boundary. OAuth and API keys supply credentials
 to provider adapters; they do not select persistence, local tools, or UI state.
@@ -52,8 +53,9 @@ contract; the existing runtime remains the behavioral oracle during extraction.
 
 ## Extraction order
 
-1. Keep the existing tests green and add adapters from current `ResponseItem`
-   and rollout records to this contract.
+1. Keep the existing tests green and add bidirectional adapters between current
+   `ResponseItem`/rollout records and this contract. Run the outbound path in a
+   non-authoritative parity shadow before changing request behavior.
 2. Move projection and compaction decisions behind this crate while retaining
    current Codex rollout storage.
 3. Add the AgentApp GRDB `ContextStore` implementation and make it the sole

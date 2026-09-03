@@ -2676,6 +2676,8 @@ dependencies = [
  "codex-code-mode-protocol",
  "codex-config",
  "codex-connectors",
+ "codex-context-engine",
+ "codex-context-engine-codex",
  "codex-context-fragments",
  "codex-core-plugins",
  "codex-core-skills",
