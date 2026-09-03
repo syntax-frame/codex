@@ -10,6 +10,14 @@ prepared request history, round-trips it through the portable contract, and
 logs aggregate classifications only. It cannot alter or block a turn. It is
 not enabled by default and is not wired into AgentApp Next storage.
 
+With `CODEX_CONTEXT_ENGINE_ROUTE=1`, the same prepared request history is
+imported, projected through `codex_context_engine::project_context`, and
+exported immediately before sampling. Request-control records are reinserted
+at their original positions. The projected request is used only when the full
+typed `ResponseItem` vector is exactly equal to its source; otherwise Codex
+uses the complete untouched rollout vector. Existing rollout storage remains
+the persistence, resume, fork, and compaction authority.
+
 ## Mapping policy
 
 - User, assistant, developer, and system messages become semantic messages.

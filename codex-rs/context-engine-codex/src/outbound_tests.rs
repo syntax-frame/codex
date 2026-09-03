@@ -370,6 +370,35 @@ fn exact_route_reconstructs_payload_and_retains_transport_envelope() {
 }
 
 #[test]
+fn exact_route_projects_model_items_and_reinserts_request_controls() {
+    let source = vec![
+        ResponseItem::Message {
+            id: Some(ResponseItemId::from_server("msg_before".to_string())),
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "private prompt text".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::CompactionTrigger {},
+        ResponseItem::FunctionCall {
+            id: Some(ResponseItemId::from_server("fc_after".to_string())),
+            name: "exec_command".to_string(),
+            namespace: None,
+            arguments: "{\"cmd\":\"pwd\"}".to_string(),
+            call_id: "call-after".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+
+    let rebuilt = adapter()
+        .rebuild_response_items_exact("conversation-1", &source)
+        .expect("projected exact route");
+    assert_eq!(rebuilt, source);
+}
+
+#[test]
 fn exact_route_fails_closed_for_a_semantically_lossy_item() {
     let source = vec![ResponseItem::Message {
         id: None,

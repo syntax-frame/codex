@@ -73,7 +73,9 @@ The first half of extraction step 2 is active behind
 `CODEX_CONTEXT_ENGINE_ROUTE`:
 
 - Current in-memory Codex input is imported into the neutral contract and
-  reconstructed immediately before provider sampling.
+  passed through `project_context` before being reconstructed immediately
+  before provider sampling. This makes the neutral projection the exercised
+  request path without changing its persistence authority.
 - Request-control records stay verbatim because they are runtime controls, not
   durable conversation context.
 - Provider item IDs and internal turn IDs remain transient rollout-owned
