@@ -495,6 +495,28 @@ char *codex_download_ssh_workspace_file(const char *ssh_host,
                                         uint64_t max_bytes);
 
 /*
+ * Atomically publish one app-generated diagnostic JSON file beneath a
+ * configured SSH workspace. Retention removes only older regular JSON files
+ * in the destination directory whose names begin with retention_prefix.
+ * retention_limit must be between 1 and 100.
+ *
+ * Returns an allocated JSON result with status "published" or "failed".
+ * Release the result with codex_free_string().
+ */
+char *codex_publish_ssh_workspace_file(const char *ssh_host,
+                                       uint16_t ssh_port,
+                                       const char *ssh_user,
+                                       const char *ssh_auth_method,
+                                       const char *ssh_secret,
+                                       const char *ssh_fingerprint,
+                                       const char *workspace_path,
+                                       const char *local_path,
+                                       const char *remote_relative_path,
+                                       const char *retention_prefix,
+                                       uint32_t retention_limit,
+                                       uint64_t max_bytes);
+
+/*
  * Inject a user-authored text message into the active regular turn identified
  * by turn_handle. The handle arrives in event_kind 8 and expires when that turn
  * ends. This is same-turn steering, not a new queued turn.

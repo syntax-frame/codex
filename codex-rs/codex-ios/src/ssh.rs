@@ -34,6 +34,26 @@ pub struct SshWorkspaceUploadReceipt {
     pub created: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SshWorkspacePublishReceipt {
+    pub remote_path: String,
+    pub size: u64,
+    pub pruned_count: usize,
+    pub cleanup_warning: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct SshWorkspaceRetention<'a> {
+    filename_prefix: &'a str,
+    maximum_files: usize,
+}
+
+struct SshWorkspaceUploadOutcome {
+    receipt: SshWorkspaceUploadReceipt,
+    pruned_count: usize,
+    cleanup_warning: Option<String>,
+}
+
 struct Handler;
 
 #[async_trait]
@@ -152,6 +172,110 @@ pub async fn ssh_upload_workspace_file_atomic(
     attempt_id: &str,
     max_bytes: u64,
 ) -> Result<SshWorkspaceUploadReceipt, String> {
+    let outcome = ssh_upload_workspace_file_atomic_inner(
+        host,
+        port,
+        user,
+        authentication,
+        host_fingerprint,
+        local_path,
+        workspace_path,
+        relative_path,
+        attempt_id,
+        max_bytes,
+        None,
+    )
+    .await?;
+    Ok(outcome.receipt)
+}
+
+/// Publish a timestamped diagnostic file and retain only a bounded number of
+/// matching regular files in its destination directory. Retention cleanup is
+/// best effort after a successful atomic commit: callers receive the committed
+/// path even when an older file could not be removed.
+#[allow(clippy::too_many_arguments)]
+pub async fn ssh_publish_workspace_file_atomic(
+    host: &str,
+    port: u16,
+    user: &str,
+    authentication: &SshAuthentication,
+    host_fingerprint: Option<String>,
+    local_path: &str,
+    workspace_path: &str,
+    relative_path: &str,
+    attempt_id: &str,
+    max_bytes: u64,
+    retention_prefix: &str,
+    retention_limit: usize,
+) -> Result<SshWorkspacePublishReceipt, String> {
+    validate_workspace_publish_retention(relative_path, retention_prefix, retention_limit)?;
+
+    let outcome = ssh_upload_workspace_file_atomic_inner(
+        host,
+        port,
+        user,
+        authentication,
+        host_fingerprint,
+        local_path,
+        workspace_path,
+        relative_path,
+        attempt_id,
+        max_bytes,
+        Some(SshWorkspaceRetention {
+            filename_prefix: retention_prefix,
+            maximum_files: retention_limit,
+        }),
+    )
+    .await?;
+    Ok(SshWorkspacePublishReceipt {
+        remote_path: outcome.receipt.remote_path,
+        size: outcome.receipt.size,
+        pruned_count: outcome.pruned_count,
+        cleanup_warning: outcome.cleanup_warning,
+    })
+}
+
+fn validate_workspace_publish_retention(
+    relative_path: &str,
+    retention_prefix: &str,
+    retention_limit: usize,
+) -> Result<(), String> {
+    if retention_prefix.is_empty()
+        || retention_prefix.contains('/')
+        || retention_prefix.contains('\\')
+        || !retention_prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("remote retention prefix is invalid".to_string());
+    }
+    if !(1..=100).contains(&retention_limit) {
+        return Err("remote retention limit must be between 1 and 100".to_string());
+    }
+    let file_name = std::path::Path::new(relative_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "remote upload filename is invalid".to_string())?;
+    if !file_name.starts_with(retention_prefix) {
+        return Err("remote upload filename does not match its retention prefix".to_string());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ssh_upload_workspace_file_atomic_inner(
+    host: &str,
+    port: u16,
+    user: &str,
+    authentication: &SshAuthentication,
+    host_fingerprint: Option<String>,
+    local_path: &str,
+    workspace_path: &str,
+    relative_path: &str,
+    attempt_id: &str,
+    max_bytes: u64,
+    retention: Option<SshWorkspaceRetention<'_>>,
+) -> Result<SshWorkspaceUploadOutcome, String> {
     if workspace_path.trim().is_empty() || !workspace_path.starts_with('/') {
         return Err("remote workspace must be a nonempty absolute path".to_string());
     }
@@ -374,10 +498,69 @@ pub async fn ssh_upload_workspace_file_atomic(
     }
     let receipt = upload_result?;
 
+    let (pruned_count, cleanup_warning) = match retention {
+        Some(retention) => {
+            match prune_workspace_uploads(&sftp, &canonical_parent, &remote_path, retention).await {
+                Ok(count) => (count, None),
+                Err(error) => (0, Some(error)),
+            }
+        }
+        None => (0, None),
+    };
+
     let _ = session
         .disconnect(Disconnect::ByApplication, "", "English")
         .await;
-    Ok(receipt)
+    Ok(SshWorkspaceUploadOutcome {
+        receipt,
+        pruned_count,
+        cleanup_warning,
+    })
+}
+
+async fn prune_workspace_uploads(
+    sftp: &SftpSession,
+    canonical_parent: &str,
+    current_path: &str,
+    retention: SshWorkspaceRetention<'_>,
+) -> Result<usize, String> {
+    let current_name = std::path::Path::new(current_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "current remote upload filename is invalid".to_string())?;
+    let mut candidates = sftp
+        .read_dir(canonical_parent.to_string())
+        .await
+        .map_err(|error| format!("list retained remote uploads: {error}"))?
+        .into_iter()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let metadata = entry.metadata();
+            (name.starts_with(retention.filename_prefix)
+                && name.ends_with(".json")
+                && metadata.is_regular()
+                && !metadata.is_symlink())
+            .then(|| (metadata.mtime.unwrap_or(0), name, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+
+    let mut retained = 1_usize;
+    let mut pruned = 0_usize;
+    for (_, name, path) in candidates {
+        if name == current_name {
+            continue;
+        }
+        if retained < retention.maximum_files {
+            retained += 1;
+            continue;
+        }
+        sftp.remove_file(path)
+            .await
+            .map_err(|error| format!("remove expired remote upload: {error}"))?;
+        pruned += 1;
+    }
+    Ok(pruned)
 }
 
 /// Compensates a newly-created exact upload after the enclosing steering
@@ -667,4 +850,49 @@ pub async fn ssh_download_workspace_file(
         .await
         .map_err(|e| format!("disconnect after download: {e}"));
     Ok(copied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_workspace_publish_retention;
+
+    #[test]
+    fn publish_retention_accepts_timestamped_diagnostic_path() {
+        assert_eq!(
+            validate_workspace_publish_retention(
+                ".agentapp-next/recovery-diagnostics/AgentAppNext-Recovery-build-226.json",
+                "AgentAppNext-Recovery-build-",
+                10,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn publish_retention_rejects_broad_or_mismatched_cleanup_scope() {
+        assert!(
+            validate_workspace_publish_retention(
+                ".agentapp-next/recovery-diagnostics/report.json",
+                "AgentAppNext-Recovery-build-",
+                10,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_workspace_publish_retention(
+                ".agentapp-next/recovery-diagnostics/AgentAppNext-Recovery-build-226.json",
+                "../AgentAppNext-Recovery-build-",
+                10,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_workspace_publish_retention(
+                ".agentapp-next/recovery-diagnostics/AgentAppNext-Recovery-build-226.json",
+                "AgentAppNext-Recovery-build-",
+                0,
+            )
+            .is_err()
+        );
+    }
 }

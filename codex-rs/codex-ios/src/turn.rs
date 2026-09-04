@@ -2085,6 +2085,126 @@ pub extern "C" fn codex_download_ssh_workspace_file(
         .into_raw()
 }
 
+#[derive(Serialize)]
+struct SshWorkspacePublishBridgeResult {
+    contract_version: u32,
+    status: &'static str,
+    remote_path: Option<String>,
+    size: Option<u64>,
+    pruned_count: usize,
+    cleanup_warning: Option<String>,
+    reason: Option<String>,
+}
+
+impl SshWorkspacePublishBridgeResult {
+    fn published(receipt: crate::ssh::SshWorkspacePublishReceipt) -> Self {
+        Self {
+            contract_version: 1,
+            status: "published",
+            remote_path: Some(receipt.remote_path),
+            size: Some(receipt.size),
+            pruned_count: receipt.pruned_count,
+            cleanup_warning: receipt.cleanup_warning,
+            reason: None,
+        }
+    }
+
+    fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            contract_version: 1,
+            status: "failed",
+            remote_path: None,
+            size: None,
+            pruned_count: 0,
+            cleanup_warning: None,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+fn ssh_workspace_publish_result_string(result: SshWorkspacePublishBridgeResult) -> *mut c_char {
+    let json = serde_json::to_string(&result).unwrap_or_else(|_| {
+        r#"{"contract_version":1,"status":"failed","remote_path":null,"size":null,"pruned_count":0,"cleanup_warning":null,"reason":"serialization_failure"}"#
+            .to_string()
+    });
+    CString::new(json)
+        .unwrap_or_else(|_| CString::new("{\"status\":\"failed\"}").expect("literal CString"))
+        .into_raw()
+}
+
+/// Publish one app-generated diagnostic snapshot beneath a configured SSH
+/// workspace. The destination is atomically committed and retention cleanup is
+/// restricted to regular JSON files with the caller-provided filename prefix.
+/// Returns an allocated JSON result; release it with `codex_free_string`.
+///
+/// # Safety
+/// Every pointer must address a valid NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn codex_publish_ssh_workspace_file(
+    ssh_host: *const c_char,
+    ssh_port: u16,
+    ssh_user: *const c_char,
+    ssh_auth_method: *const c_char,
+    ssh_secret: *const c_char,
+    ssh_fingerprint: *const c_char,
+    workspace_path: *const c_char,
+    local_path: *const c_char,
+    remote_relative_path: *const c_char,
+    retention_prefix: *const c_char,
+    retention_limit: u32,
+    max_bytes: u64,
+) -> *mut c_char {
+    let result = std::panic::catch_unwind(|| -> Result<_, String> {
+        let host = c_str_to_string(ssh_host, "ssh_host")?;
+        let user = c_str_to_string(ssh_user, "ssh_user")?;
+        let auth_method = c_str_to_string(ssh_auth_method, "ssh_auth_method")?;
+        let secret = c_str_to_string(ssh_secret, "ssh_secret")?;
+        let fingerprint = if ssh_fingerprint.is_null() {
+            None
+        } else {
+            let value = c_str_to_string(ssh_fingerprint, "ssh_fingerprint")?;
+            (!value.trim().is_empty()).then_some(value)
+        };
+        let workspace = c_str_to_string(workspace_path, "workspace_path")?;
+        let local = c_str_to_string(local_path, "local_path")?;
+        let remote = c_str_to_string(remote_relative_path, "remote_relative_path")?;
+        let prefix = c_str_to_string(retention_prefix, "retention_prefix")?;
+        let (authentication, secret_guard) = parse_ssh_authentication(&auth_method, secret)?;
+        let attempt_nonce = NEXT_UPLOAD_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        let attempt_id = format!("diagnostic-{attempt_nonce}");
+
+        let result = turn_runtime().block_on(crate::ssh::ssh_publish_workspace_file_atomic(
+            &host,
+            ssh_port,
+            &user,
+            &authentication,
+            fingerprint,
+            &local,
+            &workspace,
+            &remote,
+            &attempt_id,
+            max_bytes,
+            &prefix,
+            retention_limit as usize,
+        ));
+        drop(secret_guard);
+        result
+    });
+
+    match result {
+        Ok(Ok(receipt)) => {
+            ssh_workspace_publish_result_string(SshWorkspacePublishBridgeResult::published(receipt))
+        }
+        Ok(Err(error)) => {
+            ssh_workspace_publish_result_string(SshWorkspacePublishBridgeResult::failed(error))
+        }
+        Err(_) => ssh_workspace_publish_result_string(SshWorkspacePublishBridgeResult::failed(
+            "panic while publishing SSH workspace file",
+        )),
+    }
+}
+
 fn remote_lifecycle_result_string(result: RemoteLifecycleBridgeResult) -> *mut c_char {
     let json = serde_json::to_string(&result).unwrap_or_else(|_| {
         r#"{"contract_version":1,"status":"terminal_failure","reason":"serialization_failure"}"#
