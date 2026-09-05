@@ -1,0 +1,221 @@
+[
+  {
+    "slug": "gpt-6-astra",
+    "support_verbosity": true,
+    "default_verbosity": "low",
+    "apply_patch_tool_type": "freeform",
+    "web_search_tool_type": "text_and_image",
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "supports_image_detail_original": true,
+    "truncation_policy": {
+      "mode": "tokens",
+      "limit": 10000
+    },
+    "supports_parallel_tool_calls": true,
+    "tool_mode": "code_mode_only",
+    "multi_agent_version": "v2",
+    "multi_agent_reasoning_effort": "xhigh",
+    "use_responses_lite": true,
+    "node_repl_auto_review_required": true,
+    "context_window": 272000,
+    "max_context_window": 872000,
+    "default_reasoning_summary": "none",
+    "display_name": "GPT-6-Astra",
+    "default_reasoning_level": "medium",
+    "supported_reasoning_levels": [
+      {
+        "effort": "low",
+        "description": "low"
+      },
+      {
+        "effort": "medium",
+        "description": "medium"
+      },
+      {
+        "effort": "high",
+        "description": "high"
+      },
+      {
+        "effort": "xhigh",
+        "description": "xhigh"
+      },
+      {
+        "effort": "max",
+        "description": "max"
+      },
+      {
+        "effort": "ultra",
+        "description": "ultra"
+      }
+    ],
+    "shell_type": "shell_command",
+    "visibility": "list",
+    "minimal_client_version": "0.153.0",
+    "supported_in_api": true,
+    "priority": 1,
+    "experimental_supported_tools": [
+      "send_user_message_async",
+      "clock"
+    ],
+    "supports_search_tool": true,
+    "service_tiers": [
+      {
+        "id": "priority",
+        "name": "Fast",
+        "description": "Synthetic speed tier."
+      }
+    ],
+    "additional_speed_tiers": [
+      "fast"
+    ],
+    "base_instructions": "Synthetic catalog compatibility test instructions.",
+    "description": "Synthetic catalog regression fixture."
+  },
+  {
+    "slug": "gpt-5.6-sol",
+    "support_verbosity": true,
+    "default_verbosity": "low",
+    "apply_patch_tool_type": "freeform",
+    "web_search_tool_type": "text_and_image",
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "supports_image_detail_original": true,
+    "truncation_policy": {
+      "mode": "tokens",
+      "limit": 10000
+    },
+    "supports_parallel_tool_calls": true,
+    "tool_mode": "code_mode_only",
+    "multi_agent_version": "v2",
+    "multi_agent_reasoning_effort": null,
+    "use_responses_lite": true,
+    "node_repl_auto_review_required": false,
+    "context_window": 272000,
+    "max_context_window": 872000,
+    "default_reasoning_summary": "none",
+    "display_name": "GPT-5.6-Sol",
+    "default_reasoning_level": "low",
+    "supported_reasoning_levels": [
+      {
+        "effort": "low",
+        "description": "low"
+      },
+      {
+        "effort": "medium",
+        "description": "medium"
+      },
+      {
+        "effort": "high",
+        "description": "high"
+      },
+      {
+        "effort": "xhigh",
+        "description": "xhigh"
+      },
+      {
+        "effort": "max",
+        "description": "max"
+      },
+      {
+        "effort": "ultra",
+        "description": "ultra"
+      }
+    ],
+    "shell_type": "shell_command",
+    "visibility": "list",
+    "minimal_client_version": "0.144.0",
+    "supported_in_api": true,
+    "priority": 6,
+    "experimental_supported_tools": [],
+    "supports_search_tool": true,
+    "service_tiers": [
+      {
+        "id": "priority",
+        "name": "Fast",
+        "description": "Synthetic speed tier."
+      }
+    ],
+    "additional_speed_tiers": [
+      "fast"
+    ],
+    "base_instructions": "Synthetic catalog compatibility test instructions.",
+    "description": "Synthetic catalog regression fixture."
+  },
+  {
+    "slug": "hidden-catalog-fixture",
+    "support_verbosity": true,
+    "default_verbosity": "low",
+    "apply_patch_tool_type": "freeform",
+    "web_search_tool_type": "text_and_image",
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "supports_image_detail_original": true,
+    "truncation_policy": {
+      "mode": "tokens",
+      "limit": 10000
+    },
+    "supports_parallel_tool_calls": true,
+    "tool_mode": "code_mode_only",
+    "multi_agent_version": "v2",
+    "multi_agent_reasoning_effort": null,
+    "use_responses_lite": true,
+    "node_repl_auto_review_required": false,
+    "context_window": 272000,
+    "max_context_window": 872000,
+    "default_reasoning_summary": "none",
+    "display_name": "Hidden catalog fixture",
+    "default_reasoning_level": "low",
+    "supported_reasoning_levels": [
+      {
+        "effort": "low",
+        "description": "low"
+      },
+      {
+        "effort": "medium",
+        "description": "medium"
+      },
+      {
+        "effort": "high",
+        "description": "high"
+      },
+      {
+        "effort": "xhigh",
+        "description": "xhigh"
+      },
+      {
+        "effort": "max",
+        "description": "max"
+      },
+      {
+        "effort": "ultra",
+        "description": "ultra"
+      }
+    ],
+    "shell_type": "shell_command",
+    "visibility": "hide",
+    "minimal_client_version": "0.144.0",
+    "supported_in_api": false,
+    "priority": 0,
+    "experimental_supported_tools": [],
+    "supports_search_tool": true,
+    "service_tiers": [
+      {
+        "id": "priority",
+        "name": "Fast",
+        "description": "Synthetic speed tier."
+      }
+    ],
+    "additional_speed_tiers": [
+      "fast"
+    ],
+    "base_instructions": "Synthetic catalog compatibility test instructions.",
+    "description": "Synthetic catalog regression fixture."
+  }
+]

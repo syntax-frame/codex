@@ -15,12 +15,19 @@ pub fn bundled_models_response()
     serde_json::from_str(include_str!("../models.json"))
 }
 
-/// Convert the client version string to a whole version string (e.g. "1.2.3-alpha.4" -> "1.2.3").
+// Reviewed compatibility with the Codex /models contract, independent of this
+// maintained fork's Cargo package version. The supported metadata includes
+// Responses Lite, tool-mode selectors, and Max/Ultra reasoning levels. Hosts
+// retain their feature-gated tool handling, including iOS's direct-tool fallback
+// when the Code Mode runtime is unavailable.
+// This does not claim that the fork includes the entire upstream 0.153 release.
+// Advance only after reviewing catalog metadata and validating turn behavior.
+const MODELS_CATALOG_COMPATIBILITY_VERSION: &str = "0.153.0";
+
+/// Return the supported Codex /models compatibility version.
+///
+/// The backend uses this value to gate model availability. Cache eligibility
+/// must use the same version so a fresh older catalog cannot hide new models.
 pub fn client_version_to_whole() -> String {
-    format!(
-        "{}.{}.{}",
-        env!("CARGO_PKG_VERSION_MAJOR"),
-        env!("CARGO_PKG_VERSION_MINOR"),
-        env!("CARGO_PKG_VERSION_PATCH")
-    )
+    MODELS_CATALOG_COMPATIBILITY_VERSION.to_string()
 }

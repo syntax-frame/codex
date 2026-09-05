@@ -546,6 +546,126 @@ async fn refresh_available_models_uses_remote_only_catalog_for_chatgpt_auth() {
 }
 
 #[tokio::test]
+async fn catalog_refresh_includes_newly_compatible_models_and_reuses_cache() {
+    #[derive(Debug, serde::Deserialize)]
+    struct GatedModel {
+        minimal_client_version: String,
+        #[serde(flatten)]
+        model: ModelInfo,
+    }
+
+    // The backend gates each catalog row before returning it. This deliberately
+    // exercises that behavior rather than asserting a client-version constant.
+    #[derive(Debug)]
+    struct VersionGatedEndpoint {
+        models: Vec<GatedModel>,
+        fetch_count: AtomicUsize,
+    }
+
+    impl ModelsEndpointClient for VersionGatedEndpoint {
+        fn has_command_auth(&self) -> bool {
+            false
+        }
+
+        fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            client_version: &'a str,
+            _http_client_factory: HttpClientFactory,
+        ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+            Box::pin(async move {
+                self.fetch_count.fetch_add(1, Ordering::SeqCst);
+                let version_parts = |version: &str| {
+                    version
+                        .split('.')
+                        .map(|part| part.parse::<u32>().expect("whole catalog version"))
+                        .collect::<Vec<_>>()
+                };
+                let client_version = version_parts(client_version);
+                let models = self
+                    .models
+                    .iter()
+                    .filter(|entry| version_parts(&entry.minimal_client_version) <= client_version)
+                    .map(|entry| entry.model.clone())
+                    .collect();
+                Ok((models, Some("compatible-catalog".to_string())))
+            })
+        }
+    }
+
+    let models: Vec<GatedModel> =
+        serde_json::from_str(include_str!("../fixtures/catalog-0.153.0.json"))
+            .expect("sanitized backend catalog fixture");
+    let endpoint = Arc::new(VersionGatedEndpoint {
+        models,
+        fetch_count: AtomicUsize::new(0),
+    });
+    let codex_home = tempdir().expect("temp dir");
+    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+    let old_catalog = vec![endpoint.models[1].model.clone()];
+    manager.apply_remote_models(old_catalog.clone()).await;
+    manager
+        .cache_manager
+        .as_ref()
+        .expect("cached manager")
+        .persist_cache(&old_catalog, /*etag*/ None, "0.145.0".to_string())
+        .await;
+
+    let available = manager
+        .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    let picker_models: Vec<_> = available
+        .iter()
+        .filter(|model| model.show_in_picker)
+        .map(|model| {
+            (
+                model.model.as_str(),
+                model.default_reasoning_effort.to_string(),
+                model.is_default,
+                model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .map(|preset| preset.effort.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max", "ultra"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        picker_models,
+        vec![
+            ("gpt-6-astra", "medium".to_string(), true, efforts.clone()),
+            ("gpt-5.6-sol", "low".to_string(), false, efforts),
+        ]
+    );
+    assert_eq!(
+        manager.get_remote_models().await,
+        endpoint
+            .models
+            .iter()
+            .map(|entry| entry.model.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let cached_manager =
+        openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+    let cached_available = cached_manager
+        .list_models(
+            RefreshStrategy::OnlineIfUncached,
+            DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await;
+    assert_eq!(cached_available, available);
+    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn refresh_available_models_uses_cached_remote_only_catalog_for_chatgpt_auth() {
     let remote_models = vec![remote_model(
         "chatgpt-cached-source-of-truth",
