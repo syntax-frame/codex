@@ -42,6 +42,7 @@ use super::SharedState;
 use super::SshProcess;
 use super::SshProcessBackend;
 use super::build_remote_command;
+use super::complete_queued_write;
 use super::publish_closed;
 use super::publish_exit;
 use super::publish_output_with_absolute_range;
@@ -528,11 +529,12 @@ async fn monitor_pump(
                             write_id,
                             ack,
                         }) => {
-                            let result = descriptor
-                                .write(backend.transport(), &data, write_id.as_deref())
-                                .await
-                                .map_err(|error| error.to_string());
-                            let _ = ack.send(result);
+                            complete_queued_write(ack, async {
+                                descriptor
+                                    .write(backend.transport(), &data, write_id.as_deref())
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            }).await;
                         }
                         Some(ChannelCommand::Signal { ack, .. }) => {
                             let result = descriptor.interrupt(backend.transport()).await;

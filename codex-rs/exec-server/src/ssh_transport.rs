@@ -7,17 +7,13 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::task::Context;
-use std::task::Poll;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -26,12 +22,15 @@ use russh::client;
 use russh::client::KeyboardInteractiveAuthResponse;
 use russh::keys::key;
 use russh::keys::load_secret_key;
-use tokio::io::AsyncRead;
-use tokio::io::AsyncWrite;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
 
 use crate::ExecServerError;
+
+mod sftp_startup;
+
+pub(crate) use sftp_startup::connect_sftp;
 
 const SSH_POOL_CONNECTIONS: usize = 32;
 const SSH_WORK_CHANNELS_PER_CONNECTION: usize = 7;
@@ -44,6 +43,13 @@ const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const SSH_KEEPALIVE_MAX: usize = 3;
 const SSH_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const SSH_COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
+// Bootstrap/adoption can each wait twice for 30 seconds, and terminal cleanup
+// can wait for process death plus output drain. Bound the entire control call
+// without shortening those remote safety windows or timing out long-lived work
+// channels. A timeout never establishes whether the remote mutation happened.
+const SSH_CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
+const SSH_CONTROL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+const SSH_ABANDONED_CHANNEL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 static SSH_POOLS: OnceLock<StdMutex<HashMap<String, Arc<SshConnectionPool>>>> = OnceLock::new();
 static SSH_CONNECT_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
@@ -125,52 +131,83 @@ impl SshTransport {
         command: &str,
         input: Option<&[u8]>,
     ) -> Result<SshCommandOutput, ExecServerError> {
-        let mut leased = self.open_control_channel().await?;
-        leased
-            .channel()
-            .exec(true, command)
+        self.exec_control_with_timeout(command, input, SSH_CONTROL_COMMAND_TIMEOUT)
             .await
-            .map_err(|error| classified_protocol_error("exec", &error))?;
+    }
 
-        if let Some(input) = input {
+    async fn exec_control_with_timeout(
+        &self,
+        command: &str,
+        input: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<SshCommandOutput, ExecServerError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut leased = tokio::time::timeout_at(deadline, self.open_control_channel())
+            .await
+            .map_err(|_| {
+                ExecServerError::Protocol("ssh control channel acquisition timed out".to_string())
+            })??;
+        let result = tokio::time::timeout_at(deadline, async {
             leased
                 .channel()
-                .data(input)
+                .exec(true, command)
                 .await
-                .map_err(|error| classified_protocol_error("stdin", &error))?;
-            leased
-                .channel()
-                .eof()
-                .await
-                .map_err(|error| classified_protocol_error("stdin_eof", &error))?;
-        }
+                .map_err(|error| classified_protocol_error("exec", &error))?;
 
-        let mut output = Vec::new();
-        let mut exit_code = None;
-        while let Some(message) = leased.channel_mut().wait().await {
-            match message {
-                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                    if output.len().saturating_add(data.len()) > SSH_COMMAND_OUTPUT_LIMIT {
-                        return Err(ExecServerError::Protocol(
-                            "ssh control command exceeded 1 MiB output limit".to_string(),
-                        ));
+            if let Some(input) = input {
+                leased
+                    .channel()
+                    .data(input)
+                    .await
+                    .map_err(|error| classified_protocol_error("stdin", &error))?;
+                leased
+                    .channel()
+                    .eof()
+                    .await
+                    .map_err(|error| classified_protocol_error("stdin_eof", &error))?;
+            }
+
+            let mut output = Vec::new();
+            let mut exit_code = None;
+            while let Some(message) = leased.channel_mut().wait().await {
+                match message {
+                    ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                        if output.len().saturating_add(data.len()) > SSH_COMMAND_OUTPUT_LIMIT {
+                            return Err(ExecServerError::Protocol(
+                                "ssh control command exceeded 1 MiB output limit".to_string(),
+                            ));
+                        }
+                        output.extend_from_slice(&data);
                     }
-                    output.extend_from_slice(&data);
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        exit_code = Some(exit_status as i32);
+                    }
+                    ChannelMsg::ExitSignal { .. } if exit_code.is_none() => {
+                        exit_code = Some(-1);
+                    }
+                    _ => {}
                 }
-                ChannelMsg::ExitStatus { exit_status } => {
-                    exit_code = Some(exit_status as i32);
-                }
-                ChannelMsg::ExitSignal { .. } if exit_code.is_none() => {
-                    exit_code = Some(-1);
-                }
-                _ => {}
+            }
+
+            Ok(SshCommandOutput {
+                output,
+                exit_code: exit_code.unwrap_or(-1),
+            })
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                // Release this command's channel and pool permits. Do not
+                // replay the command or discard its durable remote receipts:
+                // closing SSH cannot prove that a remote effect did not occur.
+                let _ =
+                    tokio::time::timeout(SSH_CONTROL_CLOSE_TIMEOUT, leased.channel().close()).await;
+                Err(ExecServerError::Protocol(
+                    "ssh control command timed out; remote outcome is unknown".to_string(),
+                ))
             }
         }
-
-        Ok(SshCommandOutput {
-            output,
-            exit_code: exit_code.unwrap_or(-1),
-        })
     }
 }
 
@@ -318,23 +355,22 @@ impl SshConnectionSlot {
     }
 
     async fn open(
-        &self,
+        self: &Arc<Self>,
         config: &SshConnectionConfig,
         permit: OwnedSemaphorePermit,
     ) -> Result<PooledSshChannel, TransportFailure> {
-        // russh's Handle is not cloneable. Serialize only the short channel-open
-        // operation, moving the handle out of the synchronous slot mutex before
-        // every network await. Established channels remain fully concurrent.
-        let _open_permit = Arc::clone(&self.open_permit)
-            .acquire_owned()
-            .await
-            .map_err(|error| TransportFailure {
-                error: classified_protocol_error("slot_wait", &error),
-                retryable: true,
-                capacity: false,
-            })?;
-
+        let mut permit = permit;
         for attempt in 0..2 {
+            // Acquisition and authentication remain cancelable before moving a
+            // cached Handle into the owned channel-open operation below.
+            let open_permit = Arc::clone(&self.open_permit)
+                .acquire_owned()
+                .await
+                .map_err(|error| TransportFailure {
+                    error: classified_protocol_error("slot_wait", &error),
+                    retryable: true,
+                    capacity: false,
+                })?;
             let session = match self.take_live_session() {
                 Some(session) => session,
                 None => {
@@ -347,10 +383,58 @@ impl SshConnectionSlot {
                 }
             };
 
-            let result = session.channel_open_session().await;
+            // russh does not close a late channel when its open future is
+            // dropped. Keep that future, the shared session and both permits
+            // owned until it resolves, even if the caller stops waiting. A
+            // stuck peer can occupy one pending open per slot until its SSH
+            // connection resolves; it cannot spawn unbounded pending opens.
+            let slot = Arc::clone(self);
+            let delivery = Arc::new(StdMutex::new(None));
+            let pending_delivery = Arc::clone(&delivery);
+            let (ready, result_ready) = oneshot::channel();
+            let (received, delivery_finished) = oneshot::channel::<()>();
+            tokio::spawn(async move {
+                let _open_permit = open_permit;
+                let result = session.channel_open_session().await;
+                let reconnect = matches!(&result, Err(error)
+                    if attempt == 0
+                        && !matches!(error, russh::Error::ChannelOpenFailure(_))
+                        && is_reconnectable_ssh_error(error));
+                if !session.is_closed() && !reconnect {
+                    slot.store_session(session);
+                }
+                *pending_delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((result, permit));
+                let _ = ready.send(());
+                // A notification alone is insufficient: a cancelled receiver
+                // can drop an unread successful oneshot result. The caller
+                // takes the result synchronously before releasing this guard.
+                let _ = delivery_finished.await;
+                let abandoned = pending_delivery
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((Ok(channel), _permit)) = abandoned {
+                    let _ =
+                        tokio::time::timeout(SSH_ABANDONED_CHANNEL_CLOSE_TIMEOUT, channel.close())
+                            .await;
+                }
+            });
+            result_ready.await.map_err(|error| TransportFailure {
+                error: classified_protocol_error("open_channel_owner", &error),
+                retryable: true,
+                capacity: false,
+            })?;
+            let (result, returned_permit) = delivery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .expect("channel-open owner published its result");
+            permit = returned_permit;
+            drop(received);
             match result {
                 Ok(channel) => {
-                    self.store_session(session);
                     tracing::debug!(
                         pool_key = %config.pool_key,
                         slot = self.index,
@@ -363,7 +447,6 @@ impl SshConnectionSlot {
                     });
                 }
                 Err(error) if matches!(error, russh::Error::ChannelOpenFailure(_)) => {
-                    self.store_session(session);
                     return Err(TransportFailure {
                         error: classified_protocol_error("open_channel", &error),
                         retryable: false,
@@ -379,9 +462,6 @@ impl SshConnectionSlot {
                     );
                 }
                 Err(error) => {
-                    if !session.is_closed() {
-                        self.store_session(session);
-                    }
                     return Err(TransportFailure::from_russh("open_channel", error));
                 }
             }
@@ -686,48 +766,8 @@ impl PooledSshChannel {
     pub(crate) fn channel_mut(&mut self) -> &mut russh::Channel<client::Msg> {
         &mut self.channel
     }
-
-    pub(crate) fn into_stream(self) -> PooledSshChannelStream {
-        PooledSshChannelStream {
-            inner: self.channel.into_stream(),
-            _permit: self._permit,
-            _pool_control_permit: self._pool_control_permit,
-        }
-    }
 }
 
-/// An SFTP-compatible stream that keeps its pool permit until the subsystem
-/// closes. This replaces the previous leaked russh session handle.
-pub(crate) struct PooledSshChannelStream {
-    inner: russh::ChannelStream<client::Msg>,
-    _permit: OwnedSemaphorePermit,
-    _pool_control_permit: Option<OwnedSemaphorePermit>,
-}
-
-impl AsyncRead for PooledSshChannelStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(context, buffer)
-    }
-}
-
-impl AsyncWrite for PooledSshChannelStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(context, buffer)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(context)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(context)
-    }
-}
+#[cfg(test)]
+#[path = "ssh_transport_tests.rs"]
+mod tests;

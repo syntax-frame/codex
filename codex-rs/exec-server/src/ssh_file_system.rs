@@ -136,22 +136,7 @@ impl SshFileSystem {
 
     /// Open a fresh SSH connection and start the SFTP subsystem on it.
     async fn connect_sftp(&self) -> io::Result<SftpSession> {
-        let channel = self
-            .transport
-            .open_work_channel()
-            .await
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        channel
-            .channel()
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(|error| io::Error::other(format!("ssh request sftp subsystem: {error}")))?;
-
-        let stream = channel.into_stream();
-        let sftp = SftpSession::new(stream)
-            .await
-            .map_err(|e| io::Error::other(format!("sftp handshake: {e}")))?;
-        Ok(sftp)
+        crate::ssh_transport::connect_sftp(&self.transport).await
     }
 
     /// Run an SFTP operation, transparently reconnecting once on failure.

@@ -15,6 +15,7 @@
 //!   operations over an mpsc command channel.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -58,6 +59,9 @@ mod tmux;
 const RETAINED_OUTPUT_BYTES_PER_PROCESS: usize = 1024 * 1024;
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const SSH_START_ATTEMPTS: usize = 2;
+// Include queue backpressure and monitor reconnection, while allowing a
+// 90-second control command and its bounded channel close to finish.
+const SSH_WRITE_ACK_TIMEOUT: Duration = Duration::from_secs(95);
 const SSH_SIGNAL_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_TERMINATE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_PATH_EXPORT: &str = "export PATH=\"$HOME/bin:$HOME/.local/bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}\"";
@@ -500,6 +504,20 @@ enum ChannelCommand {
     },
 }
 
+async fn complete_queued_write(
+    ack: oneshot::Sender<Result<(), String>>,
+    write: impl Future<Output = Result<(), String>>,
+) {
+    // A caller that timed out while the pump was disconnected must not have
+    // its queued input delivered after reconnection. Once execution begins,
+    // losing the acknowledgement still leaves the remote outcome unknown.
+    if ack.is_closed() {
+        return;
+    }
+    let result = write.await;
+    let _ = ack.send(result);
+}
+
 struct SshProcess {
     process_id: ProcessId,
     events: ExecProcessEventLog,
@@ -598,85 +616,99 @@ impl ExecProcessImpl for SshProcess {
             }
         }
 
-        let (ack_tx, ack_rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(ChannelCommand::Write {
-                data: chunk,
-                write_id,
-                ack: ack_tx,
-            })
-            .await
-            .is_err()
-        {
-            return Ok(WriteResponse {
-                status: WriteStatus::StdinClosed,
-            });
-        }
+        tokio::time::timeout(SSH_WRITE_ACK_TIMEOUT, async {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if self
+                .cmd_tx
+                .send(ChannelCommand::Write {
+                    data: chunk,
+                    write_id,
+                    ack: ack_tx,
+                })
+                .await
+                .is_err()
+            {
+                return Ok(WriteResponse {
+                    status: WriteStatus::StdinClosed,
+                });
+            }
 
-        match ack_rx.await {
-            Ok(Ok(())) => Ok(WriteResponse {
-                status: WriteStatus::Accepted,
-            }),
-            Ok(Err(err)) => Err(ExecServerError::Protocol(format!("ssh stdin write: {err}"))),
-            Err(_) => Ok(WriteResponse {
-                status: WriteStatus::StdinClosed,
-            }),
-        }
+            match ack_rx.await {
+                Ok(Ok(())) => Ok(WriteResponse {
+                    status: WriteStatus::Accepted,
+                }),
+                Ok(Err(err)) => Err(ExecServerError::Protocol(format!("ssh stdin write: {err}"))),
+                Err(_) => Ok(WriteResponse {
+                    status: WriteStatus::StdinClosed,
+                }),
+            }
+        })
+        .await
+        .map_err(|_| {
+            ExecServerError::Protocol(
+                "ssh stdin write acknowledgement timed out; remote outcome is unknown".to_string(),
+            )
+        })?
     }
 
     async fn signal(&self, signal: ProcessSignal) -> Result<ProcessSignalOutcome, ExecServerError> {
         let sig = match signal {
             ProcessSignal::Interrupt => Sig::INT,
         };
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ChannelCommand::Signal {
-                signal: sig,
-                ack: ack_tx,
-            })
-            .await
-            .map_err(|_| {
-                ExecServerError::Protocol("ssh signal: channel pump unavailable".to_string())
-            })?;
-        match tokio::time::timeout(SSH_SIGNAL_ACK_TIMEOUT, ack_rx).await {
-            Ok(Ok(Ok(outcome))) => Ok(outcome),
-            Ok(Ok(Err(error))) => Err(ExecServerError::Protocol(format!("ssh signal: {error}"))),
-            Ok(Err(_)) => Err(ExecServerError::Protocol(
-                "ssh signal acknowledgement channel closed".to_string(),
-            )),
-            Err(_) => Err(ExecServerError::Protocol(
-                "ssh signal acknowledgement timed out".to_string(),
-            )),
-        }
+        tokio::time::timeout(SSH_SIGNAL_ACK_TIMEOUT, async {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            self.cmd_tx
+                .send(ChannelCommand::Signal {
+                    signal: sig,
+                    ack: ack_tx,
+                })
+                .await
+                .map_err(|_| {
+                    ExecServerError::Protocol("ssh signal: channel pump unavailable".to_string())
+                })?;
+            match ack_rx.await {
+                Ok(Ok(outcome)) => Ok(outcome),
+                Ok(Err(error)) => Err(ExecServerError::Protocol(format!("ssh signal: {error}"))),
+                Err(_) => Err(ExecServerError::Protocol(
+                    "ssh signal acknowledgement channel closed".to_string(),
+                )),
+            }
+        })
+        .await
+        .map_err(|_| {
+            ExecServerError::Protocol("ssh signal acknowledgement timed out".to_string())
+        })?
     }
 
     async fn terminate(&self) -> Result<(), ExecServerError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ChannelCommand::Terminate { ack: ack_tx })
-            .await
-            .map_err(|_| {
-                ExecServerError::Protocol(
-                    "ssh terminate failed: process command pump is unavailable".to_string(),
-                )
-            })?;
-        tokio::time::timeout(SSH_TERMINATE_ACK_TIMEOUT, ack_rx)
-            .await
-            .map_err(|_| {
-                ExecServerError::Protocol(
-                    "ssh terminate failed: timed out awaiting remote acknowledgement".to_string(),
-                )
-            })?
-            .map_err(|_| {
-                ExecServerError::Protocol(
-                    "ssh terminate failed: process command pump dropped acknowledgement"
-                        .to_string(),
-                )
-            })?
-            .map_err(|message| {
-                ExecServerError::Protocol(format!("ssh terminate failed: {message}"))
-            })
+        tokio::time::timeout(SSH_TERMINATE_ACK_TIMEOUT, async {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            self.cmd_tx
+                .send(ChannelCommand::Terminate { ack: ack_tx })
+                .await
+                .map_err(|_| {
+                    ExecServerError::Protocol(
+                        "ssh terminate failed: process command pump is unavailable".to_string(),
+                    )
+                })?;
+            ack_rx
+                .await
+                .map_err(|_| {
+                    ExecServerError::Protocol(
+                        "ssh terminate failed: process command pump dropped acknowledgement"
+                            .to_string(),
+                    )
+                })?
+                .map_err(|message| {
+                    ExecServerError::Protocol(format!("ssh terminate failed: {message}"))
+                })
+        })
+        .await
+        .map_err(|_| {
+            ExecServerError::Protocol(
+                "ssh terminate failed: timed out awaiting remote acknowledgement".to_string(),
+            )
+        })?
     }
 }
 
@@ -797,12 +829,13 @@ async fn channel_pump(
                         write_id: _,
                         ack,
                     }) => {
-                        let result = channel
-                            .channel()
-                            .data(&data[..])
-                            .await
-                            .map_err(|e| e.to_string());
-                        let _ = ack.send(result);
+                        complete_queued_write(ack, async {
+                            channel
+                                .channel()
+                                .data(&data[..])
+                                .await
+                                .map_err(|e| e.to_string())
+                        }).await;
                     }
                     Some(ChannelCommand::Signal { signal, ack }) => {
                         if let Err(error) = channel.channel().signal(signal).await {

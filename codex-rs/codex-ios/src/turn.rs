@@ -86,12 +86,15 @@ use sha2::Sha256;
 use tokio::time::timeout;
 
 mod admission_receipt;
+mod startup_cancellation;
 mod warm_thread_cache;
 
 use admission_receipt::AdmissionError;
 use admission_receipt::AdmissionReceiptQuery;
 use admission_receipt::AdmissionRequest;
 use admission_receipt::TurnAdmission;
+use startup_cancellation::abort_interrupted_startup;
+use startup_cancellation::acquire_startup_context_lock;
 use warm_thread_cache::WarmThreadEntry;
 use warm_thread_cache::cache_warm_thread;
 use warm_thread_cache::retire_warm_thread;
@@ -515,6 +518,9 @@ fn model_context_resume_error_reason(error: &codex_protocol::error::CodexErr) ->
         }
         codex_protocol::error::CodexErr::Fatal(detail)
             if detail.contains("remote execution reconciliation deadline exceeded")
+                || detail.contains("ssh control command timed out")
+                || detail.contains("ssh control channel acquisition timed out")
+                || detail.contains("ssh sftp startup timed out")
                 || (detail.contains("terminal background session")
                     && detail.contains("reconciliation deadline exceeded")) =>
         {
@@ -1594,6 +1600,7 @@ enum TurnBridge {
     Starting {
         interrupt_requested: bool,
         cleanup_claimed: bool,
+        interrupt_signal: tokio::sync::watch::Sender<bool>,
     },
     Active {
         dynamic_response_sender: ResponseSender,
@@ -1632,6 +1639,7 @@ fn register_starting_turn(
             TurnBridge::Starting {
                 interrupt_requested: false,
                 cleanup_claimed: false,
+                interrupt_signal: tokio::sync::watch::channel(false).0,
             },
         );
     emit(callback, ctx, KIND_TURN_STARTING, &turn_handle.to_string());
@@ -1661,6 +1669,7 @@ fn activate_turn(
     let TurnBridge::Starting {
         interrupt_requested,
         cleanup_claimed,
+        ..
     } = entry
     else {
         return Err("turn handle was already activated".to_string());
@@ -1701,6 +1710,7 @@ fn claim_turn_exit_disposition(turn_handle: u64) -> Result<TurnExitDisposition, 
         Some(TurnBridge::Starting {
             interrupt_requested,
             cleanup_claimed,
+            ..
         })
         | Some(TurnBridge::Active {
             interrupt_requested,
@@ -1729,6 +1739,7 @@ async fn request_interrupt(turn_handle: u64) -> Result<(), String> {
             Some(TurnBridge::Starting {
                 interrupt_requested,
                 cleanup_claimed,
+                interrupt_signal,
             }) => {
                 if *interrupt_requested {
                     return Ok(());
@@ -1737,6 +1748,7 @@ async fn request_interrupt(turn_handle: u64) -> Result<(), String> {
                     return Err("turn cleanup has already started".to_string());
                 }
                 *interrupt_requested = true;
+                interrupt_signal.send_replace(true);
                 None
             }
             Some(TurnBridge::Active {
@@ -2429,6 +2441,9 @@ pub(crate) async fn run_turn_async(
     ctx: *mut c_void,
 ) -> Result<(), TurnFailure> {
     emit_debug_stage(callback, ctx, "run_turn_async_entered");
+    if abort_interrupted_startup(turn_handle, &mut admission, callback, ctx)? {
+        return Ok(());
+    }
     let configuration_fingerprint = warm_thread_fingerprint(
         &provider_config,
         &model,
@@ -2463,10 +2478,16 @@ pub(crate) async fn run_turn_async(
             .map_err(|error| format!("failed to create model-context home: {error}"))
     );
     let turn_lock = pre_admission_try!(admission, context_turn_lock(&codex_home));
-    let _turn_guard = turn_lock.lock().await;
+    let Some(_turn_guard) = acquire_startup_context_lock(turn_handle, &turn_lock).await? else {
+        abort_interrupted_startup(turn_handle, &mut admission, callback, ctx)?;
+        return Ok(());
+    };
     let _context_file_lock =
         pre_admission_try!(admission, acquire_context_file_lock(&codex_home).await);
     let resume_path = pre_admission_try!(admission, read_thread_pointer(&codex_home).await);
+    if abort_interrupted_startup(turn_handle, &mut admission, callback, ctx)? {
+        return Ok(());
+    }
     let (warm_thread, stale_thread) = if temporary_home.is_none() {
         take_warm_thread(
             &codex_home,
@@ -2491,6 +2512,9 @@ pub(crate) async fn run_turn_async(
                 warm_thread.credential_guard,
             )
         } else {
+            if abort_interrupted_startup(turn_handle, &mut admission, callback, ctx)? {
+                return Ok(());
+            }
             // Build auth and provider independently from the persistent context home.
             // Credentials remain in memory and are never written beside the rollout.
             let (auth, provider, model_provider_override) = match provider_config {
@@ -2534,6 +2558,9 @@ pub(crate) async fn run_turn_async(
                 }
             };
             emit_debug_stage(callback, ctx, "auth_ready");
+            if abort_interrupted_startup(turn_handle, &mut admission, callback, ctx)? {
+                return Ok(());
+            }
 
             // In server mode, build a ThreadManager whose EnvironmentManager has the
             // SSH environment registered AND selected as the default, so the turn's
@@ -2612,6 +2639,9 @@ pub(crate) async fn run_turn_async(
                     .map_err(|e| format!("failed to build config: {e}"))
             );
             emit_debug_stage(callback, ctx, "config_ready");
+            if abort_interrupted_startup(turn_handle, &mut admission, callback, ctx)? {
+                return Ok(());
+            }
 
             // An explicit effort comes from the node picker. None means the model
             // manager applies the selected model's live default.
@@ -2679,6 +2709,9 @@ pub(crate) async fn run_turn_async(
                             )
                         })
                 );
+                if abort_interrupted_startup(turn_handle, &mut admission, callback, ctx)? {
+                    return Ok(());
+                }
                 let pending_writes = reconciliation_request.pending_writes.clone();
                 if (!reconciliation_request.incomplete_executions.is_empty()
                     || !pending_writes.is_empty())
@@ -2702,6 +2735,9 @@ pub(crate) async fn run_turn_async(
                         })
                 );
                 emit_debug_stage(callback, ctx, "exact_execution_reconciled");
+                if abort_interrupted_startup(turn_handle, &mut admission, callback, ctx)? {
+                    return Ok(());
+                }
                 let thread = pre_admission_try!(
                     admission,
                     thread_manager
@@ -2840,11 +2876,7 @@ pub(crate) async fn run_turn_async(
     // An interrupt observed before this check skips input entirely. An interrupt
     // racing after the check is preserved by activate_turn below, after input is
     // already ordered, and is then submitted and drained.
-    if startup_interrupt_requested(turn_handle)? {
-        if let Some(admission) = admission.as_mut() {
-            admission.mark_terminal().map_err(|error| error.to_string())?;
-        }
-        emit(callback, ctx, KIND_TURN_ABORTED, "");
+    if abort_interrupted_startup(turn_handle, &mut admission, callback, ctx)? {
         return Ok(());
     }
     // This is deliberately written before `thread.submit`, which also carries
@@ -4709,6 +4741,7 @@ pub extern "C" fn codex_interrupt_turn(turn_handle: u64) -> c_int {
             Some(TurnBridge::Starting {
                 interrupt_requested,
                 cleanup_claimed,
+                interrupt_signal,
             }) => {
                 if *interrupt_requested {
                     return 0;
@@ -4717,6 +4750,7 @@ pub extern "C" fn codex_interrupt_turn(turn_handle: u64) -> c_int {
                     return 6;
                 }
                 *interrupt_requested = true;
+                interrupt_signal.send_replace(true);
                 None
             }
             Some(TurnBridge::Active {

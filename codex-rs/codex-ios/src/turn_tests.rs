@@ -60,7 +60,9 @@ use super::TurnAdmission;
 use super::TurnBridge;
 use super::TurnExitDisposition;
 use super::TurnFailure;
+use super::abort_interrupted_startup;
 use super::acquire_context_file_lock;
+use super::acquire_startup_context_lock;
 use super::active_turn_registry;
 use super::build_turn_runtime;
 use super::claim_turn_exit_disposition;
@@ -495,12 +497,71 @@ fn pre_submit_interrupt_gate_is_idempotent_and_registry_guard_cleans_up() {
             Some(TurnBridge::Starting {
                 interrupt_requested: true,
                 cleanup_claimed: true,
+                ..
             })
         ));
     }
 
     drop(guard);
     assert_eq!(codex_interrupt_turn(handle), 6);
+}
+
+#[tokio::test]
+async fn startup_context_lock_wait_is_woken_by_ffi_stop_without_releasing_the_owner() {
+    let mut events = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+    let (handle, registry_guard) =
+        register_starting_turn(capture_event, ctx).expect("register turn");
+    let context_lock = tokio::sync::Mutex::new(());
+    let owner = context_lock.lock().await;
+    let waiter = acquire_startup_context_lock(handle, &context_lock);
+    tokio::pin!(waiter);
+
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
+    assert_eq!(codex_interrupt_turn(handle), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("Stop must wake the blocked waiter")
+            .expect("startup lock result")
+            .is_none()
+    );
+    assert!(context_lock.try_lock().is_err());
+    let mut admission = None;
+    assert!(
+        abort_interrupted_startup(handle, &mut admission, capture_event, ctx)
+            .expect("finish interrupted startup")
+    );
+    assert_eq!(
+        events,
+        vec![
+            (KIND_TURN_STARTING, handle.to_string()),
+            (super::KIND_TURN_ABORTED, String::new()),
+        ]
+    );
+    drop(owner);
+    drop(registry_guard);
+    assert_eq!(codex_interrupt_turn(handle), 6);
+}
+
+#[tokio::test]
+async fn startup_stop_before_lock_subscription_wins_even_when_context_is_available() {
+    let mut events = Vec::new();
+    let ctx = (&mut events as *mut Vec<(c_int, String)>).cast::<c_void>();
+    let (handle, _registry_guard) =
+        register_starting_turn(capture_event, ctx).expect("register turn");
+    let context_lock = tokio::sync::Mutex::new(());
+
+    super::request_interrupt(handle)
+        .await
+        .expect("request Stop");
+    assert!(
+        acquire_startup_context_lock(handle, &context_lock)
+            .await
+            .expect("startup lock result")
+            .is_none()
+    );
+    assert!(context_lock.try_lock().is_ok());
 }
 
 #[test]
@@ -1543,6 +1604,26 @@ fn model_context_resume_errors_are_content_free_stable_classes() {
          reason=remote_execution_lifecycle_unresolved]"
     );
     assert!(!adopted_lifecycle_message.contains("private verification conflict"));
+}
+
+#[test]
+fn remote_control_deadlines_remain_reconciliation_failures_through_resume_wrapping() {
+    use codex_protocol::error::CodexErr;
+
+    for detail in [
+        "failed to adopt running background session private after reconciliation: \
+         protocol error: ssh control command timed out; remote outcome is unknown",
+        "remote execution lifecycle unresolved during resume repair: protocol error: \
+         ssh control channel acquisition timed out",
+        "remote filesystem initialization failed: ssh sftp startup timed out",
+    ] {
+        let error = CodexErr::Fatal(detail.to_string());
+        assert_eq!(
+            persistent_model_context_resume_error("thread_resume", &error),
+            "failed to resume persistent model context \
+             [invalid_or_unavailable;stage=thread_resume;reason=remote_reconciliation_timeout]"
+        );
+    }
 }
 
 #[test]
