@@ -35,3 +35,15 @@ pub mod request_user_input;
 pub mod review_format;
 pub mod shell_environment;
 pub mod user_input;
+
+/// Reviewed Codex API compatibility for this maintained fork, independent of
+/// its Cargo package version and truthful source version in the User-Agent.
+///
+/// The catalog query/cache version and OpenAI provider `version` header must
+/// agree: the backend gates both model discovery and turn execution on them.
+/// Supported metadata includes Responses Lite, tool-mode selectors, and
+/// Max/Ultra reasoning levels. Hosts retain their feature-gated tool handling,
+/// including iOS's direct-tool fallback when Code Mode is unavailable.
+/// This does not claim the entire upstream 0.153 release is included; advance
+/// only after reviewing catalog metadata and validating live turn behavior.
+pub const CODEX_API_COMPATIBILITY_VERSION: &str = "0.153.0";

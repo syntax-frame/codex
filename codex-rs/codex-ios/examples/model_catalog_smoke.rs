@@ -19,6 +19,7 @@ use std::path::Path;
 use std::process::Command;
 use std::process::ExitCode;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
@@ -44,6 +45,67 @@ struct Capture {
     tool_calls: usize,
     error_code: Option<&'static str>,
     http_status: Option<u64>,
+    last_startup_stage: Option<&'static str>,
+}
+
+// The protected Core event already exposes a numeric status without an error
+// message. Keep only that field; never format or retain other tracing values.
+struct StatusSubscriber(Arc<Mutex<TraceCapture>>);
+
+#[derive(Default)]
+struct TraceCapture {
+    protected_error_seen: bool,
+    http_status: Option<u64>,
+}
+
+#[derive(Default)]
+struct StatusVisitor(Option<u64>);
+
+impl tracing::field::Visit for StatusVisitor {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "http_status" && (100..=599).contains(&value) {
+            self.0 = Some(value);
+        }
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        if let Ok(value) = u64::try_from(value) {
+            self.record_u64(field, value);
+        }
+    }
+
+    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+}
+
+impl tracing::Subscriber for StatusSubscriber {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.is_event()
+            && metadata.target() == "codex_core::session::turn"
+            && metadata.fields().field("http_status").is_some()
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if self.enabled(event.metadata()) {
+            let mut visitor = StatusVisitor::default();
+            event.record(&mut visitor);
+            if let Ok(mut captured) = self.0.lock() {
+                captured.protected_error_seen = true;
+                captured.http_status = visitor.0;
+            }
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
 }
 
 fn interrupt(handle: u64) {
@@ -132,7 +194,44 @@ extern "C" fn on_event(context: *mut c_void, kind: c_int, text: *const c_char) {
             state.http_status = error["http_status_code"]
                 .as_u64()
                 .filter(|status| (100..=599).contains(status));
-            state.error_code.get_or_insert("structured_turn_error");
+            let code = match error["code"].as_str() {
+                Some("context_window_exceeded") => "context_window_exceeded",
+                Some("session_budget_exceeded") => "session_budget_exceeded",
+                Some("usage_limit_exceeded") => "usage_limit_exceeded",
+                Some("server_overloaded") => "server_overloaded",
+                Some("unauthorized") => "unauthorized",
+                Some("bad_request") => "bad_request",
+                Some("other") => "other",
+                Some("cyber_policy") => "cyber_policy",
+                Some("sandbox_error") => "sandbox_error",
+                Some("http_connection_failed") => "http_connection_failed",
+                Some("response_stream_connection_failed") => "response_stream_connection_failed",
+                Some("response_stream_disconnected") => "response_stream_disconnected",
+                Some("internal_server_error") => "internal_server_error",
+                Some("response_too_many_failed_attempts") => "response_too_many_failed_attempts",
+                _ => "structured_turn_error",
+            };
+            state.error_code.get_or_insert(code);
+        }
+        19 => {
+            state.last_startup_stage = match std::str::from_utf8(text) {
+                Ok("run_turn_async_entered") => Some("run_turn_async_entered"),
+                Ok("thread_reused") => Some("thread_reused"),
+                Ok("auth_ready") => Some("auth_ready"),
+                Ok("config_ready") => Some("config_ready"),
+                Ok("exact_execution_reconciled") => Some("exact_execution_reconciled"),
+                Ok("thread_resumed") => Some("thread_resumed"),
+                Ok("thread_ready") => Some("thread_ready"),
+                Ok("history_inject_begin") => Some("history_inject_begin"),
+                Ok("history_inject_end") => Some("history_inject_end"),
+                Ok("prompt_image_submit_begin") => Some("prompt_image_submit_begin"),
+                Ok("prompt_image_submit_end") => Some("prompt_image_submit_end"),
+                Ok("prompt_submit_begin") => Some("prompt_submit_begin"),
+                Ok("prompt_submit_end") => Some("prompt_submit_end"),
+                Ok("prompt_image_first_event_wait") => Some("prompt_image_first_event_wait"),
+                Ok("thread_cached") => Some("thread_cached"),
+                _ => Some("unknown_startup_stage"),
+            };
         }
         _ => {}
     }
@@ -146,6 +245,9 @@ fn run_worker(model: &str, root: &Path) -> Result<Value, &'static str> {
     if root.parent() != Some(expected_parent.as_path()) {
         return Err("invalid_private_root");
     }
+    let traced_status = Arc::new(Mutex::new(TraceCapture::default()));
+    tracing::subscriber::set_global_default(StatusSubscriber(traced_status.clone()))
+        .map_err(|_| "diagnostic_subscriber_unavailable")?;
     let auth_path = Path::new("/Users/ivica/.codex/auth.json");
     let auth: Value =
         serde_json::from_slice(&std::fs::read(auth_path).map_err(|_| "auth_unreadable")?)
@@ -208,13 +310,40 @@ fn run_worker(model: &str, root: &Path) -> Result<Value, &'static str> {
         on_event,
     );
     let state = capture.lock().map_err(|_| "callback_failed")?;
+    let trace = traced_status
+        .lock()
+        .map_err(|_| "diagnostic_capture_failed")?;
+    let http_status = state.http_status.or(trace.http_status);
+    let cache_path = root.join("context/models_cache.json");
+    let cache = std::fs::read(&cache_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let cached_model = cache
+        .as_ref()
+        .and_then(|cache| cache["models"].as_array())
+        .and_then(|models| {
+            models.iter().find(|cached| {
+                cached["slug"]
+                    .as_str()
+                    .is_some_and(|slug| slug.as_bytes() == model.as_bytes())
+            })
+        });
     Ok(json!({
         "ok": state.completed && state.error_code.is_none()
             && state.tool_calls == 1 && state.answer_is_42,
         "catalog_count": models.len(), "model_visible": true,
         "completed": state.completed, "tool_calls": state.tool_calls,
         "answer": state.answer_is_42.then_some(42),
-        "error_code": state.error_code, "http_status": state.http_status,
+        "error_code": state.error_code, "http_status": http_status,
+        "last_startup_stage": state.last_startup_stage,
+        "protected_error_seen": trace.protected_error_seen,
+        "models_cache_present": cache_path.is_file(),
+        "models_cache_valid": cache.is_some(),
+        "models_cache_version_compatible": cache.as_ref()
+            .is_some_and(|cache| cache["client_version"] == codex_models_manager::client_version_to_whole()),
+        "cached_model_present": cached_model.is_some(),
+        "cached_model_uses_responses_lite": cached_model
+            .is_some_and(|model| model["use_responses_lite"] == true),
     }))
 }
 
