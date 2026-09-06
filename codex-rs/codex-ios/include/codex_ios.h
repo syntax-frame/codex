@@ -522,8 +522,9 @@ char *codex_publish_ssh_workspace_file(const char *ssh_host,
  * ends. This is same-turn steering, not a new queued turn.
  *
  * Returns 0 when accepted. Non-zero: 1 = bad text pointer, 2 = empty text,
- * 4 = registry lock poisoned, 6 = unknown/finished turn_handle,
- * 7 = the active turn rejected steering.
+ * 4 = registry lock poisoned,
+ * 6 = unavailable or non-steerable exact turn (input not admitted),
+ * 7 = native panic (input admission unknown; do not retry automatically).
  */
 int codex_steer_turn(uint64_t turn_handle, const char *text);
 

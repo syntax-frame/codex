@@ -21,6 +21,7 @@ use std::time::Duration;
 use codex_core::PersistedRemoteLifecycleFailureReason;
 use codex_core::PersistedRemoteLifecycleHoldReason;
 use codex_core::PersistedRemoteLifecycleOutcome;
+use codex_core::SteerInputError;
 use codex_exec_server::SshAuthentication;
 use codex_exec_server::SshTmuxMode;
 use codex_features::Feature;
@@ -33,6 +34,7 @@ use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::ItemStartedEvent;
+use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use sha2::Digest;
@@ -2027,6 +2029,32 @@ fn steering_rejects_invalid_text_and_expired_handles() {
         codex_steer_turn_with_uploads(u64::MAX, text.as_ptr(), malformed.as_ptr()),
         8
     );
+}
+
+#[test]
+fn steering_explicit_pre_admission_rejections_remain_retryable_without_hiding_invalid_input() {
+    use super::steering_submission::rejected_input_code;
+
+    let pending_input = vec![codex_protocol::user_input::UserInput::Text {
+        text: "Change direction after startup.".to_string(),
+        text_elements: Vec::new(),
+    }];
+    let codes = [
+        SteerInputError::NoActiveTurn(pending_input),
+        SteerInputError::ExpectedTurnMismatch {
+            expected: "prior-turn".to_string(),
+            actual: "current-turn".to_string(),
+        },
+        SteerInputError::ActiveTurnNotSteerable {
+            turn_kind: NonSteerableTurnKind::Compact,
+        },
+        SteerInputError::ActiveTurnNotSteerable {
+            turn_kind: NonSteerableTurnKind::Review,
+        },
+        SteerInputError::EmptyInput,
+    ]
+    .map(rejected_input_code);
+    assert_eq!(codes, [6, 6, 6, 6, 2]);
 }
 
 #[test]

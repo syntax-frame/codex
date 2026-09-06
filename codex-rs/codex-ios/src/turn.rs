@@ -87,6 +87,7 @@ use tokio::time::timeout;
 
 mod admission_receipt;
 mod startup_cancellation;
+mod steering_submission;
 mod warm_thread_cache;
 
 use admission_receipt::AdmissionError;
@@ -4586,7 +4587,8 @@ pub extern "C" fn codex_respond_dynamic_tool(
 ///
 /// Returns 0 when Codex accepted the steering input. Non-zero codes:
 /// 1 = bad text pointer, 2 = empty text, 4 = registry lock poisoned,
-/// 6 = unknown/finished turn handle, 7 = the active turn rejected steering.
+/// 6 = unavailable or non-steerable exact turn (input not admitted),
+/// 7 = native panic (input admission unknown; do not retry automatically).
 ///
 /// # Safety
 /// `text` must be a valid NUL-terminated UTF-8 C string.
@@ -4709,11 +4711,11 @@ pub extern "C" fn codex_steer_turn_with_uploads(
                     /*responsesapi_client_metadata*/ None,
                 )
                 .await;
-            if steer_result.is_err() {
+            if let Err(error) = steer_result {
                 rollback_server_file_uploads(server_mode.as_ref(), &workspace, &receipts)
                     .await
                     .map_err(|_| 10)?;
-                return Err(7);
+                return Err(steering_submission::rejected_input_code(error));
             }
             Ok(())
         })
